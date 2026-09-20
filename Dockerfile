@@ -22,7 +22,7 @@ LABEL org.opencontainers.image.source="https://github.com/tarynwyj/xiaoai-ha-bri
       org.opencontainers.image.description="XiaoAI to Home Assistant bridge for HAOS" \
       io.hass.name="XiaoAI HA Bridge" \
       io.hass.description="XiaoAI voice bridge for Home Assistant" \
-      io.hass.version="1.0.0" \
+      io.hass.version="1.0.1" \
       io.hass.type="app" \
       io.hass.arch="amd64"
 

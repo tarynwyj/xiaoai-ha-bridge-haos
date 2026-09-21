@@ -1,10 +1,11 @@
 name: "XiaoAI HA Bridge"
-version: "1.0.2"
+version: "1.0.3"
 slug: "xiaoai_bridge"
 description: "小爱音箱语音桥接 Home Assistant"
 url: "https://github.com/tarynwyj/xiaoai-ha-bridge-haos"
 arch:
   - amd64
+stage: stable
 startup: application
 boot: auto
 init: false

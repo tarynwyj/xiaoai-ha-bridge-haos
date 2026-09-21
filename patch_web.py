@@ -43,8 +43,8 @@ function entityOptions(domain,current){
 // ═══════════ DOMAIN INFO ═══════════"""
     ),
     (
-        "h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';",
-        "h+='</select></div><div class="field"><label>实体ID</label><select class="r-e">'+entityOptions(d,a.entity_id||'')+'</select></div><div class="extra-fields">';"
+        '''h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';''',
+        '''h+='</select></div><div class="field"><label>实体ID</label><select class="r-e">'+entityOptions(d,a.entity_id||'')+'</select></div><div class="extra-fields">';'''
     ),
     (
         "const info=DINFO[d];const sel=item.querySelector('.r-s');",

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.5
+- Allow QR-only accounts to reconnect from saved `passToken` credentials without requiring a stored username and password.
+- Reuse the saved QR identity when testing the Xiaomi connection after an app restart or update.
+
 ## 1.0.4
 - Fix QR login reporting success while saving an empty Xiaomi `serviceToken`.
 - Exchange QR `passToken` credentials for a fresh `micoapi` service token before saving.

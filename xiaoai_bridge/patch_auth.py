@@ -21,7 +21,41 @@ replace_exact(
     "micoapi token helper",
     """async def bridge_loop():
 """,
-    """async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
+    """def _load_saved_xiaomi_identity() -> dict:
+    \"\"\"Load only the account identity fields needed to refresh micoapi.\"\"\"
+    for token_path in (TOKEN_PATH, AUTH_PATH):
+        if not token_path.exists():
+            continue
+        try:
+            data = json.loads(token_path.read_text(encoding="utf-8"))
+            if data.get("userId") and data.get("passToken"):
+                return {
+                    "userId": str(data["userId"]),
+                    "passToken": data["passToken"],
+                    "deviceId": data.get("deviceId", ""),
+                }
+        except Exception as e:
+            log.warning("读取已保存的小米登录信息失败: %s", e)
+
+    cookie_text = (load_config().get("xiaomi", {}) or {}).get("cookie_text", "")
+    if cookie_text:
+        try:
+            from http.cookies import SimpleCookie
+            parsed = SimpleCookie()
+            parsed.load(cookie_text)
+            cookies = {key: morsel.value for key, morsel in parsed.items()}
+            if cookies.get("userId") and cookies.get("passToken"):
+                return {
+                    "userId": cookies["userId"],
+                    "passToken": cookies["passToken"],
+                    "deviceId": cookies.get("deviceId", ""),
+                }
+        except Exception as e:
+            log.warning("读取已保存的小米 Cookie 失败: %s", e)
+    return {}
+
+
+async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
                                   device_id: str) -> str:
     \"\"\"Exchange an account passToken for a fresh micoapi serviceToken.\"\"\"
     if not user_id or not pass_token:
@@ -55,6 +89,52 @@ replace_exact(
 
 
 async def bridge_loop():
+""",
+)
+
+replace_exact(
+    "allow QR-only bridge startup",
+    """    if not mi_cfg.get("username") or not mi_cfg.get("password"):
+        bridge_state["error"] = "小米账号未配置"
+        bridge_state["running"] = False
+        return
+""",
+    """    saved_identity = _load_saved_xiaomi_identity()
+    if (not mi_cfg.get("username") or not mi_cfg.get("password")) and not saved_identity:
+        bridge_state["error"] = "小米账号或扫码登录信息未配置"
+        bridge_state["running"] = False
+        return
+""",
+)
+
+replace_exact(
+    "allow saved QR identity in connection test",
+    """    if not username or not password:
+        return {"ok": False, "msg": "请先填写账号和密码"}
+
+    global _pending_session
+""",
+    """    saved_identity = _load_saved_xiaomi_identity() if req.use_saved else {}
+    if (not username or not password) and not saved_identity:
+        return {"ok": False, "msg": "请先填写账号密码，或使用扫码登录"}
+
+    global _pending_session
+""",
+)
+
+replace_exact(
+    "use saved QR identity in connection test",
+    """        cookie_text = req.cookie_text or mi.get("cookie_text", "")
+        if cookie_text and not cookie_text.startswith("https://"):
+""",
+    """        cookie_text = req.cookie_text or mi.get("cookie_text", "")
+        if not cookie_text and saved_identity:
+            cookie_text = (
+                f"userId={saved_identity['userId']}; "
+                f"passToken={saved_identity['passToken']}; "
+                f"deviceId={saved_identity.get('deviceId', '')}"
+            )
+        if cookie_text and not cookie_text.startswith("https://"):
 """,
 )
 

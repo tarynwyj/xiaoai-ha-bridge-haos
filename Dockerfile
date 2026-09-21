@@ -11,6 +11,9 @@ RUN git clone --depth 1 --branch "${UPSTREAM_REF}" \
 
 WORKDIR /app
 
+COPY patch_web.py /tmp/patch_web.py
+RUN python /tmp/patch_web.py && rm /tmp/patch_web.py
+
 RUN pip install --no-cache-dir -r requirements.txt \
     && rm -rf /app/config /app/logs \
     && ln -s /data/config /app/config \
@@ -22,7 +25,7 @@ LABEL org.opencontainers.image.source="https://github.com/tarynwyj/xiaoai-ha-bri
       org.opencontainers.image.description="XiaoAI to Home Assistant bridge for HAOS" \
       io.hass.name="XiaoAI HA Bridge" \
       io.hass.description="XiaoAI voice bridge for Home Assistant" \
-      io.hass.version="1.0.1" \
+      io.hass.version="1.0.2" \
       io.hass.type="app" \
       io.hass.arch="amd64"
 

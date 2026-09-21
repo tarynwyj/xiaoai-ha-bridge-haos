@@ -1,34 +1,23 @@
 # XiaoAI HA Bridge for Home Assistant OS
 
-这是一个给 Home Assistant OS 使用的预构建镜像包装，实际桥接程序来自：
+Home Assistant App wrapper for [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge).
 
-- https://github.com/chenshuhe/xiaoai-ha-bridge
+## Install
 
-目标是避免在 HAOS 本机执行 Docker 构建，从而绕开 Docker Hub builder 镜像下载失败的问题。
+Add this repository to the Home Assistant App Store:
 
-## GHCR 镜像
+`https://github.com/tarynwyj/xiaoai-ha-bridge-haos`
 
-```
-ghcr.io/tarynwyj/xiaoai-ha-bridge-haos:1.0.0
-```
+Then install **XiaoAI HA Bridge** from that repository.
 
-首次构建后，请在 GitHub 的 Packages 页面把容器包可见性改成 **Public**，这样 HAOS 可以匿名拉取。
+## Image
 
-## HAOS 本地 App 配置
+The app uses the prebuilt image:
 
-把仓库里的 `haos-config.yaml` 内容覆盖到：
+`ghcr.io/tarynwyj/xiaoai-ha-bridge-haos:<version>`
 
-```
-/addons/xiaoai_bridge/config.yaml
-```
+The version in `xiaoai_bridge/config.yaml` is the single source of truth for both the App Store metadata and the image tag.
 
-刷新应用商店后重新安装即可。
+## Local development
 
-## 持久化
-
-上游程序原本把配置写入 `config/`、日志写入 `logs/`。本镜像将它们映射到 Home Assistant App 的持久化 `/data`：
-
-- `/data/config`
-- `/data/logs`
-
-因此重新创建容器后配置仍会保留。
+The Docker image pins a known upstream XiaoAI HA Bridge commit and applies `patch_web.py` during build. CI compiles the patch, builds the image, verifies the entity selector patch is present, verifies the Home Assistant version label, and only then pushes the image.

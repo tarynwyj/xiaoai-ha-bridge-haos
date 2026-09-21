@@ -6,8 +6,8 @@ on:
     branches:
       - main
     paths:
-      - Dockerfile
-      - patch_web.py
+      - xiaoai_bridge/Dockerfile
+      - xiaoai_bridge/patch_web.py
       - xiaoai_bridge/config.yaml
       - .github/workflows/build.yml
 
@@ -47,7 +47,7 @@ jobs:
       - name: Build image locally
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./xiaoai_bridge
           platforms: linux/amd64
           load: true
           push: false

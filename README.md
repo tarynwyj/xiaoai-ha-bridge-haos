@@ -20,4 +20,4 @@ The version in `xiaoai_bridge/config.yaml` is the single source of truth for bot
 
 ## Local development
 
-The Docker image pins a known upstream XiaoAI HA Bridge commit and applies `xiaoai_bridge/patch_web.py` during build. The app-specific build files live under `xiaoai_bridge/`. CI compiles the patch, builds the image, verifies the entity selector patch is present, verifies the Home Assistant version label, and only then pushes the image.
+The Docker image pins a known upstream XiaoAI HA Bridge commit and applies the authentication and web UI patches in `xiaoai_bridge/` during build. CI compiles both patches, builds the image, verifies the Xiaomi `micoapi` token exchange and entity selector patches are present, verifies the Home Assistant version label, and only then pushes the image.

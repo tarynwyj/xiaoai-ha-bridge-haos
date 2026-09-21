@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - xiaoai_bridge/Dockerfile
+      - xiaoai_bridge/patch_auth.py
       - xiaoai_bridge/patch_web.py
       - xiaoai_bridge/config.yaml
       - .github/workflows/build.yml
@@ -32,7 +33,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Validate patch syntax
-        run: python -m py_compile xiaoai_bridge/patch_web.py
+        run: python -m py_compile xiaoai_bridge/patch_auth.py xiaoai_bridge/patch_web.py
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -64,7 +65,7 @@ jobs:
         shell: bash
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/xiaoai-ha-bridge-haos:${{ steps.app.outputs.version }}"
-          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; s=Path('/app/web/index.html').read_text(); assert '<select class=\"r-e\">' in s; assert 'async function loadRuleDevices()' in s"
+          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\">' in w; assert 'async function loadRuleDevices()' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b"
           test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
 
       - name: Push verified image

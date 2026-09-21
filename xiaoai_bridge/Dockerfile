@@ -22,6 +22,14 @@ RUN python -m py_compile /tmp/patch_web.py \
     && grep -Fq 'async function loadRuleDevices()' /app/web/index.html \
     && rm /tmp/patch_web.py
 
+COPY patch_auth.py /tmp/patch_auth.py
+RUN python -m py_compile /tmp/patch_auth.py \
+    && python /tmp/patch_auth.py \
+    && python -m py_compile /app/bridge.py \
+    && grep -Fq 'async def _refresh_micoapi_token' /app/bridge.py \
+    && grep -Fq 'micoapi serviceToken 已保存' /app/bridge.py \
+    && rm /tmp/patch_auth.py
+
 RUN pip install --no-cache-dir -r requirements.txt \
     && rm -rf /app/config /app/logs \
     && ln -s /data/config /app/config \

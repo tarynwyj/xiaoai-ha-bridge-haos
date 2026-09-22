@@ -9,6 +9,7 @@ on:
       - xiaoai_bridge/Dockerfile
       - xiaoai_bridge/patch_auth.py
       - xiaoai_bridge/patch_web.py
+      - xiaoai_bridge/test_startup_patch.py
       - xiaoai_bridge/config.yaml
       - .github/workflows/build.yml
 
@@ -66,6 +67,7 @@ jobs:
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/xiaoai-ha-bridge-haos:${{ steps.app.outputs.version }}"
           docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\">' in w; assert 'async function loadRuleDevices()' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b"
+          docker run --rm --entrypoint python -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py
           test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
 
       - name: Push verified image

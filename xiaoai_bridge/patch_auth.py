@@ -18,6 +18,100 @@ def replace_exact(label: str, old: str, new: str) -> None:
 
 
 replace_exact(
+    "restore complete cached micoapi token",
+    """def _set_token(account, cfg: dict):
+    \"\"\"从 auth.json 或 cookie 恢复 token（参考 xiaomusic set_token）\"\"\"
+    mi_cfg = cfg.get("xiaomi", {})
+    if AUTH_PATH.exists():
+        try:
+            with open(AUTH_PATH, encoding="utf-8") as f:
+                user_data = json.load(f)
+            account.token = {
+                "passToken": user_data["passToken"],
+                "userId": user_data["userId"],
+                "deviceId": user_data.get("deviceId", ""),
+            }
+            log.info("已从 auth.json 恢复 token")
+            return
+        except Exception as e:
+            log.warning("auth.json 读取失败: %s", e)
+
+    cookie_text = mi_cfg.get("cookie_text", "")
+    if cookie_text:
+        from http.cookies import SimpleCookie
+        sc = SimpleCookie()
+        sc.load(cookie_text)
+        cookies_dict = {k: m.value for k, m in sc.items()}
+        account.token = {
+            "passToken": cookies_dict.get("passToken", ""),
+            "userId": cookies_dict.get("userId", ""),
+            "deviceId": cookies_dict.get("deviceId", ""),
+        }
+""",
+    """def _set_token(account, cfg: dict):
+    \"\"\"Restore a complete micoapi token before falling back to account identity.\"\"\"
+    for saved_path in (TOKEN_PATH, AUTH_PATH):
+        if not saved_path.exists():
+            continue
+        try:
+            data = json.loads(saved_path.read_text(encoding="utf-8"))
+            if not data.get("userId") or not data.get("passToken"):
+                continue
+            restored = {
+                "passToken": data["passToken"],
+                "userId": str(data["userId"]),
+                "deviceId": data.get("deviceId") or "",
+            }
+            micoapi = data.get("micoapi")
+            if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
+                restored["micoapi"] = tuple(micoapi)
+            account.token = restored
+            log.info("已从 %s 恢复小米登录信息", saved_path.name)
+            return
+        except Exception as e:
+            log.warning("读取 %s 失败: %s", saved_path.name, e)
+
+    cookie_text = (cfg.get("xiaomi", {}) or {}).get("cookie_text", "")
+    if cookie_text:
+        from http.cookies import SimpleCookie
+        sc = SimpleCookie()
+        sc.load(cookie_text)
+        cookies = {key: morsel.value for key, morsel in sc.items()}
+        if cookies.get("userId") and cookies.get("passToken"):
+            account.token = {
+                "passToken": cookies["passToken"],
+                "userId": cookies["userId"],
+                "deviceId": cookies.get("deviceId", ""),
+            }
+            if cookies.get("serviceToken"):
+                account.token["micoapi"] = ("", cookies["serviceToken"])
+""",
+)
+
+replace_exact(
+    "prefer fresh token cookie over stale form data",
+    """    if mi_cfg.get("cookie_text"):
+        from http.cookies import SimpleCookie
+        from aiohttp import CookieJar
+        sc = SimpleCookie()
+        sc.load(mi_cfg["cookie_text"])
+        cookies_dict = {k: m.value for k, m in sc.items()}
+        return cookies_dict
+
+    if not TOKEN_PATH.exists():
+        return None
+""",
+    """    if not TOKEN_PATH.exists():
+        if mi_cfg.get("cookie_text"):
+            from http.cookies import SimpleCookie
+            sc = SimpleCookie()
+            sc.load(mi_cfg["cookie_text"])
+            return {k: m.value for k, m in sc.items()}
+        return None
+""",
+)
+
+replace_exact(
     "micoapi token helper",
     """async def bridge_loop():
 """,
@@ -138,6 +232,62 @@ replace_exact(
 )
 
 replace_exact(
+    "preserve QR cookie after stale page save",
+    """    if cfg.get("openai", {}).get("api_key") == masked:
+        cfg["openai"]["api_key"] = existing.get("openai", {}).get("api_key", "")
+    save_config(cfg)
+""",
+    """    if cfg.get("openai", {}).get("api_key") == masked:
+        cfg["openai"]["api_key"] = existing.get("openai", {}).get("api_key", "")
+    # A page loaded before QR login still contains an empty cookie_text.
+    # Its later Save action must not erase the freshly stored QR credentials.
+    if not cfg.get("xiaomi", {}).get("cookie_text") and existing.get("xiaomi", {}).get("cookie_text"):
+        cfg.setdefault("xiaomi", {})["cookie_text"] = existing["xiaomi"]["cookie_text"]
+    save_config(cfg)
+""",
+)
+
+replace_exact(
+    "keep MiService from deleting saved token on login failure",
+    """        account = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"],
+                           str(TOKEN_PATH) if TOKEN_PATH.parent.exists() else None)
+""",
+    """        # Persistence is handled by _save_auth_and_token after validation.
+        # MiService deletes its token file when login fails, so never hand it TOKEN_PATH.
+        account = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"], None)
+""",
+)
+
+replace_exact(
+    "test cached micoapi before re-login",
+    """        na = None
+        logged_in = False
+
+        # 尝试1: 用 passToken 绕过密码步骤（xiaomusic 做法，不需要 SMS）
+""",
+    """        na = None
+        devices = None
+        logged_in = False
+
+        # QR test already saved a micoapi serviceToken. Validate it before any
+        # new account login, since a passToken can be rejected independently.
+        if account.token.get('micoapi') and account.token['micoapi'][1]:
+            try:
+                na = MiNAService(account)
+                devices = await na.device_list()
+                logged_in = True
+                log.info("已使用保存的 micoapi Token 登录")
+            except Exception as e:
+                log.warning("保存的 micoapi Token 不可用: %s", e)
+                _set_token(account, cfg)
+                na = None
+                devices = None
+
+        # 尝试1: 用 passToken 绕过密码步骤（xiaomusic 做法，不需要 SMS）
+""",
+)
+
+replace_exact(
     "use saved QR identity in connection test",
     """        cookie_text = req.cookie_text or mi.get("cookie_text", "")
         if cookie_text and not cookie_text.startswith("https://"):
@@ -166,7 +316,7 @@ replace_exact(
                 log.warning("passToken 登录异常: %s，尝试其他方式", e)
 """,
     """        # 尝试1: 用 passToken 换取新的 micoapi serviceToken（不需要 SMS）
-        if account.token.get('passToken') and account.token.get('userId'):
+        if not logged_in and account.token.get('passToken') and account.token.get('userId'):
             log.info("尝试 passToken 登录...")
             try:
                 await _refresh_micoapi_token(
@@ -175,10 +325,15 @@ replace_exact(
                     account.token['passToken'],
                     account.token.get('deviceId', get_random(16).upper()),
                 )
+                na = MiNAService(account)
+                devices = await na.device_list()
                 _save_auth_and_token(account)
                 logged_in = True
             except Exception as e:
                 log.warning("passToken 登录异常: %s，尝试其他方式", e)
+                _set_token(account, cfg)
+                na = None
+                devices = None
 """,
 )
 
@@ -211,14 +366,70 @@ replace_exact(
                         account = account2
 """,
     """                    if cookies.get('userId') and cookies.get('passToken'):
-                        account2 = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"], str(TOKEN_PATH))
+                        account2 = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"], None)
                         await _refresh_micoapi_token(
                             account2,
                             cookies['userId'],
                             cookies['passToken'],
                             cookies.get('deviceId', get_random(16).upper()),
                         )
+                        candidate = MiNAService(account2)
+                        candidate_devices = await candidate.device_list()
                         account = account2
+                        devices = candidate_devices
+""",
+)
+
+replace_exact(
+    "avoid blank-password retry and validate password login",
+    """        # 尝试3: 密码登录（会触发 SMS 验证）
+        if not logged_in:
+            log.info("尝试密码登录...")
+            try:
+                ok = await account.login("micoapi")
+                if ok:
+                    logged_in = True
+            except Exception as e:
+                log.warning("密码登录异常: %s", e)
+
+        if not logged_in:
+            bridge_state["error"] = ("登录失败，请打开配置页面 → 在「Cookie 登录」输入框中粘贴浏览器 Cookie → 点测试连接。"
+                                     "Cookie 获取方法：浏览器打开 account.xiaomi.com → F12 → Application → Cookies → 复制全部")
+""",
+    """        # 尝试3: 只有提供真实账号密码时才尝试密码登录。
+        if not logged_in and mi_cfg.get("username") and mi_cfg.get("password"):
+            log.info("尝试密码登录...")
+            try:
+                password_account = MiAccount(
+                    _bridge_session, mi_cfg["username"], mi_cfg["password"], None
+                )
+                password_account.token = {'deviceId': get_random(16).upper()}
+                if await password_account.login("micoapi"):
+                    candidate = MiNAService(password_account)
+                    devices = await candidate.device_list()
+                    account = password_account
+                    na = candidate
+                    logged_in = True
+            except Exception as e:
+                log.warning("密码登录异常: %s", e)
+
+        if not logged_in:
+            bridge_state["error"] = "小米登录失败。请在小米账号页重新扫码，然后再启动桥接器。"
+""",
+)
+
+replace_exact(
+    "reuse validated device list",
+    """        # 获取设备列表
+        try:
+            devices = await na.device_list()
+            if devices:
+""",
+    """        # 获取设备列表；登录验证时已经取得列表就不再重复请求。
+        try:
+            if devices is None:
+                devices = await na.device_list()
+            if devices:
 """,
 )
 

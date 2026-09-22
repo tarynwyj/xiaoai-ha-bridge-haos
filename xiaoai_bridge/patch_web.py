@@ -91,5 +91,17 @@ replace_exact(
     "(d.ok?'保存成功':(d.msg||'保存失败'))",
 )
 
+replace_exact(
+    "allow QR-only Xiaomi connection test",
+    "if(!gv('mi-username')&&!(cfg.xiaomi||{}).username){showAlert(a,'err','✗ 先填写账号');return}",
+    "",
+)
+
+replace_exact(
+    "show QR login failure honestly",
+    "showAlert(a,'ok','✓ '+d.msg);const r2=await fetch('/api/test/xiaomi'",
+    "showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+d.msg);if(!d.ok)return;const r2=await fetch('/api/test/xiaomi'",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")

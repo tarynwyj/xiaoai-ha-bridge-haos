@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.7
+- Start the bridge with a validated saved `micoapi` service token before attempting account login again.
+- Validate device access before saving refreshed credentials, and prevent MiService from deleting the token file on failed login.
+- Skip password login when only QR credentials are configured.
+- Preserve fresh QR cookies when an older web page saves Xiaomi settings, and prefer the saved token when building polling cookies.
+- Let QR-only users run the Xiaomi connection test; display failed QR login as a failure.
+
 ## 1.0.6
 - Fix the Home Assistant connection test when the saved token is masked in the web UI.
 - Reuse a saved token only for its original HA address; require a new token when changing the address.

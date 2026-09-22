@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.8
+- Allow one intent rule to target multiple Home Assistant entities of the same type.
+- Limit rule collection to the rules editor, so visiting device or schedule pages does not break saving.
+- Read the latest saved rules for each new voice command without restarting Xiaomi login.
+
 ## 1.0.7
 - Start the bridge with a validated saved `micoapi` service token before attempting account login again.
 - Validate device access before saving refreshed credentials, and prevent MiService from deleting the token file on failed login.

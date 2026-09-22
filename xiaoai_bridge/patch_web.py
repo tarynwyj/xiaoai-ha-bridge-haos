@@ -48,24 +48,21 @@ async function loadRuleDevices(){
   }
 }
 function entityOptions(domain,current){
+  const selected=new Set(Array.isArray(current)?current:(current?[current]:[]));
   const list=haDevices
     .filter(d=>d.domain===domain)
     .sort((a,b)=>String(a.name||a.entity_id).localeCompare(String(b.name||b.entity_id),'zh-CN'));
   let out='';
-  const exists=list.some(d=>d.entity_id===current);
-  if(current&&!exists){
-    out+='<option value="'+escHtml(current)+'" selected>'+escHtml(current)+'（当前）</option>';
-  }
-  if(!current){
-    out+='<option value="">请选择实体</option>';
+  for(const id of selected){
+    if(!list.some(d=>d.entity_id===id))out+='<option value="'+escHtml(id)+'" selected>'+escHtml(id)+'（当前）</option>';
   }
   if(!list.length){
-    if(!current)out+='<option value="" disabled>未读取到此类型实体</option>';
+    if(!selected.size)out+='<option value="" disabled>未读取到此类型实体</option>';
     return out;
   }
   out+=list.map(d=>{
     const label=(deviceAliases[d.entity_id]||d.name||d.entity_id)+' · '+d.entity_id;
-    return '<option value="'+escHtml(d.entity_id)+'" '+(d.entity_id===current?'selected':'')+'>'+escHtml(label)+'</option>';
+    return '<option value="'+escHtml(d.entity_id)+'" '+(selected.has(d.entity_id)?'selected':'')+'>'+escHtml(label)+'</option>';
   }).join('');
   return out;
 }
@@ -76,7 +73,13 @@ function entityOptions(domain,current){
 replace_exact(
     "entity input to select",
     '''h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';''',
-    '''h+='</select></div><div class="field"><label>实体ID</label><select class="r-e">'+entityOptions(d,a.entity_id||'')+'</select></div><div class="extra-fields">';''',
+    '''h+='</select></div><div class="field"><label>实体ID（可多选）</label><select class="r-e" multiple size="6">'+entityOptions(d,a.entity_id||'')+'</select><small>按住 Ctrl 选择多个设备</small></div><div class="extra-fields">';''',
+)
+
+replace_exact(
+    "collect only intent rule rows and preserve multiple entities",
+    "const items=document.querySelectorAll('.rule-item');cfg.intent_rules=Array.from(items).map(el=>{const a={domain:el.querySelector('.r-d').value,service:el.querySelector('.r-s').value,entity_id:el.querySelector('.r-e').value.trim(),reply:el.querySelector('.r-r').value.trim()||'好的'};",
+    "const items=document.querySelectorAll('#rule-list .rule-item');cfg.intent_rules=Array.from(items).map(el=>{const ids=Array.from(el.querySelector('.r-e').selectedOptions).map(o=>o.value).filter(Boolean);const a={domain:el.querySelector('.r-d').value,service:el.querySelector('.r-s').value,entity_id:ids.length===1?ids[0]:ids,reply:el.querySelector('.r-r').value.trim()||'好的'};",
 )
 
 replace_exact(

@@ -202,6 +202,12 @@ replace_exact(
 )
 
 replace_exact(
+    "use newly saved rules without restarting Xiaomi login",
+    "                    action = parser.parse(query)\n",
+    "                    action = IntentParser(load_config().get(\"intent_rules\", [])).parse(query)\n",
+)
+
+replace_exact(
     "allow saved QR identity in connection test",
     """    if not username or not password:
         return {"ok": False, "msg": "请先填写账号和密码"}

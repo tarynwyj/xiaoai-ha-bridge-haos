@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -11,6 +12,22 @@ from types import ModuleType, SimpleNamespace
 
 source_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/app/bridge.py")
 tree = ast.parse(source_path.read_text(encoding="utf-8"))
+assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in source_path.read_text(encoding="utf-8")
+intent_node = next(
+    node for node in tree.body
+    if isinstance(node, ast.ClassDef) and node.name == "IntentParser"
+)
+intent_namespace = {"re": re}
+exec(compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"), intent_namespace)
+multi_entity_ids = ["switch.one", "switch.two", "switch.three", "switch.four"]
+parsed_action = intent_namespace["IntentParser"]([{
+    "pattern": "打开客厅灯",
+    "action": {
+        "domain": "switch", "service": "turn_on",
+        "entity_id": multi_entity_ids,
+    },
+}]).parse("打开客厅灯")
+assert parsed_action["entity_id"] == multi_entity_ids
 needed = {"_set_token", "_load_saved_xiaomi_identity", "bridge_loop", "post_config"}
 nodes = {
     node.name: node

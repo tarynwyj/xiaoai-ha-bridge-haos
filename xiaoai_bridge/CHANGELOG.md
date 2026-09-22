@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.9
+- Show each intent rule as a compact summary of the phrase, action, and target devices.
+- Add rule search and a visible match count; expand only the rule being edited.
+- Preserve the multiple-entity selector and make new rules open for editing automatically.
+
 ## 1.0.8
 - Allow one intent rule to target multiple Home Assistant entities of the same type.
 - Limit rule collection to the rules editor, so visiting device or schedule pages does not break saving.

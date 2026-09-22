@@ -35,6 +35,28 @@ replace_exact(
 )
 
 replace_exact(
+    "compact rule list styling",
+    "/* ── Rule List ── */",
+    """/* ── Rule List ── */
+.rule-item.collapsed .rule-grid{display:none}
+.rule-item.collapsed .rule-head{margin-bottom:0}
+.rule-head{gap:10px}
+.rule-summary{flex:1;min-width:0;line-height:1.5}
+.rule-summary-pattern{font-size:13px;font-weight:600;color:var(--txt-primary);overflow-wrap:anywhere}
+.rule-summary-meta{font-size:11px;color:var(--txt-muted);margin-top:3px}
+.rule-summary-targets{font-size:11px;color:var(--txt-secondary);margin-top:4px;overflow-wrap:anywhere}
+.rule-expand{background:var(--surface-bg);border:1px solid var(--border-default);border-radius:var(--r-sm);color:var(--txt-secondary);cursor:pointer;padding:4px 9px;white-space:nowrap}
+.rule-expand:hover{border-color:var(--border-accent);color:var(--txt-primary)}
+""",
+)
+
+replace_exact(
+    "rule search control",
+    '<div class="rule-list" id="rule-list"></div>',
+    '<div class="test-row"><input type="search" id="rule-filter" placeholder="搜索语句或设备" oninput="filterRules()"><span id="rule-count" style="white-space:nowrap;color:var(--txt-muted);font-size:12px"></span></div>\n      <div class="rule-list" id="rule-list"></div>',
+)
+
+replace_exact(
     "entity helper insertion",
     "// ═══════════ DOMAIN INFO ═══════════",
     """// ═══════════ Rule entity selector ═══════════
@@ -66,8 +88,71 @@ function entityOptions(domain,current){
   }).join('');
   return out;
 }
+function ruleEntityIds(rule){
+  const value=(rule.action||{}).entity_id;
+  return Array.isArray(value)?value:(value?[value]:[]);
+}
+function ruleTargetNames(rule){
+  return ruleEntityIds(rule).map(id=>{
+    const device=haDevices.find(item=>item.entity_id===id);
+    return deviceAliases[id]||(device&&device.name)||id;
+  });
+}
+function ruleSearchText(rule){
+  return [rule.pattern||'',...ruleEntityIds(rule),...ruleTargetNames(rule)].join(' ').toLowerCase();
+}
+function ruleSummaryHtml(rule){
+  const action=rule.action||{};
+  const info=DINFO[action.domain]||{};
+  const operation=(info.s||{})[action.service]||action.service||'未设置操作';
+  const targets=ruleTargetNames(rule);
+  return '<div class="rule-summary-pattern">'+escHtml(rule.pattern||'未填写语句')+'</div>'+
+    '<div class="rule-summary-meta">'+escHtml(info.name||action.domain||'设备')+' · '+escHtml(operation)+' · '+targets.length+' 个设备</div>'+
+    '<div class="rule-summary-targets">'+escHtml(targets.join('、')||'尚未选择设备')+'</div>';
+}
+function toggleRule(button){
+  const row=button.closest('.rule-item');
+  row.classList.toggle('collapsed');
+  button.textContent=row.classList.contains('collapsed')?'编辑':'收起';
+}
+function filterRules(){
+  const query=(document.getElementById('rule-filter')?.value||'').trim().toLowerCase();
+  const rows=document.querySelectorAll('#rule-list .rule-item');
+  let shown=0;
+  rows.forEach(row=>{
+    const visible=!query||row.dataset.search.includes(query);
+    row.style.display=visible?'':'none';
+    if(visible)shown++;
+  });
+  const count=document.getElementById('rule-count');
+  if(count)count.textContent=shown+'/'+rows.length+' 条';
+}
 
 // ═══════════ DOMAIN INFO ═══════════""",
+)
+
+replace_exact(
+    "compact rule summary",
+    '''div.className='rule-item';div.dataset.idx=i;let h='<div class="rule-head"><span class="rule-num">#'+(i+1)+'</span><button class="rule-del"''',
+    '''div.className='rule-item collapsed';div.dataset.idx=i;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(i+1)+'</span><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div><button class="rule-expand" onclick="toggleRule(this)">编辑</button><button class="rule-del"''',
+)
+
+replace_exact(
+    "refresh rule count after render",
+    "rules.forEach((r,i)=>{list.appendChild(buildRule(r,i))})}",
+    "rules.forEach((r,i)=>{list.appendChild(buildRule(r,i))});filterRules()}",
+)
+
+replace_exact(
+    "refresh summary after saving",
+    "async function saveRules(){collectRulesFromUI();await saveCfg('rules')}",
+    "async function saveRules(){collectRulesFromUI();await saveCfg('rules');renderRules()}",
+)
+
+replace_exact(
+    "open newly added rule",
+    "renderRules();const last=document.querySelector('.rule-list')?.lastElementChild;if(last)last.scrollIntoView({behavior:'smooth'})}",
+    "document.getElementById('rule-filter').value='';renderRules();const last=document.querySelector('#rule-list .rule-item:last-child');if(last){toggleRule(last.querySelector('.rule-expand'));last.scrollIntoView({behavior:'smooth'})}}",
 )
 
 replace_exact(

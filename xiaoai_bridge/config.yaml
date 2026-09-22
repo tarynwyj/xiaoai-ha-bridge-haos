@@ -1,5 +1,5 @@
 name: "XiaoAI HA Bridge"
-version: "1.0.8"
+version: "1.0.9"
 slug: "xiaoai_bridge"
 description: "小爱音箱语音桥接 Home Assistant"
 url: "https://github.com/tarynwyj/xiaoai-ha-bridge-haos"

@@ -1,6 +1,7 @@
 from pathlib import Path
+import sys
 
-path = Path("/app/web/index.html")
+path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/app/web/index.html")
 html = path.read_text(encoding="utf-8")
 
 
@@ -82,6 +83,12 @@ replace_exact(
     "domain switch refresh",
     "const info=DINFO[d];const sel=item.querySelector('.r-s');",
     "const info=DINFO[d];const ent=item.querySelector('.r-e');if(ent)ent.innerHTML=entityOptions(d,'');const sel=item.querySelector('.r-s');",
+)
+
+replace_exact(
+    "save error detail",
+    "(d.ok?'保存成功':'保存失败')",
+    "(d.ok?'保存成功':(d.msg||'保存失败'))",
 )
 
 path.write_text(html, encoding="utf-8")

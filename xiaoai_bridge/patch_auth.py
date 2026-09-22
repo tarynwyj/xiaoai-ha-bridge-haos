@@ -123,6 +123,21 @@ replace_exact(
 )
 
 replace_exact(
+    "do not carry masked HA token to another address",
+    """    if cfg.get("homeassistant", {}).get("token") == masked:
+        cfg["homeassistant"]["token"] = existing.get("homeassistant", {}).get("token", "")
+""",
+    """    if cfg.get("homeassistant", {}).get("token") == masked:
+        previous_ha = existing.get("homeassistant", {}) or {}
+        old_url = (previous_ha.get("url") or "").strip().rstrip("/")
+        new_url = (cfg["homeassistant"].get("url") or "").strip().rstrip("/")
+        if new_url != old_url:
+            return {"ok": False, "msg": "HA 地址已更改，请输入新 Token 再保存"}
+        cfg["homeassistant"]["token"] = previous_ha.get("token", "")
+""",
+)
+
+replace_exact(
     "use saved QR identity in connection test",
     """        cookie_text = req.cookie_text or mi.get("cookie_text", "")
         if cookie_text and not cookie_text.startswith("https://"):
@@ -308,6 +323,55 @@ replace_exact(
     """            log.info("QR 扫码登录成功，micoapi serviceToken 已保存")
             await s.close()
             return {"ok": True, "done": True, "msg": "扫码登录成功"}
+""",
+)
+
+replace_exact(
+    "resolve masked HA token for tests",
+    """@app.post("/api/test/ha")
+async def test_ha(req: TestHARequest):
+    ha = HAClient(req.url, req.token)
+""",
+    """def _resolve_ha_credentials(req: TestHARequest) -> tuple[str, str]:
+    \"\"\"Use the saved token only for the exact HA address it belongs to.\"\"\"
+    url = req.url.strip().rstrip("/")
+    if not url:
+        raise ValueError("请先填写 Home Assistant 地址")
+
+    token = req.token.strip()
+    if token == "••••••••":
+        saved = load_config().get("homeassistant", {}) or {}
+        if url != (saved.get("url") or "").strip().rstrip("/"):
+            raise ValueError("HA 地址已更改，请输入该地址的新 Token")
+        token = saved.get("token") or ""
+    if not token:
+        raise ValueError("请先填写 Long-Lived Token")
+    return url, token
+
+
+@app.post("/api/test/ha")
+async def test_ha(req: TestHARequest):
+    try:
+        url, token = _resolve_ha_credentials(req)
+    except ValueError as e:
+        return {"ok": False, "msg": str(e)}
+    ha = HAClient(url, token)
+""",
+)
+
+replace_exact(
+    "resolve masked HA token for services",
+    """@app.post("/api/ha/services")
+async def get_ha_services(req: TestHARequest):
+    ha = HAClient(req.url, req.token)
+""",
+    """@app.post("/api/ha/services")
+async def get_ha_services(req: TestHARequest):
+    try:
+        url, token = _resolve_ha_credentials(req)
+    except ValueError as e:
+        return {"ok": False, "msg": str(e)}
+    ha = HAClient(url, token)
 """,
 )
 

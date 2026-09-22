@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6
+- Fix the Home Assistant connection test when the saved token is masked in the web UI.
+- Reuse a saved token only for its original HA address; require a new token when changing the address.
+- Prevent saving a changed HA address with the old masked token, and show the error in the web UI.
+- Apply the same behavior to the HA services endpoint.
+
 ## 1.0.5
 - Allow QR-only accounts to reconnect from saved `passToken` credentials without requiring a stored username and password.
 - Reuse the saved QR identity when testing the Xiaomi connection after an app restart or update.

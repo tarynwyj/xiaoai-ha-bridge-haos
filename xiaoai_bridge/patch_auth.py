@@ -112,6 +112,14 @@ replace_exact(
 )
 
 replace_exact(
+    "send authentication cookies on every conversation poll",
+    '    cookies = {"deviceId": device_id}\n',
+    '''    cookies = _get_cookie(load_config()) or {}
+    cookies["deviceId"] = device_id
+''',
+)
+
+replace_exact(
     "micoapi token helper",
     """async def bridge_loop():
 """,

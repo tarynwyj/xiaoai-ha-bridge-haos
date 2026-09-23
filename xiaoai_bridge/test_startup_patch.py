@@ -11,8 +11,11 @@ from types import ModuleType, SimpleNamespace
 
 
 source_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/app/bridge.py")
-tree = ast.parse(source_path.read_text(encoding="utf-8"))
-assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in source_path.read_text(encoding="utf-8")
+source_text = source_path.read_text(encoding="utf-8")
+tree = ast.parse(source_text)
+assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in source_text
+assert 'cookies = _get_cookie(load_config()) or {}' in source_text
+assert 'cookies["deviceId"] = device_id' in source_text
 intent_node = next(
     node for node in tree.body
     if isinstance(node, ast.ClassDef) and node.name == "IntentParser"

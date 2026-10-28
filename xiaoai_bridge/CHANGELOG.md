@@ -34,10 +34,21 @@
 - 规则收集限定在 `#rule-list` 内，修复访问设备/计划页面后保存规则报错的问题。
 - 未选择实体时保存为空字符串（与上游一致），不再写入 `entity_id: []`。
 
-### 构建
+### 构建与发布
 - 新增 `requirements.lock.txt` 固定运行期依赖版本（上游 `requirements.txt` 只有 `>=`）。
-- 构建期额外执行两套回归测试（登录/Token 模拟 + HTTP 鉴权），任一失败即拒绝构建。
+- 构建期额外执行三套回归测试（登录/Token 模拟 + HTTP 鉴权 + Ingress 契约），任一失败即拒绝构建。
 - CI 增加静态检查：全部文件编译、补丁禁止二次应用、禁止 `ssl=False` / `str(TOKEN_PATH)`。
+- **CI 与正式发布拆分为两个工作流**：
+  - `.github/workflows/ci.yml`：PR / push main / 手动触发，执行全部静态检查、宿主测试与 Docker
+    构建加镜像内测试；**不登录 GHCR、无 `packages: write`、`push: false`**，并有守卫步骤在出现
+    任何 registry 登录/推送时直接失败；
+  - `.github/workflows/release.yml`：**仅手动触发**且**仅允许 `refs/heads/main`**，校验
+    `inputs.version` 与 `config.yaml` 一致、拒绝覆盖已存在的 `<version>` 标签、发布前重跑全套测试，
+    最后**只推送不可变的 `<version>` 标签**；`:latest` 不会被推送（`allow_latest=true` 直接失败）。
+- 新增 `test_ingress_contract.py`：校验 `ingress_port` 与实际监听端口一致、前端在 Ingress 前缀下的
+  相对路径解析、Supervisor 对端信任、直连令牌接口不向未授权请求泄露、旧 `/data` 可正常加载。
+- 新增 `test_upgrade_data.py`：用 1.0.9 与 1.0.10 的真实补丁代码做「1.0.9 → 1.0.10 → 1.0.9」
+  的 `/data` 往返，验证升级与回退的数据可操作性（附加组件安装器本身仍需真机验证）。
 - 原有上游 Commit 固定机制（`UPSTREAM_REF`）与补丁架构（`patch_web.py` / `patch_auth.py`）保持不变。
 
 ## 1.0.9

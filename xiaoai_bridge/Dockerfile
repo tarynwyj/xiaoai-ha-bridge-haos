@@ -46,14 +46,16 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && ! grep -Fq 'str(TOKEN_PATH)' /app/bridge.py \
     && rm /tmp/patch_auth.py
 
-# Build-time regression suite: login/token/credential simulation plus the
-# HTTP-level access-control tests. Both run against the freshly patched app and
-# only need the runtime dependencies, so a broken patch fails the build instead
-# of reaching users.
-COPY test_startup_patch.py test_api_auth.py /tmp/
+# Build-time regression suite: login/token/credential simulation, HTTP-level
+# access control and the HAOS Ingress contract (port, relative fetch paths).
+# They only need the runtime dependencies, so a broken patch fails the build
+# instead of reaching users.
+COPY test_startup_patch.py test_api_auth.py test_ingress_contract.py /tmp/
 RUN python /tmp/test_startup_patch.py /app/bridge.py \
     && python /tmp/test_api_auth.py /app \
-    && rm /tmp/test_startup_patch.py /tmp/test_api_auth.py
+    && python /tmp/test_ingress_contract.py \
+         --bridge /app/bridge.py --html /app/web/index.html --no-node \
+    && rm /tmp/test_startup_patch.py /tmp/test_api_auth.py /tmp/test_ingress_contract.py
 
 RUN rm -rf /app/config /app/logs \
     && ln -s /data/config /app/config \

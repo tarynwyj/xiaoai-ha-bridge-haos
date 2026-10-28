@@ -23,6 +23,9 @@
   micoapi token，成功后同步 MiNAService 与轮询 Cookie；失败则指数退避（10s → 300s 上限），
   不再按轮询间隔高频重试，也不会覆盖或删除仍然有效的凭据。
 - 仅扫码 / 仅 Cookie（没有账号密码）的场景可以正常启动并自动恢复。
+- **修复对话轮询丢失认证 Cookie**：轮询请求现在显式携带 `userId` + `serviceToken`（保留当前目标音箱
+  的 `deviceId`），不再依赖共享 CookieJar 的域名匹配；同时禁止轮询跟随重定向，避免认证 Cookie 被
+  发往其它主机。根因与修法来自社区 PR #4（@caideone），本版本补充了 CookieJar 修复与回归测试。
 - 保存凭据时只写非空字段并与磁盘已有值合并，避免一次不完整的刷新把 passToken 清空。
 - 新增「清除登录凭据」按钮与 `POST /api/xiaomi/clear-login`：用户主动清除时同时删除
   `auth.json`、`.mi.token` 与配置中的 Cookie/密码，之后不会被旧页面保存逻辑自动恢复。

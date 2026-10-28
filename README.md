@@ -44,7 +44,10 @@ build itself refuses to finish unless the freshly patched app passes these suite
   rejection, Ingress trust, credential clearing);
 - `xiaoai_bridge/test_ingress_contract.py` — HAOS Ingress contract: `ingress_port` vs the
   actually listened port, relative `fetch` rewriting under the ingress prefix, supervisor
-  peer trust, and the direct-token endpoint not leaking to unauthorised callers.
+  peer trust, and the direct-token endpoint not leaking to unauthorised callers;
+- `xiaoai_bridge/test_poll_auth.py` — the conversation poll really carries the Xiaomi
+  auth cookies (not just `deviceId`), keeps the selected speaker, and never sends them to
+  a redirect target.
 
 Run them locally against a patched tree:
 
@@ -52,6 +55,7 @@ Run them locally against a patched tree:
 python xiaoai_bridge/patch_auth.py  /tmp/app/bridge.py   # patched from the pinned upstream commit
 python xiaoai_bridge/patch_web.py   /tmp/app/web/index.html
 python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
+python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
 python xiaoai_bridge/test_api_auth.py /tmp/app
 python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
 python xiaoai_bridge/test_ingress_contract.py --bridge /tmp/app/bridge.py \

@@ -199,22 +199,33 @@ def _restore_token(account, snapshot: dict) -> None:
         account.token = dict(snapshot)
 
 
+def _poll_auth_cookies(device_id: str) -> dict:
+    '''Authentication cookies attached to every conversation poll request.
+
+    The shared CookieJar cannot be relied on here: aiohttp keeps the domain on the
+    morsels, so injecting one SimpleCookie for several hosts stores everything
+    under the first host and userprofile.mina.mi.com ends up with no credentials
+    (that is the "connected but zero commands" bug). Attaching them per request
+    also makes the selected speaker deviceId win over the stored one.
+    '''
+    cookies = dict(_get_cookie(load_config()) or {})
+    cookies["deviceId"] = device_id
+    return cookies
+
+
 def _apply_cookie_to_session(session, cfg: dict) -> bool:
-    '''Push the token derived Cookie into the polling session.'''
+    '''Push the token derived Cookie into the polling session CookieJar.
+
+    A plain dict is used per domain on purpose: reusing one SimpleCookie across
+    domains stores every cookie under the first host (see _poll_auth_cookies).
+    '''
     cookies = _get_cookie(cfg)
     if not cookies:
         return False
     try:
         import yarl
-        from http.cookies import SimpleCookie
-        jar = SimpleCookie()
-        for key, value in cookies.items():
-            try:
-                jar[key] = value
-            except Exception:
-                pass
-        for domain in ("account.xiaomi.com", ".mina.mi.com"):
-            session.cookie_jar.update_cookies(jar, yarl.URL(f"https://{domain}/"))
+        for domain in ("account.xiaomi.com", "mina.mi.com", "userprofile.mina.mi.com"):
+            session.cookie_jar.update_cookies(dict(cookies), yarl.URL(f"https://{domain}/"))
         return True
     except Exception as e:
         log.warning("写入轮询 Cookie 失败: %s", e)
@@ -1300,6 +1311,29 @@ replace_exact(
     '    # so a client-supplied X-Forwarded-For must never be able to rewrite it.\n'
     '    uvicorn.run(app, host="0.0.0.0", port=WEB_PORT, log_level="warning",\n'
     '                proxy_headers=False)',
+)
+
+# ──────────────── D: 对话轮询必须显式携带认证 Cookie（PR #4） ────────────────
+replace_exact(
+    "poll requests carry the xiaomi auth cookies",
+    '    cookies = {"deviceId": device_id}\n',
+    """    cookies = _poll_auth_cookies(device_id)
+""",
+)
+
+replace_exact(
+    "poll must not follow redirects with auth cookies",
+    "            r = await session.get(url, timeout=timeout, cookies=cookies)\n",
+    """            # aiohttp re-sends an explicit cookies= dict on redirects, so a
+            # redirect would hand userId/serviceToken to another host. Never
+            # follow one from the polling endpoint.
+            r = await session.get(url, timeout=timeout, cookies=cookies,
+                                  allow_redirects=False)
+            if 300 <= r.status < 400:
+                log.warning("对话轮询被重定向 (%s → %s)，已停止跟随以保护认证 Cookie",
+                            r.status, str(r.headers.get("Location", ""))[:120])
+                return [], last_ts, False
+""",
 )
 
 path.write_text(source, encoding="utf-8")

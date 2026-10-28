@@ -199,6 +199,9 @@ def _restore_token(account, snapshot: dict) -> None:
         account.token = dict(snapshot)
 
 
+POLL_COOKIE_KEYS = ("userId", "serviceToken")
+
+
 def _poll_auth_cookies(device_id: str) -> dict:
     '''Authentication cookies attached to every conversation poll request.
 
@@ -207,8 +210,14 @@ def _poll_auth_cookies(device_id: str) -> dict:
     under the first host and userprofile.mina.mi.com ends up with no credentials
     (that is the "connected but zero commands" bug). Attaching them per request
     also makes the selected speaker deviceId win over the stored one.
+
+    Least privilege: only the two session cookies the conversation API actually
+    needs are forwarded. passToken is a long lived login credential that belongs
+    to the refresh path (account.xiaomi.com) and must never travel to the
+    conversation host, even when the user pasted a full browser cookie.
     '''
-    cookies = dict(_get_cookie(load_config()) or {})
+    saved = _get_cookie(load_config()) or {}
+    cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     cookies["deviceId"] = device_id
     return cookies
 
@@ -216,15 +225,21 @@ def _poll_auth_cookies(device_id: str) -> dict:
 def _apply_cookie_to_session(session, cfg: dict) -> bool:
     '''Push the token derived Cookie into the polling session CookieJar.
 
+    Only the polling hosts receive these cookies, and only the session cookies
+    (userId + serviceToken): account.xiaomi.com is the login/refresh domain and is
+    filled by the login flow itself with the full cookie set, so passToken is
+    never spread here.
+
     A plain dict is used per domain on purpose: reusing one SimpleCookie across
     domains stores every cookie under the first host (see _poll_auth_cookies).
     '''
-    cookies = _get_cookie(cfg)
+    saved = _get_cookie(cfg) or {}
+    cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     if not cookies:
         return False
     try:
         import yarl
-        for domain in ("account.xiaomi.com", "mina.mi.com", "userprofile.mina.mi.com"):
+        for domain in ("mina.mi.com", "userprofile.mina.mi.com"):
             session.cookie_jar.update_cookies(dict(cookies), yarl.URL(f"https://{domain}/"))
         return True
     except Exception as e:

@@ -324,6 +324,21 @@ class Harness:
             "JSONResponse": object,
             "HTMLResponse": object,
         }
+        # Module level constants the extracted functions read at call time
+        # (e.g. POLL_COOKIE_KEYS). Explicit values above win.
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                name = node.targets[0].id
+                if name.isupper() and name not in namespace:
+                    try:
+                        namespace[name] = ast.literal_eval(node.value)
+                    except (ValueError, SyntaxError):
+                        pass
+
         intent_node = next(
             node for node in tree.body
             if isinstance(node, ast.ClassDef) and node.name == "IntentParser"

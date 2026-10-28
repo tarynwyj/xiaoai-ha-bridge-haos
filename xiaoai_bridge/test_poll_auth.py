@@ -115,6 +115,17 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
             ClientSession=object,
         ),
     }
+    # Module level constants the extracted functions rely on (e.g. the cookie
+    # allow-list). Explicit values above win.
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name.isupper() and name not in namespace:
+                try:
+                    namespace[name] = ast.literal_eval(node.value)
+                except (ValueError, SyntaxError):
+                    pass
+
     for name in names:
         node = next(
             (node for node in tree.body
@@ -179,6 +190,8 @@ def scenario_auth_cookies_present(root):
     check(cookies.get("userId") == "user-1", f"poll must carry userId, got {sorted(cookies)}")
     check(cookies.get("serviceToken") == "service-token-1",
           f"poll must carry serviceToken, got {sorted(cookies)}")
+    check(set(cookies) == {"userId", "serviceToken", "deviceId"},
+          f"poll must not carry anything besides the three needed cookies, got {sorted(cookies)}")
     check(cookies.get("deviceId") == "speaker-target",
           f"poll must keep the selected speaker deviceId, got {cookies.get('deviceId')!r}")
     check(urlsplit(url).hostname == POLL_HOST, f"poll must target {POLL_HOST}, got {url}")
@@ -204,10 +217,16 @@ def scenario_target_device_wins(root):
     return "target speaker deviceId overrides the stored one"
 
 
-def scenario_cookie_only_install(root):
-    # QR / Cookie-only installs have no .mi.token at all.
-    cfg = make_data(root, write_token=False,
-                    cookie_text="userId=qr-user; passToken=qr-pass; serviceToken=qr-svc; deviceId=qr-dev")
+def scenario_cookie_only_does_not_send_pass_token(root):
+    """A pasted browser cookie contains passToken; the poll must not forward it."""
+    cfg = make_data(
+        root,
+        write_token=False,
+        cookie_text=(
+            "userId=qr-user; passToken=qr-pass; serviceToken=qr-svc; deviceId=qr-dev; "
+            "cUserId=qr-cuid; refreshToken=qr-refresh"
+        ),
+    )
     log = Logger()
     namespace = build_namespace(root, cfg, log)
     session = FakeSession()
@@ -215,7 +234,13 @@ def scenario_cookie_only_install(root):
     cookies = session.calls[0][1]["cookies"]
     check(cookies.get("userId") == "qr-user" and cookies.get("serviceToken") == "qr-svc",
           f"cookie-only install must still send auth, got {sorted(cookies)}")
-    return "cookie-only install still sends the auth cookies"
+    check(set(cookies) == {"userId", "serviceToken", "deviceId"},
+          f"poll must send exactly userId+serviceToken+deviceId, got {sorted(cookies)}")
+    check("passToken" not in cookies,
+          f"passToken is a login credential and must never reach the poll, got {sorted(cookies)}")
+    check("refreshToken" not in cookies and "cUserId" not in cookies,
+          f"unknown cookie fields must not be forwarded, got {sorted(cookies)}")
+    return "cookie-only poll sends userId+serviceToken+deviceId and never passToken"
 
 
 def scenario_no_credentials(root):
@@ -251,29 +276,72 @@ def scenario_redirect_does_not_leak(root):
     return "a 302 is not followed, so cookies never reach another host"
 
 
-def scenario_jar_injection_reaches_poll_host(root):
-    cfg = make_data(root)
+def scenario_jar_least_privilege(root):
+    """The CookieJar is only used by the polling hosts and only for session cookies."""
+    cfg = make_data(
+        root,
+        write_token=False,
+        cookie_text="userId=qr-user; passToken=qr-pass; serviceToken=qr-svc; deviceId=qr-dev",
+    )
     log = Logger()
     namespace = build_namespace(root, cfg, log)
     session = FakeSession()
 
     async def exercise():
+        import yarl
+
         jar = aiohttp.CookieJar()
         session.cookie_jar = jar
         applied = namespace["_apply_cookie_to_session"](session, cfg)
-        poll_url = (
-            "https://userprofile.mina.mi.com/device_profile/v2/conversation"
-            "?source=dialogu&hardware=L05C&timestamp=1&limit=2"
+
+        def cookies_for(url):
+            return {k: m.value for k, m in jar.filter_cookies(yarl.URL(url)).items()}
+
+        return (
+            applied,
+            cookies_for(
+                "https://userprofile.mina.mi.com/device_profile/v2/conversation?limit=2"
+            ),
+            cookies_for("https://api2.mina.mi.com/remote/ubus"),
+            cookies_for("https://account.xiaomi.com/pass/serviceLoginAuth2"),
         )
-        import yarl
 
-        return applied, {k: m.value for k, m in jar.filter_cookies(yarl.URL(poll_url)).items()}
-
-    applied, jar_cookies = asyncio.run(exercise())
+    applied, poll_cookies, mina_cookies, account_cookies = asyncio.run(exercise())
     check(applied is True, "_apply_cookie_to_session must report success")
-    check(jar_cookies.get("userId") == "user-1" and jar_cookies.get("serviceToken") == "service-token-1",
-          f"the CookieJar must serve auth cookies to the poll host, got {sorted(jar_cookies)}")
-    return "CookieJar injection really reaches userprofile.mina.mi.com"
+    check(poll_cookies.get("userId") == "qr-user"
+          and poll_cookies.get("serviceToken") == "qr-svc",
+          f"the CookieJar must serve auth cookies to the poll host, got {sorted(poll_cookies)}")
+    check(set(poll_cookies) == {"userId", "serviceToken"},
+          f"the poll host must only get the two session cookies, got {sorted(poll_cookies)}")
+    check("passToken" not in poll_cookies and "passToken" not in mina_cookies,
+          "passToken must not be injected into the mina domains")
+    check(account_cookies == {},
+          f"the login domain is filled by the login flow, not here: got {sorted(account_cookies)}")
+    return "CookieJar gets userId+serviceToken for polling hosts only, never passToken"
+
+
+def scenario_login_and_refresh_still_get_pass_token(root):
+    """QR login / token refresh keep using passToken: only the poll paths filter it."""
+    cfg = make_data(
+        root,
+        write_token=False,
+        cookie_text="userId=qr-user; passToken=qr-pass; serviceToken=qr-svc; deviceId=qr-dev",
+    )
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    raw = namespace["_get_cookie"](cfg) or {}
+
+    check(raw.get("passToken") == "qr-pass",
+          "exactly: _get_cookie must stay unchanged for the login/refresh paths")
+    check("POLL_COOKIE_KEYS" in built,
+          "the poll allow-list must be an explicit constant in the patched bridge")
+    check('saved["passToken"]' in built,
+          "the refresh path must still read the saved passToken")
+    check('"passToken": pass_token' in built,
+          "the micoapi exchange must still send passToken to the login endpoint")
+    check("passToken" in raw and "passToken" not in namespace["_poll_auth_cookies"]("dev"),
+          "the filter must apply to the poll only")
+    return "QR login and micoapi refresh keep passToken; only the poll filters it"
 
 
 def scenario_redirect_would_leak_without_the_flag(root):
@@ -329,10 +397,11 @@ def main():
     scenarios = [
         scenario_auth_cookies_present,
         scenario_target_device_wins,
-        scenario_cookie_only_install,
+        scenario_cookie_only_does_not_send_pass_token,
         scenario_no_credentials,
         scenario_redirect_does_not_leak,
-        scenario_jar_injection_reaches_poll_host,
+        scenario_jar_least_privilege,
+        scenario_login_and_refresh_still_get_pass_token,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

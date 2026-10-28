@@ -10,6 +10,8 @@ on:
       - xiaoai_bridge/patch_auth.py
       - xiaoai_bridge/patch_web.py
       - xiaoai_bridge/test_startup_patch.py
+      - xiaoai_bridge/test_api_auth.py
+      - xiaoai_bridge/requirements.lock.txt
       - xiaoai_bridge/config.yaml
       - .github/workflows/build.yml
 
@@ -18,8 +20,68 @@ permissions:
   packages: write
 
 jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile every Python file
+        run: |
+          python -m compileall -q xiaoai_bridge
+          python -m py_compile xiaoai_bridge/patch_auth.py xiaoai_bridge/patch_web.py \
+            xiaoai_bridge/test_startup_patch.py xiaoai_bridge/test_api_auth.py
+
+      - name: Reject accidental secrets or TLS opt-outs in patches
+        run: |
+          set -euo pipefail
+          ! grep -RIn "ssl=False" xiaoai_bridge/patch_auth.py
+          ! grep -RIn "ssl=_create_unverified_context" xiaoai_bridge/patch_auth.py
+          ! grep -RIn "str(TOKEN_PATH)" xiaoai_bridge/patch_auth.py
+
+      - name: Web patch regression (rebuild from pinned upstream)
+        run: |
+          set -euo pipefail
+          REF=e4c82d4b4e872ff5d02d1baec089a6b4ad36734a
+          BASE="https://raw.githubusercontent.com/chenshuhe/xiaoai-ha-bridge/${REF}"
+          mkdir -p /tmp/pinned
+          curl -fsSL -o /tmp/pinned/index.html "${BASE}/web/index.html"
+          curl -fsSL -o /tmp/pinned/bridge.py "${BASE}/bridge.py"
+          # test_web_patch.py rebuilds the UI from the pristine file in a temp dir,
+          # checks source invariants and runs the extracted JS on a DOM stub.
+          python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
+
+      - name: Patch the pinned upstream and run the bridge tests
+        run: |
+          set -euo pipefail
+          cp /tmp/pinned/bridge.py /tmp/pinned/bridge_patched.py
+          python xiaoai_bridge/patch_auth.py /tmp/pinned/bridge_patched.py
+          python xiaoai_bridge/test_startup_patch.py /tmp/pinned/bridge_patched.py
+
+      - name: Patches must refuse to run twice (anchor uniqueness)
+        run: |
+          set -euo pipefail
+          cp /tmp/pinned/bridge.py /tmp/pinned/twice.py
+          python xiaoai_bridge/patch_auth.py /tmp/pinned/twice.py
+          if python xiaoai_bridge/patch_auth.py /tmp/pinned/twice.py; then
+            echo "patch_auth.py must refuse to patch an already patched file" >&2
+            exit 1
+          fi
+          cp /tmp/pinned/index.html /tmp/pinned/twice.html
+          python xiaoai_bridge/patch_web.py /tmp/pinned/twice.html
+          if python xiaoai_bridge/patch_web.py /tmp/pinned/twice.html; then
+            echo "patch_web.py must refuse to patch an already patched file" >&2
+            exit 1
+          fi
+
   build:
     runs-on: ubuntu-latest
+    needs: static-checks
 
     steps:
       - name: Check out repository
@@ -65,10 +127,22 @@ jobs:
       - name: Smoke-test patched image
         shell: bash
         run: |
+          set -euo pipefail
           IMAGE="ghcr.io/${{ github.repository_owner }}/xiaoai-ha-bridge-haos:${{ steps.app.outputs.version }}"
-          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\" multiple size=\"6\">' in w; assert \"#rule-list .rule-item\" in w; assert 'function ruleSummaryHtml(rule)' in w; assert 'id=\"rule-filter\"' in w; assert 'async function loadRuleDevices()' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b; assert 'IntentParser(load_config().get(\"intent_rules\", [])).parse(query)' in b"
+          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\" multiple size=\"6\">' in w; assert '#rule-list .rule-item' in w; assert 'function ruleSummaryHtml(rule)' in w; assert 'id=\"rule-filter\"' in w; assert 'async function loadRuleDevices()' in w; assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'clearXiaomiLogin' in w; assert 'revealDirectToken' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b; assert 'async def _relogin_and_refresh' in b; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b; assert 'IntentParser(load_config().get(\"intent_rules\", [])).parse(query)' in b"
           docker run --rm --entrypoint python -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py
+          docker run --rm --entrypoint python \
+            -v "$PWD/xiaoai_bridge/test_api_auth.py:/tmp/test_api_auth.py:ro" \
+            "$IMAGE" /tmp/test_api_auth.py /app
           test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
+
+      - name: Verify ingress metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^ingress: true$' xiaoai_bridge/config.yaml
+          grep -Eq '^ingress_port: 47521$' xiaoai_bridge/config.yaml
+          grep -Eq '^panel_admin: true$' xiaoai_bridge/config.yaml
 
       - name: Push verified image
         shell: bash

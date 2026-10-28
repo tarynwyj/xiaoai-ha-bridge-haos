@@ -1,0 +1,16 @@
+# Pinned runtime dependencies for reproducible builds.
+#
+# The upstream requirements.txt only uses lower bounds (>=), so two builds of the
+# same pinned upstream commit could install different libraries. This file pins
+# the exact versions the add-on is tested against; the Dockerfile installs this
+# file instead of the upstream requirements.txt.
+#
+# Bump deliberately (one at a time) and let CI build + smoke-test before release.
+# Transitive dependencies are still resolved by pip and are not pinned here.
+aiofiles==25.1.0
+miservice_fork==2.9.3
+aiohttp==3.14.3
+pyyaml==6.0.3
+fastapi==0.133.1
+uvicorn[standard]==0.41.0
+python-multipart==0.0.32

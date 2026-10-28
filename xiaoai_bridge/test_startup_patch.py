@@ -1,7 +1,26 @@
-"""Isolated checks for the patched bridge's QR-only startup path."""
+"""Isolated behavioural tests for the patched bridge.
+
+The tests run against the *patched* ``bridge.py`` (produces by ``patch_auth.py``)
+without installing miservice and without any network access: every I/O seam is
+replaced by an in-memory fake, and the real functions under test are lifted from
+the AST so they execute as the shipped code does.
+
+Covered scenarios (see task list C/D/E):
+  1.  normal start with a still-valid cached micoapi token
+  2.  cached token expired -> passToken refresh -> start succeeds
+  3.  QR / Cookie only install (no username + password) logs in
+  4.  runtime 401 -> refresh succeeds -> polling resumes and a command executes
+  5.  runtime 401 -> refresh fails -> exponential backoff, credentials untouched
+  6.  _save_auth_and_token never blanks a valid credential
+  7.  post_config: masked / stale-page save keeps secrets, explicit clear wipes
+  8.  multi-entity intent rules survive the parser (regression G, backend side)
+
+Usage: python test_startup_patch.py [/app/bridge.py]
+"""
 
 import ast
-import asyncio
+import asyncio as real_asyncio
+import datetime as real_datetime
 import json
 import re
 import sys
@@ -9,174 +28,630 @@ import tempfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-
 source_path = Path(sys.argv[1] if len(sys.argv) > 1 else "/app/bridge.py")
-tree = ast.parse(source_path.read_text(encoding="utf-8"))
-assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in source_path.read_text(encoding="utf-8")
-intent_node = next(
-    node for node in tree.body
-    if isinstance(node, ast.ClassDef) and node.name == "IntentParser"
+source = source_path.read_text(encoding="utf-8")
+tree = ast.parse(source)
+assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in source, (
+    "patched bridge.py must re-read intent rules on every command"
 )
-intent_namespace = {"re": re}
-exec(compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"), intent_namespace)
-multi_entity_ids = ["switch.one", "switch.two", "switch.three", "switch.four"]
-parsed_action = intent_namespace["IntentParser"]([{
-    "pattern": "打开客厅灯",
-    "action": {
-        "domain": "switch", "service": "turn_on",
-        "entity_id": multi_entity_ids,
-    },
-}]).parse("打开客厅灯")
-assert parsed_action["entity_id"] == multi_entity_ids
-needed = {"_set_token", "_load_saved_xiaomi_identity", "bridge_loop", "post_config"}
-nodes = {
-    node.name: node
-    for node in tree.body
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in needed
-}
-assert set(nodes) == needed
-nodes["post_config"].decorator_list = []
+
+MASKED = "\u2022" * 8
+WANTED_FUNCS = [
+    "_set_token",
+    "_load_saved_xiaomi_identity",
+    "_get_cookie",
+    "_refresh_micoapi_token",
+    "_token_snapshot",
+    "_restore_token",
+    "_apply_cookie_to_session",
+    "_relogin_and_refresh",
+    "_read_saved_credential",
+    "_save_auth_and_token",
+    "_merge_xiaomi_credentials",
+    "_delete_saved_login_files",
+    "_enforce_access_control",
+    "post_config",
+    "bridge_loop",
+]
+nodes = {}
+for node in tree.body:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in WANTED_FUNCS:
+        nodes[node.name] = node
+missing = [name for name in WANTED_FUNCS if name not in nodes]
+assert not missing, f"patched bridge.py is missing expected functions: {missing}"
+
+# FastAPI decorators cannot be evaluated here; keep the plain function bodies.
+for name in ("post_config", "bridge_loop"):
+    nodes[name].decorator_list = []
 
 
+# ───────────────────────── fakes ─────────────────────────
 class Logger:
     def __init__(self):
         self.messages = []
+        self.level = "INFO"
+
+    def _add(self, level, message, args):
+        text = message % args if args else message
+        self.messages.append(f"[{level}] {text}")
+
+    def debug(self, message, *args):
+        self._add("DEBUG", message, args)
 
     def info(self, message, *args):
-        self.messages.append(message % args if args else message)
+        self._add("INFO", message, args)
 
-    warning = info
-    error = info
+    def warning(self, message, *args):
+        self._add("WARNING", message, args)
+
+    def error(self, message, *args):
+        self._add("ERROR", message, args)
+
+    def exception(self, message, *args):
+        self._add("EXCEPTION", message, args)
+
+    def has(self, needle):
+        return any(needle in message for message in self.messages)
+
+
+class FakeCookieJar:
+    def __init__(self):
+        self.cleared = []
+        self.updated = []
+
+    def clear_domain(self, domain):
+        self.cleared.append(domain)
+
+    def update_cookies(self, jar, url):
+        self.updated.append((jar, url))
 
 
 class FakeSession:
     def __init__(self):
         self.closed = False
+        self.cookie_jar = FakeCookieJar()
 
     async def close(self):
         self.closed = True
 
 
 class FakeAccount:
-    created = []
+    """Mimics miservice.MiAccount closely enough for the login paths."""
 
-    def __init__(self, session, username, password, token_store):
-        assert token_store is None, "MiService must not own/delete the saved token file"
+    instances = []
+    reject_service_login = False
+
+    def __init__(self, session, username, password, token_store=None):
+        assert token_store is None, "MiService must never own the saved token file"
+        self.session = session
+        self.username = username
+        self.password = password
+        self.token_store = token_store
         self.token = None
-        self.created.append(self)
+        self.service_login_calls = []
+        self.instances.append(self)
+
+    async def _serviceLogin(self, uri, data=None):
+        self.service_login_calls.append(uri)
+        if FakeAccount.reject_service_login:
+            return {"code": 70016, "description": "passToken 已失效"}
+        return {
+            "code": 0,
+            "location": "https://sts.example.invalid/sts",
+            "nonce": "1234567",
+            "ssecurity": "ssecurity-value",
+            "userId": "user-1",
+            "passToken": "pass-token-rotated",
+        }
+
+    async def _securityTokenService(self, location, nonce, ssecurity):
+        if FakeAccount.reject_service_login:
+            raise RuntimeError("STS rejected")
+        return "fresh-service-token"
 
     async def login(self, sid):
-        raise AssertionError("cached valid micoapi must not re-login")
+        raise AssertionError("legacy MiAccount.login() must not be used for recovery")
 
 
 class FakeMiNAService:
-    calls = 0
-
     def __init__(self, account):
         self.account = account
+        FakeMiNAService.created.append(self)
+
+    created = []
 
     async def device_list(self):
-        self.__class__.calls += 1
-        if self.account.token["micoapi"][1] != "valid-service":
-            self.account.token = None  # emulate MiService's 401 handling
+        token = self.account.token
+        if not isinstance(token, dict):
+            raise RuntimeError("HTTP 401 (token cleared)")
+        micoapi = token.get("micoapi") or ("", "")
+        service = micoapi[1] if len(micoapi) > 1 else ""
+        if service not in ("valid-service", "fresh-service-token"):
+            # Emulate miservice: a 401 clears the in-memory token.
+            self.account.token = None
             raise RuntimeError("HTTP 401")
-        return [{"deviceID": "speaker-1", "hardware": "L05C", "name": "speaker"}]
+        return [{"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅音箱"}]
+
+    async def text_to_speech(self, device_id, text):
+        FakeMiNAService.said.append(text)
+
+
+FakeMiNAService.created = []
+FakeMiNAService.said = []
 
 
 class FakeHAClient:
-    calls = 0
+    created = []
+    calls = []
+    stop_after_connect = False
+    state = None
 
     def __init__(self, url, token):
         assert url == "http://homeassistant:80"
         assert token == "ha-secret"
+        self.url = url
+        self.token = token
+        FakeHAClient.created.append(self)
 
     async def test_connection(self, session):
-        self.__class__.calls += 1
-        namespace["bridge_state"]["running"] = False
+        if FakeHAClient.stop_after_connect:
+            FakeHAClient.state["running"] = False
+        return True
+
+    async def call_service(self, domain, service, data, session):
+        FakeHAClient.calls.append((domain, service, dict(data)))
+        FakeHAClient.state["running"] = False
         return True
 
 
-miservice = ModuleType("miservice")
-miservice.MiAccount = FakeAccount
-miservice.MiNAService = FakeMiNAService
-miaccount = ModuleType("miservice.miaccount")
-miaccount.get_random = lambda length: "R" * length
-sys.modules["miservice"] = miservice
-sys.modules["miservice.miaccount"] = miaccount
+def install_miservice_stubs():
+    miservice = ModuleType("miservice")
+    miservice.MiAccount = FakeAccount
+    miservice.MiNAService = FakeMiNAService
+    miaccount = ModuleType("miservice.miaccount")
+    miaccount.get_random = lambda length: "R" * length
+    sys.modules["miservice"] = miservice
+    sys.modules["miservice.miaccount"] = miaccount
+    yarl = ModuleType("yarl")
+    yarl.URL = lambda text: text
+    sys.modules["yarl"] = yarl
 
 
-with tempfile.TemporaryDirectory() as temp_dir:
-    root = Path(temp_dir)
-    token_path = root / ".mi.token"
-    auth_path = root / "auth.json"
-    cfg = {
-        "xiaomi": {"username": "", "password": "", "cookie_text": "", "device_did": "speaker-1"},
-        "homeassistant": {"url": "http://homeassistant:80", "token": "ha-secret"},
-        "intent_rules": [],
-        "poll_interval_seconds": 2,
+class Harness:
+    """One isolated patched-bridge runtime with its own /data tree."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.token_path = root / "config" / ".mi.token"
+        self.auth_path = root / "config" / "auth.json"
+        self.cfg_path = root / "config" / "config.yaml"
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg = {
+            "xiaomi": {
+                "username": "",
+                "password": "",
+                "cookie_text": "",
+                "device_did": "speaker-1",
+                "hardware": "L05C",
+                "tts_reply": True,
+            },
+            "homeassistant": {"url": "http://homeassistant:80", "token": "ha-secret"},
+            "intent_rules": [],
+            "poll_interval_seconds": 2,
+        }
+        self.saved_configs = []
+        self.sleeps = []
+        self.log = Logger()
+        self.poll_script = []
+        self.bridge_state = {
+            "running": True,
+            "connected": False,
+            "error": None,
+            "devices": None,
+            "command_count": 0,
+        }
+        self.account_hooks = {}
+        FakeHAClient.state = self.bridge_state
+        self.namespace = self._build_namespace()
+
+    def _fake_asyncio(self):
+        sleeps = self.sleeps
+
+        async def sleep(delay):
+            sleeps.append(delay)
+            if len(sleeps) > 50:
+                raise AssertionError("the poll loop did not terminate within 50 iterations")
+
+        def create_task(coro):
+            coro.close()
+            return SimpleNamespace(done=lambda: True, cancel=lambda: None)
+
+        return SimpleNamespace(
+            sleep=sleep,
+            create_task=create_task,
+            CancelledError=real_asyncio.CancelledError,
+            TimeoutError=real_asyncio.TimeoutError,
+        )
+
+    async def fake_poll(self, session, device_id, hardware, last_ts):
+        if self.poll_script:
+            records, need_relogin = self.poll_script.pop(0)
+        else:
+            records, need_relogin = ([], False)
+        return records, last_ts, need_relogin
+
+    async def fake_automation(*args, **kwargs):
+        return "xiaoai_bridge_test", True
+
+    async def fake_delayed(*args, **kwargs):
+        return None
+
+    async def fake_ai(query):
+        return None
+
+    def _build_namespace(self):
+        namespace = {
+            "TOKEN_PATH": self.token_path,
+            "AUTH_PATH": self.auth_path,
+            "CONFIG_PATH": self.cfg_path,
+            "COOKIE_TEMPLATE": "deviceId={device_id}; serviceToken={service_token}; userId={user_id}",
+            "MASKED_VALUE": MASKED,
+            "RELOGIN_BACKOFF_START": 10,
+            "RELOGIN_BACKOFF_MAX": 300,
+            "GET_ASK_BY_MINA": ["M01"],
+            "json": json,
+            "re": re,
+            "os": __import__("os"),
+            "time": __import__("time"),
+            "datetime": real_datetime.datetime,
+            "log": self.log,
+            "load_config": self.load_config,
+            "save_config": self.save_config,
+            "aiohttp": SimpleNamespace(ClientSession=FakeSession),
+            "asyncio": self._fake_asyncio(),
+            "HAClient": FakeHAClient,
+            "bridge_state": self.bridge_state,
+            "_get_latest_ask_from_xiaoai": self.fake_poll,
+            "_extract_query": lambda rec: rec.get("query"),
+            "_extract_answer": lambda rec: rec.get("answer"),
+            "_create_ha_automation": self.fake_automation,
+            "_delayed_call": self.fake_delayed,
+            "ai_parse_command": self.fake_ai,
+            "SaveConfigRequest": object,
+            "TestHARequest": object,
+            "SessionRequest": object,
+            "Request": object,
+            "JSONResponse": object,
+            "HTMLResponse": object,
+        }
+        intent_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "IntentParser"
+        )
+        exec(
+            compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        for name in WANTED_FUNCS:
+            if name in ("post_config", "bridge_loop", "_enforce_access_control"):
+                continue
+            module = ast.Module(body=[nodes[name]], type_ignores=[])
+            exec(compile(module, str(source_path), "exec"), namespace)
+        for name in ("post_config", "bridge_loop"):
+            module = ast.Module(body=[nodes[name]], type_ignores=[])
+            exec(compile(module, str(source_path), "exec"), namespace)
+        return namespace
+
+    def load_config(self):
+        return self.cfg
+
+    def save_config(self, new_cfg):
+        self.saved_configs.append(json.loads(json.dumps(new_cfg)))
+        self.cfg = new_cfg
+
+    def write_token(self, data):
+        self.token_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def write_auth(self, data):
+        self.auth_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def read_token(self):
+        return json.loads(self.token_path.read_text(encoding="utf-8"))
+
+    def run(self):
+        real_asyncio.run(self.namespace["bridge_loop"]())
+
+
+# ───────────────────────── scenarios ─────────────────────────
+def scenario_normal_start(root: Path):
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    before = harness.read_token()
+
+    harness.run()
+
+    assert harness.bridge_state["error"] is None, harness.bridge_state["error"]
+    assert harness.bridge_state["devices"][0]["deviceID"] == "speaker-1"
+    assert harness.log.has("已使用保存的 micoapi Token 登录")
+    assert harness.read_token() == before, "valid cached token must be reused, not rewritten"
+    return "normal start with valid cached token"
+
+
+def scenario_startup_refresh(root: Path):
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "expired-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+
+    harness.run()
+
+    assert harness.bridge_state["error"] is None, harness.bridge_state["error"]
+    assert harness.log.has("passToken 登录") or harness.log.has("尝试 passToken")
+    saved = harness.read_token()
+    assert saved["micoapi"][1] == "fresh-service-token", saved
+    assert saved["passToken"] == "pass-token-rotated", saved
+    return "expired cached token refreshed through passToken"
+
+
+def scenario_qr_only_start(root: Path):
+    """QR login leaves cookie_text + files but no username/password (issue C)."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["cookie_text"] = (
+        "userId=qr-user; passToken=qr-pass; serviceToken=valid-service; deviceId=qr-device"
+    )
+
+    harness.run()
+
+    assert harness.bridge_state["error"] is None, harness.bridge_state["error"]
+    assert harness.bridge_state["devices"][0]["deviceID"] == "speaker-1"
+    assert harness.auth_path.exists(), "auth.json must be created after QR-only login"
+    assert harness.token_path.exists(), ".mi.token must be created after QR-only login"
+    saved = harness.read_token()
+    assert saved["userId"] == "qr-user"
+    assert saved["passToken"] == "qr-pass"
+    assert saved["micoapi"][1] == "valid-service"
+    return "QR-only install (no username/password) logs in"
+
+
+def scenario_runtime_refresh_recovers(root: Path):
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "expired-service"],
+        }
+    )
+    harness.cfg["intent_rules"] = [
+        {
+            "pattern": "打开客厅灯",
+            "action": {
+                "domain": "light",
+                "service": "turn_on",
+                "entity_id": ["light.ceiling", "light.floor"],
+                "reply": "好的",
+            },
+        }
+    ]
+    # First poll says "token expired", second one delivers the command.
+    harness.poll_script = [
+        ([], True),
+        (
+            [
+                {
+                    "time": 1_700_000_000_000,
+                    "query": "打开客厅灯",
+                    "answer": "好的",
+                }
+            ],
+            False,
+        ),
+    ]
+
+    harness.run()
+
+    assert harness.log.has("Token 刷新成功"), harness.log.messages
+    assert FakeHAClient.calls, "the command after recovery must reach Home Assistant"
+    domain, service, data = FakeHAClient.calls[0]
+    assert (domain, service) == ("light", "turn_on")
+    assert data["entity_id"] == ["light.ceiling", "light.floor"], data
+    assert harness.bridge_state["command_count"] == 1
+    assert harness.read_token()["micoapi"][1] == "fresh-service-token"
+    # Recovery must not spin: the sleep after login is the poll interval.
+    assert 2 in harness.sleeps, harness.sleeps
+    return "runtime 401 -> refresh -> polling resumes and command executes"
+
+
+def scenario_runtime_refresh_failure(root: Path):
+    harness = Harness(root)
+    # Startup succeeds from the cached token; only the runtime refresh fails.
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    token_before = harness.read_token()
+    auth_before = json.loads(harness.auth_path.read_text(encoding="utf-8"))
+    harness.poll_script = [([], True), ([], True), ([], True)]
+    FakeAccount.reject_service_login = True
+
+    # The loop would retry forever; stop it after the second backoff sleep.
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    assert token_before == harness.read_token(), "failed refresh must not rewrite .mi.token"
+    assert auth_before == json.loads(harness.auth_path.read_text(encoding="utf-8")), (
+        "failed refresh must not rewrite auth.json"
+    )
+    assert harness.token_path.exists(), "failed refresh must never delete .mi.token"
+    backoffs = [delay for delay in harness.sleeps if delay >= 10]
+    assert backoffs[:2] == [10, 20], f"expected exponential backoff, got {harness.sleeps}"
+    assert harness.bridge_state["error"], "a persistent failure must be surfaced"
+    return "runtime 401 -> refresh fails -> backoff, credentials untouched"
+
+
+def scenario_save_credentials_never_blank(root: Path):
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "old-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    save = harness.namespace["_save_auth_and_token"]
+
+    class IncompleteAccount:
+        def __init__(self, token):
+            self.token = token
+
+    save(IncompleteAccount({"deviceId": "other-device"}))
+    assert harness.read_token()["passToken"] == "pass-1", "incomplete token must not blank passToken"
+    assert harness.read_token()["micoapi"][1] == "old-service"
+
+    save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2"}))
+    updated = harness.read_token()
+    assert updated["userId"] == "user-2" and updated["passToken"] == "pass-2"
+    assert updated["micoapi"][1] == "old-service", "existing micoapi must be preserved"
+    return "_save_auth_and_token never blanks a valid credential"
+
+
+def scenario_post_config_credentials(root: Path):
+    harness = Harness(root)
+    harness.write_token(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "d", "micoapi": ["s", "t"]}
+    )
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "d"})
+    harness.cfg["xiaomi"]["cookie_text"] = "userId=user-1; passToken=pass-1"
+    harness.cfg["xiaomi"]["password"] = "secret-password"
+    post_config = harness.namespace["post_config"]
+
+    # 1. A page loaded before QR login still shows an empty cookie field.
+    stale = {
+        "xiaomi": {"username": "", "password": MASKED, "cookie_text": ""},
+        "homeassistant": {"url": "http://homeassistant:80", "token": MASKED},
+        "openai": {"api_key": ""},
     }
-    namespace = {
-        "TOKEN_PATH": token_path,
-        "AUTH_PATH": auth_path,
-        "CONFIG_PATH": root / "config.yaml",
-        "COOKIE_TEMPLATE": "deviceId={device_id}; serviceToken={service_token}; userId={user_id}",
-        "json": json,
-        "log": Logger(),
-        "load_config": lambda: cfg,
-        "save_config": lambda new_cfg: saved_configs.append(new_cfg),
-        "aiohttp": SimpleNamespace(ClientSession=FakeSession),
-        "asyncio": asyncio,
-        "IntentParser": lambda rules: object(),
-        "HAClient": FakeHAClient,
-        "_get_cookie": lambda config: None,
-        "_save_auth_and_token": lambda account: None,
-        "_refresh_micoapi_token": None,
-        "TestHARequest": object,
-        "SaveConfigRequest": object,
-        "time": __import__("time"),
-        "bridge_state": {"running": True, "connected": False, "error": None},
-    }
-    saved_configs = []
-    for name in ("_set_token", "_load_saved_xiaomi_identity", "post_config", "bridge_loop"):
-        exec(compile(ast.Module(body=[nodes[name]], type_ignores=[]), str(source_path), "exec"), namespace)
-
-    async def refresh_must_not_run(*args):
-        raise AssertionError("valid saved token must not be exchanged again")
-
-    namespace["_refresh_micoapi_token"] = refresh_must_not_run
-    original = {
-        "userId": "user-1",
-        "passToken": "pass-1",
-        "deviceId": "account-device",
-        "micoapi": ["security", "valid-service"],
-    }
-    token_path.write_text(json.dumps(original), encoding="utf-8")
-    auth_path.write_text(json.dumps({key: original[key] for key in ("userId", "passToken", "deviceId")}), encoding="utf-8")
-
-    asyncio.run(namespace["bridge_loop"]())
-    assert FakeMiNAService.calls == 1
-    assert FakeHAClient.calls == 1
-    assert namespace["bridge_state"]["error"] is None
-    assert namespace["bridge_state"]["devices"][0]["deviceID"] == "speaker-1"
-    assert json.loads(token_path.read_text(encoding="utf-8")) == original
-    assert any("已使用保存的 micoapi Token 登录" in message for message in namespace["log"].messages)
-
-    cfg["xiaomi"]["cookie_text"] = "userId=fresh; passToken=fresh-pass; serviceToken=fresh-service"
-    stale_page = {**cfg, "xiaomi": {**cfg["xiaomi"], "cookie_text": ""}}
-    result = asyncio.run(namespace["post_config"](SimpleNamespace(config=stale_page)))
+    result = real_asyncio.run(post_config(SimpleNamespace(config=stale)))
     assert result["ok"] is True
-    assert saved_configs[-1]["xiaomi"]["cookie_text"] == cfg["xiaomi"]["cookie_text"]
+    assert harness.cfg["xiaomi"]["cookie_text"] == "userId=user-1; passToken=pass-1"
+    assert harness.cfg["xiaomi"]["password"] == "secret-password"
+    assert harness.cfg["homeassistant"]["token"] == "ha-secret"
 
-    async def failed_refresh(*args):
-        raise RuntimeError("micoapi login rejected")
+    # 2. The masked value coming back from GET /api/config must be kept too.
+    masked = {
+        "xiaomi": {"username": "user-1", "password": MASKED, "cookie_text": MASKED},
+        "homeassistant": {"url": "http://homeassistant:80", "token": MASKED},
+        "openai": {"api_key": ""},
+    }
+    real_asyncio.run(post_config(SimpleNamespace(config=masked)))
+    assert harness.cfg["xiaomi"]["cookie_text"] == "userId=user-1; passToken=pass-1"
 
-    cfg["xiaomi"]["cookie_text"] = ""
-    namespace["_refresh_micoapi_token"] = failed_refresh
-    namespace["bridge_state"] = {"running": True, "connected": False, "error": None}
-    original["micoapi"] = ["security", "expired-service"]
-    token_path.write_text(json.dumps(original), encoding="utf-8")
-    asyncio.run(namespace["bridge_loop"]())
-    assert "重新扫码" in namespace["bridge_state"]["error"]
-    assert json.loads(token_path.read_text(encoding="utf-8")) == original
+    # 3. An explicit clear_login removes both the files and the stored cookie.
+    clearing = {
+        "xiaomi": {"username": "", "password": MASKED, "cookie_text": "", "clear_login": True},
+        "homeassistant": {"url": "http://homeassistant:80", "token": MASKED},
+        "openai": {"api_key": ""},
+    }
+    real_asyncio.run(post_config(SimpleNamespace(config=clearing)))
+    assert harness.cfg["xiaomi"]["cookie_text"] == ""
+    assert not harness.token_path.exists(), "explicit clear must delete .mi.token"
+    assert not harness.auth_path.exists(), "explicit clear must delete auth.json"
+    return "post_config keeps secrets unless the user explicitly clears them"
 
-print("startup patch tests passed")
+
+def scenario_multi_entity_rules():
+    intent_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "IntentParser"
+    )
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"), namespace)
+    multi = ["switch.one", "switch.two", "switch.three", "switch.four"]
+    parsed = namespace["IntentParser"]([
+        {
+            "pattern": "打开客厅灯",
+            "action": {"domain": "switch", "service": "turn_on", "entity_id": multi},
+        },
+    ]).parse("打开客厅灯")
+    assert parsed["entity_id"] == multi, parsed
+    single = namespace["IntentParser"]([
+        {
+            "pattern": "打开台灯",
+            "action": {"domain": "switch", "service": "turn_on", "entity_id": "switch.desk"},
+        },
+    ]).parse("打开台灯")
+    assert single["entity_id"] == "switch.desk", "single entity string must stay unchanged"
+    return "multi-entity rules keep arrays, single entity stays a string"
+
+
+def main():
+    install_miservice_stubs()
+    results = []
+    scenarios = [
+        scenario_normal_start,
+        scenario_startup_refresh,
+        scenario_qr_only_start,
+        scenario_runtime_refresh_recovers,
+        scenario_runtime_refresh_failure,
+        scenario_save_credentials_never_blank,
+        scenario_post_config_credentials,
+    ]
+    for scenario in scenarios:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            FakeHAClient.calls.clear()
+            FakeMiNAService.created.clear()
+            FakeMiNAService.said.clear()
+            FakeAccount.reject_service_login = False
+            # Startup-only scenarios stop the poll loop as soon as login is done.
+            FakeHAClient.stop_after_connect = scenario in (
+                scenario_normal_start,
+                scenario_startup_refresh,
+                scenario_qr_only_start,
+            )
+            results.append(scenario(Path(temp_dir)))
+    results.append(scenario_multi_entity_rules())
+    for line in results:
+        print(f"  ok  {line}")
+    print(f"startup patch tests passed ({len(results)} scenarios)")
+
+
+if __name__ == "__main__":
+    main()

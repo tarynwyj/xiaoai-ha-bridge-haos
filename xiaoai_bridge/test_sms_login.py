@@ -236,6 +236,7 @@ FUNCTIONS = (
     "_exchange_sts_service_token",
     "_probe_devices_with_token",
     "_persist_sms_credentials",
+    "_restore_credential_files",
     "_finish_sms_verification",
     "_finish_cookie_login",
     "xiaomi_verify",
@@ -644,6 +645,62 @@ def scenario_failures_do_not_pollute_data():
         h.cleanup()
 
 
+# ─────────────── 6b. multi-file persistence rolls back on a partial failure ───────────────
+def scenario_persistence_rollback():
+    h = Harness()
+    try:
+        h.auth_path.write_text('{"passToken": "old-pass", "userId": "old-user", '
+                               '"deviceId": "old-dev"}', encoding="utf-8")
+        h.token_path.write_text('{"passToken": "old-pass", "userId": "old-user", '
+                                '"deviceId": "old-dev", "micoapi": ["old-sec", "old-svc"]}',
+                                encoding="utf-8")
+        before = h.snapshot_data()
+        real_os = h.ns["os"]
+        state = {"calls": 0}
+
+        def flaky_replace(src, dst):
+            state["calls"] += 1
+            if state["calls"] == 2:
+                raise OSError("simulated rename failure")
+            return real_os.replace(src, dst)
+
+        proxy = types.SimpleNamespace(**{name: getattr(real_os, name)
+                                         for name in dir(real_os) if not name.startswith("_")})
+        proxy.replace = flaky_replace
+        h.ns["os"] = proxy
+        try:
+            h.ns["_persist_sms_credentials"]({
+                "userId": "new-user", "passToken": "new-pass",
+                "deviceId": "new-dev", "ssecurity": "new-sec", "serviceToken": "new-svc",
+            })
+            check(False, "a failing rename must raise so the caller can report a retry")
+        except OSError:
+            pass
+        finally:
+            h.ns["os"] = real_os
+
+        check(state["calls"] == 2, f"expected two rename attempts, saw {state['calls']}")
+        check(h.snapshot_data() == before,
+              f"a half applied write must be rolled back; files now: {sorted(h.snapshot_data())}")
+        check(not list(h.root.rglob("*.tmp")), "temporary files must not be left behind")
+
+        # the normal path still writes both files and leaves no temporaries
+        h.ns["_persist_sms_credentials"]({
+            "userId": "new-user", "passToken": "new-pass",
+            "deviceId": "new-dev", "ssecurity": "new-sec", "serviceToken": "new-svc",
+        })
+        auth = json.loads(h.auth_path.read_text(encoding="utf-8"))
+        token = json.loads(h.token_path.read_text(encoding="utf-8"))
+        check(auth.get("userId") == "new-user" and token.get("userId") == "new-user",
+              "a successful write must persist the new identity in both files")
+        check(token.get("micoapi") == ["new-sec", "new-svc"],
+              f"the token file must carry [ssecurity, serviceToken], got {token.get('micoapi')}")
+        check(not list(h.root.rglob("*.tmp")), "a successful write must clean up its temporaries")
+        ok("credential persistence rolls both files back when the second rename fails")
+    finally:
+        h.cleanup()
+
+
 # ─────────────── 7. session expiry + repeat requests + concurrency ───────────────
 def scenario_pending_lifecycle_and_concurrency():
     h = Harness()
@@ -884,6 +941,7 @@ def main():
         scenario_sts_success_persists_credentials,
         scenario_retry_login_keeps_pass_token_and_ssecurity,
         scenario_failures_do_not_pollute_data,
+        scenario_persistence_rollback,
         scenario_pending_lifecycle_and_concurrency,
         scenario_cookie_login_still_works,
         scenario_logs_do_not_leak_secrets,

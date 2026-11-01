@@ -1846,11 +1846,25 @@ async def _probe_devices_with_token(username: str, password: str, creds: dict) -
             pass
 
 
+def _restore_credential_files(previous: dict) -> None:
+    '''Put the previous credential files back after a half applied write.'''
+    for path, content in previous.items():
+        try:
+            if content is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                path.write_bytes(content)
+        except OSError as e:
+            log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
+
+
 def _persist_sms_credentials(creds: dict) -> None:
     '''Persist a fully validated credential set atomically (all or nothing).
 
-    Both files are written to temporaries first and then swapped in, so a failure
-    can never leave auth.json and .mi.token describing different logins.
+    Both files go to temporaries first; the originals are snapshotted so that a
+    failure between the two renames can be rolled back. auth.json and .mi.token
+    therefore always describe the same login.
     '''
     missing = _missing_credentials(creds)
     if missing:
@@ -1867,6 +1881,12 @@ def _persist_sms_credentials(creds: dict) -> None:
     TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_auth = AUTH_PATH.with_name(AUTH_PATH.name + ".tmp")
     tmp_token = TOKEN_PATH.with_name(TOKEN_PATH.name + ".tmp")
+    previous = {}
+    for path in (AUTH_PATH, TOKEN_PATH):
+        try:
+            previous[path] = path.read_bytes() if path.exists() else None
+        except OSError:
+            previous[path] = None
     try:
         tmp_auth.write_text(json.dumps(identity, ensure_ascii=False), encoding="utf-8")
         tmp_token.write_text(json.dumps(token_data, ensure_ascii=False), encoding="utf-8")
@@ -1876,6 +1896,9 @@ def _persist_sms_credentials(creds: dict) -> None:
             os.chmod(TOKEN_PATH, 0o600)
         except OSError:
             pass
+    except Exception:
+        _restore_credential_files(previous)
+        raise
     finally:
         for stale in (tmp_auth, tmp_token):
             try:

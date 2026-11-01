@@ -244,6 +244,11 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
     saved_rules = html.count("saveCfg('rules')")
     return [
         (
+            "no NodeList array-method misuse in the page script",
+            not re.search(r"querySelectorAll\([^)]*\)\s*\.\s*(?:filter|map|reduce|some|every|find|sort)\(", html),
+            "a querySelectorAll(...) result is used as an array (NodeList has no .filter/.map in browsers)",
+        ),
+        (
             "destructive device-load re-render removed",
             "loadRuleDevices().then(renderRules)" not in html,
             "found loadRuleDevices().then(renderRules)",
@@ -444,7 +449,7 @@ class El {
   get value(){
     if (this.tagName === 'SELECT'){
       if (this._value !== undefined) return this._value;
-      const options = this.querySelectorAll('option');
+      const options = queryAll(this, 'option');
       const chosen = options.find(option => option.hasAttribute('selected')) || options[0];
       return chosen ? (chosen.attrs.value || '') : '';
     }
@@ -506,12 +511,12 @@ class El {
     return null;
   }
   querySelector(selector){ return queryAll(this, selector)[0] || null; }
-  querySelectorAll(selector){ return queryAll(this, selector); }
+  querySelectorAll(selector){ return nodeList(queryAll(this, selector)); }
   scrollIntoView(){}
   click(){}
   get selectedOptions(){
     if (this.tagName !== 'SELECT') return [];
-    const options = this.querySelectorAll('option');
+    const options = queryAll(this, 'option');
     if (this.multiple || this.hasAttribute('multiple')) {
       return options.filter(option => option.hasAttribute('selected'));
     }
@@ -530,7 +535,7 @@ class Doc {
   createTextNode(text){ return new TextNode(text); }
   getElementById(id){ return descendantElements(this.documentElement).find(el => el.id === id) || null; }
   querySelector(selector){ return queryAll(this.documentElement, selector)[0] || null; }
-  querySelectorAll(selector){ return queryAll(this.documentElement, selector); }
+  querySelectorAll(selector){ return nodeList(queryAll(this.documentElement, selector)); }
   addEventListener(){}
 }
 
@@ -776,6 +781,20 @@ function queryAll(root, selector){
   return descendantElements(root).filter(el => matchChain(el, parts, last));
 }
 
+// A real browser returns a NodeList from querySelectorAll: it has forEach/length/item
+// and an iterator, but NO .filter/.map/.reduce/.find. Returning a plain Array here hid
+// a shipped bug where the checkbox helpers called querySelectorAll(...).filter(...).
+class NodeListLike {
+  constructor(items){
+    this.length = items.length;
+    for (let i = 0; i < items.length; i += 1) this[i] = items[i];
+  }
+  item(i){ return this[i] || null; }
+  forEach(cb, thisArg){ for (let i = 0; i < this.length; i += 1) cb.call(thisArg, this[i], i, this); }
+  *[Symbol.iterator](){ for (let i = 0; i < this.length; i += 1) yield this[i]; }
+}
+function nodeList(items){ return new NodeListLike(items); }
+
 // ===== page globals the extracted code expects =====
 const document = new Doc();
 let cfg = {};
@@ -891,18 +910,18 @@ const RULES_PAGE_HTML =
     '<div class="rule-list" id="rule-list"></div>' +
   '</div>';
 
-function rows(){ return document.querySelectorAll('#rule-list .rule-item'); }
-function boxes(row){ return row ? row.querySelectorAll('.r-e') : []; }
+function rows(){ return Array.from(document.querySelectorAll('#rule-list .rule-item')); }
+function boxes(row){ return row ? Array.from(row.querySelectorAll('.r-e')) : []; }
 function checkedIds(row){ return boxes(row).filter(box => box.checked).map(box => box.value); }
 function setChecked(row, ids){
   const chosen = new Set(ids || []);
   boxes(row).forEach(box => { box.checked = chosen.has(box.value); });
 }
 function pickerOf(row){ return row ? row.querySelector('.entity-picker') : null; }
-function pickerIds(row){ return row.querySelectorAll('.entity-option .entity-id').map(el => el.textContent); }
+function pickerIds(row){ return Array.from(row.querySelectorAll('.entity-option .entity-id')).map(el => el.textContent); }
 function pickerCount(row){ const el = row ? row.querySelector('.entity-count') : null; return el ? el.textContent : null; }
 function chipOf(row){ return row ? row.querySelector('.rule-chip') : null; }
-function optionValues(el){ return el.querySelectorAll('option').map(option => option.attrs.value); }
+function optionValues(el){ return Array.from(el.querySelectorAll('option')).map(option => option.attrs.value); }
 function postedCalls(){ return __fetchCalls.filter(call => call.body && call.body.config); }
 function postedRules(){
   const calls = postedCalls();
@@ -1046,7 +1065,7 @@ test('picker toolbar: 全选 / 清空 / 搜索 / 已选择计数', () => {
   ], { devices: LIGHT_DEVICES, aliases: { 'light.b': '客厅灯' } });
   const row = list[0];
   const picker = pickerOf(row);
-  const buttons = picker.querySelectorAll('button');
+  const buttons = Array.from(picker.querySelectorAll('button'));
   const allBtn = buttons.find(button => String(button.attrs.onclick || '') === 'selectAllEntities(this)');
   const clearBtn = buttons.find(button => String(button.attrs.onclick || '') === 'clearEntities(this)');
   const searchBox = picker.querySelector('.entity-search');
@@ -1183,7 +1202,7 @@ test('switchD rebuilds only that rule and keeps other rules intact', () => {
   ], { devices: LIGHT_DEVICES });
   checkEq('two rows built', list.length, 2);
   list[0].querySelector('.r-p').value = '开灯(改)';
-  const buttons = list[0].querySelectorAll('.domain-btn');
+  const buttons = Array.from(list[0].querySelectorAll('.domain-btn'));
   const climateButton = buttons.find(button => String(button.attrs.onclick || '').includes("'climate'"));
   check('climate domain button exists', !!climateButton);
   switchD(climateButton, 'climate');
@@ -1493,7 +1512,7 @@ test('delete and domain switch keep other drafts', async () => {
   checkEq('per-rule save is refused after a delete', refused, false);
   checkEq('the refusal does not POST', __fetchCalls.length, 0);
 
-  const buttons = rows()[0].querySelectorAll('.domain-btn');
+  const buttons = Array.from(rows()[0].querySelectorAll('.domain-btn'));
   const switchButton = buttons.find(button => String(button.attrs.onclick || '').includes("'climate'"));
   switchD(switchButton, 'climate');
   const row = rows()[0];

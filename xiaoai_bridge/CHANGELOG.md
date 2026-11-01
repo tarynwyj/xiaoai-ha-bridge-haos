@@ -43,6 +43,11 @@
   **不写任何文件**；进行中的验证码会话不会阻塞扫码登录，也不会阻塞 Cookie 登录。
 
 ### 意图规则界面（复选框设备选择、分条保存、规则名称）
+- 修复规则页按钮在真实浏览器里全部失效的问题：`entityIdsOf` / `updateEntityCount` /
+  `visibleEntityOptions` 把 `querySelectorAll()` 返回的 **NodeList** 当成数组调用
+  `.filter()`/`.map()`（浏览器里 NodeList 没有这些方法），点击除「编辑/收起」外的按钮都会抛
+  `TypeError`；现改为 `Array.from(...)` 后再用数组方法。测试用的 DOM 模拟器也改为返回与浏览器
+  一致的 NodeList（无 `.filter`/`.map`/`.find`），并新增源码不变量，避免这类问题再被模拟器掩盖。
 - 设备选择从「按住 Ctrl 才能多选」的下拉框改为**复选框列表**：点选即可、显示名称与 `entity_id`、
   顶部「已选择 N 个设备」，支持按名称/`entity_id` 搜索、全选、清空；设备列表异步刷新与 HA
   暂时离线都不会清掉已选实体。

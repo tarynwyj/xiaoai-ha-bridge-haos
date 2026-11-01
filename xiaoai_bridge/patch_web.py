@@ -228,7 +228,7 @@ function entityPickerOf(scope){
 function entityIdsOf(scope){
   const picker=entityPickerOf(scope);
   if(!picker)return [];
-  return picker.querySelectorAll('.r-e').filter(box=>box.checked).map(box=>box.value).filter(Boolean);
+  return Array.from(picker.querySelectorAll('.r-e')).filter(box=>box.checked).map(box=>box.value).filter(Boolean);
 }
 function setEntitySelection(scope,ids){
   const picker=entityPickerOf(scope);
@@ -240,7 +240,7 @@ function setEntitySelection(scope,ids){
 function updateEntityCount(picker){
   if(!picker)return 0;
   const count=picker.querySelector('.entity-count');
-  const total=picker.querySelectorAll('.r-e').filter(box=>box.checked).length;
+  const total=Array.from(picker.querySelectorAll('.r-e')).filter(box=>box.checked).length;
   if(count)count.textContent='已选择 '+total+' 个设备';
   return total;
 }
@@ -257,7 +257,7 @@ function filterEntityOptions(input){
   return shown;
 }
 function visibleEntityOptions(picker){
-  return picker?picker.querySelectorAll('.entity-option').filter(row=>row.style.display!=='none'):[];
+  return picker?Array.from(picker.querySelectorAll('.entity-option')).filter(row=>row.style.display!=='none'):[];
 }
 function selectAllEntities(btn){
   const picker=entityPickerOf(btn);

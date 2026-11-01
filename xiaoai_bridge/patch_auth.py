@@ -2122,6 +2122,8 @@ OTP_VERIFY_HOST = "account.xiaomi.com"
 OTP_TTL_SECONDS = 300            # 一次验证会话的有效期（秒）
 OTP_RESEND_COOLDOWN = 60         # 「获取验证码」的冷却时间（秒）
 OTP_MAX_ATTEMPTS = 5             # 一个验证会话最多允许输错几次
+OTP_MAX_REDIRECTS = 5            # 验证码通过后最多手动跟随几次跳转（逐跳校验）
+OTP_TRUSTED_AUTH_HOSTS = {"account.xiaomi.com"}  # 允许跟随的跳转主机（https + 443）
 OTP_JSON_PREFIX = "&&&START&&&"  # account.xiaomi.com 的 JSON 前缀
 OTP_FLAG_PHONE = 4
 OTP_FLAG_EMAIL = 8
@@ -2130,12 +2132,15 @@ OTP_USER_AGENT = (
     "DEV/aVBob25l DEVS/aU9T L/zh_CN"
 )
 # 这些失败意味着协议/安全边界对不上，必须丢弃会话并让用户重新开始；
-# 网络类错误与「验证码输错」都不在此列。
+# 网络类错误与「验证码输错」都不在此列。跳转链越界/超限同理：一旦发现
+# 302 或 confirmUrl 指向别处，就不能再用这份会话去恢复 serviceLogin。
 OTP_STATE_BREAKING_ERRORS = frozenset({
     "bad_json", "no_location", "unsafe_location", "location_http",
     "resume_failed", "missing_credentials", "no_service_token",
     "verify_http", "bad_notification_url", "no_notification_url",
     "no_context", "no_flag", "auth_start_http", "identity_list_http",
+    "unsafe_redirect", "too_many_redirects", "no_redirect_target",
+    "verify_redirect_http", "confirm_http",
 })
 
 _otp_session = None
@@ -2414,8 +2419,54 @@ def _otp_normalize_location(location: str) -> str:
     return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
 
 
-async def _otp_request(session, method: str, url: str, **kwargs):
-    '''One request on the OTP session; redirects are never followed.'''
+def _otp_normalize_auth_hop(target: str) -> str:
+    '''Validate one hop of the post-verification chain: https + allowlisted host.
+
+    Relative paths are completed onto account.xiaomi.com; scheme relative forms,
+    other hosts, plain http, userinfo and non-443 ports are refused. The error
+    code is stable (unsafe_redirect) so the caller drops the OTP session instead
+    of resuming serviceLogin with a session that has been fed a foreign URL.
+    '''
+    from urllib.parse import urlsplit, urlunsplit
+    text = str(target or "").strip()
+    if not text:
+        raise OtpFlowError(
+            "unsupported", "no_redirect_target",
+            "小米返回了跳转响应但没有给出跳转地址，无法继续登录；请改用扫码登录",
+        )
+    if text.startswith("//"):
+        text = "https:" + text
+    elif text.startswith("/"):
+        text = OTP_ACCOUNT_BASE + text
+    elif not text.lower().startswith(("http://", "https://")):
+        # 裸相对形式（"pass/verify?..."）：同样落到 account 主机上再校验
+        text = OTP_ACCOUNT_BASE + "/" + text
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except Exception:
+        raise OtpFlowError(
+            "unsupported", "unsafe_redirect",
+            "小米返回的跳转地址无法解析，已拒绝跟随；请改用扫码登录",
+        ) from None
+    host = (parts.hostname or "").lower()
+    if (parts.scheme.lower() != "https" or host not in OTP_TRUSTED_AUTH_HOSTS
+            or parts.username or parts.password or port not in (None, 443)):
+        raise OtpFlowError(
+            "unsupported", "unsafe_redirect",
+            "小米返回的跳转地址不在允许的 HTTPS 主机（"
+            + "、".join(sorted(OTP_TRUSTED_AUTH_HOSTS))
+            + "）内，已拒绝跟随（避免凭据外泄）；请改用扫码登录",
+        )
+    return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+
+
+async def _otp_exchange(session, method: str, url: str, **kwargs):
+    '''One request on the OTP session: (status, body, redirect target).
+
+    Redirects are never followed automatically (allow_redirects=False); the
+    Location header is returned so the caller can walk the chain itself.
+    '''
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         if method == "POST":
@@ -2424,6 +2475,13 @@ async def _otp_request(session, method: str, url: str, **kwargs):
             context = session.get(url, timeout=timeout, allow_redirects=False, **kwargs)
         async with context as resp:
             status = int(getattr(resp, "status", 0) or 0)
+            headers = getattr(resp, "headers", None)
+            target = ""
+            if headers is not None:
+                try:
+                    target = str(headers.get("Location") or "").strip()
+                except Exception:
+                    target = ""
             raw = await resp.read()
     except OtpFlowError:
         raise
@@ -2432,7 +2490,58 @@ async def _otp_request(session, method: str, url: str, **kwargs):
         raise OtpFlowError(
             "retry", "network", "访问小米账号服务失败（网络错误），请稍后重试"
         ) from None
+    return status, raw, target
+
+
+async def _otp_request(session, method: str, url: str, **kwargs):
+    '''One request on the OTP session; redirects are never followed.'''
+    status, raw, _target = await _otp_exchange(session, method, url, **kwargs)
     return status, raw
+
+
+async def _otp_follow_auth_chain(session, target: str, headers: dict, cookies: dict,
+                                 stage: str):
+    '''Follow the post-code redirect chain by hand, hop by hop, on the same session.
+
+    Every hop must be an allowlisted HTTPS account host and at most
+    OTP_MAX_REDIRECTS redirects are followed. Anything else raises an explicit
+    OtpFlowError so the caller drops the OTP state instead of resuming the
+    login. Logs carry the stage, the hop number and the status code only:
+    never a URL (its query string holds tokens) and never a cookie.
+    '''
+    url = _otp_normalize_auth_hop(target)
+    hops = 0
+    while True:
+        status, raw, next_target = await _otp_exchange(
+            session, "GET", url, headers=headers, cookies=cookies
+        )
+        if 300 <= status < 400:
+            if not next_target:
+                log.warning("小米验证跳转缺少 Location (stage=%s, status=%s)", stage, status)
+                raise OtpFlowError(
+                    "unsupported", "no_redirect_target",
+                    "小米返回了跳转响应但没有给出跳转地址，无法继续登录；请改用扫码登录",
+                )
+            hops += 1
+            if hops > OTP_MAX_REDIRECTS:
+                log.warning("小米验证跳转次数超过上限 (stage=%s, hops=%s)", stage, hops)
+                raise OtpFlowError(
+                    "unsupported", "too_many_redirects",
+                    "小米的验证跳转超过 " + str(OTP_MAX_REDIRECTS)
+                    + " 次，已停止跟随；请改用扫码登录",
+                )
+            url = _otp_normalize_auth_hop(next_target)
+            log.info("小米验证：跟随跳转 (stage=%s, hop=%s, status=%s)", stage, hops, status)
+            continue
+        if status >= 400:
+            log.warning("小米验证跳转返回 HTTP %s (stage=%s)", status, stage)
+            raise OtpFlowError(
+                "unsupported", stage + "_http",
+                "小米账号服务返回 HTTP " + str(status) + "（" + stage
+                + "），无法继续验证；请改用扫码登录",
+            )
+        log.info("小米验证：跳转链结束 (stage=%s, hops=%s, status=%s)", stage, hops, status)
+        return status, raw, hops
 
 
 async def _otp_request_json(session, method: str, url: str, stage: str, **kwargs) -> dict:
@@ -2730,7 +2839,7 @@ async def _otp_verify_code(code: str) -> dict:
     verify_url = (OTP_ACCOUNT_BASE + "/identity/auth/verify" + method
                   + "?_dc=" + str(int(time.time() * 1000)))
     log.info("OTP 登录：提交验证码（stage=verify_code）")
-    status, raw = await _otp_request(
+    status, raw, redirect = await _otp_exchange(
         session, "POST", verify_url, headers=headers, cookies=cookies,
         data={"_flag": str(flag), "ticket": code, "trust": "false", "_json": "true"},
     )
@@ -2740,10 +2849,22 @@ async def _otp_verify_code(code: str) -> dict:
             "unsupported", "verify_http",
             "小米拒绝了验证码提交（HTTP " + str(status) + "），请重新点击「登录」",
         )
-    payload = _otp_json(raw) if raw else {}
+    # 真实的小米验证有三种答法：JSON 里给 location、JSON 里给 confirmUrl
+    # （要求再确认一次），或者直接 302 + Location。302 的响应体经常不是 JSON，
+    # 所以只有「没有跳转目标」时才把解析失败当成错误。
+    is_redirect = 300 <= status < 400 and bool(redirect)
+    payload = {}
+    if raw:
+        try:
+            payload = _otp_json(raw)
+        except OtpFlowError:
+            if not is_redirect:
+                raise
+            payload = {}
     location = str(_otp_field(payload, "location") or "").strip()
+    confirm = str(_otp_field(payload, "confirmUrl") or "").strip()
     description = str(payload.get("description") or payload.get("desc") or "").strip()
-    if not location:
+    if not location and not confirm and not is_redirect:
         rejection = _otp_int(payload.get("code"), 0)
         if rejection != 0 or description:
             return await _otp_wrong_code(description)
@@ -2751,15 +2872,17 @@ async def _otp_verify_code(code: str) -> dict:
             "unsupported", "no_location",
             "小米未返回验证完成后的跳转地址（响应格式不符合预期），无法继续登录；请改用扫码登录",
         )
-    target = _otp_normalize_location(location)
-    log.info("OTP 登录：验证通过，打开跳转地址（stage=follow_location）")
-    status, _raw = await _otp_request(session, "GET", target, headers=headers, cookies=cookies)
-    if status >= 400:
-        log.warning("打开验证跳转地址返回 HTTP %s", status)
-        raise OtpFlowError(
-            "unsupported", "location_http",
-            "验证通过后打开小米跳转地址失败（HTTP " + str(status) + "），请重新点击「登录」",
-        )
+    if is_redirect:
+        # 同时给了 location 和 302 时，先跟随 302，再按响应体继续
+        log.info("OTP 登录：验证响应为跳转（stage=verify_redirect, status=%s）", status)
+        await _otp_follow_auth_chain(session, redirect, headers, cookies, "verify_redirect")
+    if location:
+        target = _otp_normalize_location(location)
+        log.info("OTP 登录：验证通过，打开跳转地址（stage=follow_location）")
+        await _otp_follow_auth_chain(session, target, headers, cookies, "location")
+    if confirm:
+        log.info("OTP 登录：小米要求二次确认（stage=follow_confirm）")
+        await _otp_follow_auth_chain(session, confirm, headers, cookies, "confirm")
     from miservice import MiAccount
     username = str(_otp_login.get("username") or "")
     password = str(_otp_login.get("password") or "")
@@ -2834,11 +2957,42 @@ async def _otp_send_code() -> dict:
     headers = {"User-Agent": OTP_USER_AGENT}
     cookies = {"deviceId": str(_otp_login.get("device_id") or "")}
     log.info("OTP 登录：触发手机验证码（stage=verify_phone）")
-    await _otp_request_json(
+    status, raw = await _otp_request(
         session, "GET",
         OTP_ACCOUNT_BASE + "/identity/auth/verifyPhone?_flag=" + str(flag) + "&_json=true",
-        "verify_phone", headers=headers, cookies=cookies,
+        headers=headers, cookies=cookies,
     )
+    if status >= 400:
+        log.warning("小米验证请求返回 HTTP %s (stage=verify_phone)", status)
+        raise OtpFlowError(
+            "unsupported", "verify_phone_http",
+            "小米账号服务返回 HTTP " + str(status) + "（verify_phone），无法继续验证；请改用扫码登录",
+        )
+    if status == 200:
+        # 200 只是 HTTP 层：verifyPhone 还会用业务码拒绝（风控 / 接口不认），
+        # 不检查就继续打 sendPhoneTicket 会让 UI 显示「已发送」而短信永远不到。
+        payload = None
+        try:
+            payload = _otp_json(raw)
+        except OtpFlowError:
+            payload = None
+        business = _otp_field(payload, "code") if payload is not None else None
+        if isinstance(business, bool) or not isinstance(business, int) or business != 0:
+            if payload is None:
+                shown = "non-json"
+            elif business is None:
+                shown = "missing"
+            else:
+                shown = str(business)
+            log.warning("触发手机验证码被拒绝 (stage=verify_phone, code=%s)", shown)
+            raise OtpFlowError(
+                "unsupported", "verify_phone_failed",
+                "小米没有确认本次验证码请求（业务码 " + shown
+                + "），未发送验证码；请稍后重试或改用扫码登录",
+            )
+    else:
+        # HTTP != 200 保持 1.0.12 的行为：只要求响应可解析，不额外解释业务码
+        _otp_json(raw)
     log.info("OTP 登录：请求发送验证码（stage=send_phone_ticket）")
     status, raw = await _otp_request(
         session, "POST", OTP_ACCOUNT_BASE + "/identity/auth/sendPhoneTicket",
@@ -2918,7 +3072,7 @@ async def xiaomi_otp_send():
             return await _otp_send_code()
         except OtpFlowError as e:
             log.warning("发送验证码失败 (code=%s)", e.code)
-            return {"ok": False, "action": e.action, "msg": e.message}
+            return {"ok": False, "action": e.action, "code": e.code, "msg": e.message}
         except Exception as e:
             log.warning("发送验证码异常 (%s)", type(e).__name__)
             return {"ok": False, "action": "failed", "msg": "发送验证码失败（未预期的响应），请稍后重试"}
@@ -2937,7 +3091,7 @@ async def xiaomi_otp_verify(req: OtpVerifyRequest):
             log.warning("OTP 验证失败 (code=%s)", e.code)
             if e.code in OTP_STATE_BREAKING_ERRORS:
                 await _reset_otp_state()
-            return {"ok": False, "action": e.action, "msg": e.message}
+            return {"ok": False, "action": e.action, "code": e.code, "msg": e.message}
         except SmsVerifyError as e:
             log.warning("OTP 验证：设备校验失败 (code=%s)", e.code)
             return {"ok": False, "action": "verify_failed", "msg": e.message}

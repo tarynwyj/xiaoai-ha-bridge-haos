@@ -75,8 +75,9 @@ def ok(headline):
 
 # ───────────────────────────── fake aiohttp / miservice ─────────────────────────────
 class FakeResponse:
-    def __init__(self, status=200, body=b""):
+    def __init__(self, status=200, body=b"", headers=None):
         self.status = status
+        self.headers = dict(headers or {})
         if isinstance(body, (bytes, bytearray)):
             self._body = bytes(body)
         elif isinstance(body, str):
@@ -329,7 +330,10 @@ FUNCTIONS = (
     "_otp_mask_hint",
     "_otp_normalize_notification_url",
     "_otp_normalize_location",
+    "_otp_normalize_auth_hop",
+    "_otp_exchange",
     "_otp_request",
+    "_otp_follow_auth_chain",
     "_otp_request_json",
     "_otp_finish_login",
     "_otp_open_verification",
@@ -503,12 +507,17 @@ def cookie_login(h, text):
     return run(h.ns["xiaomi_cookie_login"](SimpleNamespace(cookie_text=text)))
 
 
-def response(status=200, payload=None, raw=None):
+def response(status=200, payload=None, raw=None, headers=None):
     if raw is not None:
-        return FakeResponse(status, raw)
+        return FakeResponse(status, raw, headers=headers)
     if payload is None:
-        return FakeResponse(status, b"")
-    return FakeResponse(status, payload)
+        return FakeResponse(status, b"", headers=headers)
+    return FakeResponse(status, payload, headers=headers)
+
+
+def redirect(location, status=302):
+    '''A 3xx answer whose Location header is the only useful content.'''
+    return response(status, raw=b"", headers={"Location": location})
 
 
 AUTH_START = ("https://account.xiaomi.com/fe/service/identity/authStart"
@@ -672,6 +681,61 @@ def scenario_send_after_cooldown():
         tickets = [url for url in session.urls() if "sendPhoneTicket" in url]
         check(len(tickets) == 2, f"two deliberate sends must mean two SMS, got {tickets}")
         ok("send: after the cooldown a user-triggered resend is allowed (counted, not automatic)")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 3b. send: the verifyPhone business code gates the SMS ───────────────
+def scenario_verify_phone_business_code():
+    h = Harness()
+    try:
+        need_otp(h)
+        session = h.otp_session()
+        before = h.snapshot_data()
+        calls_before = len(session.calls)
+
+        # (a) HTTP 200 + business code 1: stop before sendPhoneTicket, no cooldown
+        session.responses = [response(200, {"code": 1, "description": "风控拦截"})]
+        data = send(h)
+        check(data.get("ok") is False and data.get("action") == "unsupported",
+              f"a business code 1 must be an explicit failure, got {data}")
+        check(data.get("code") == "verify_phone_failed",
+              f"a business code 1 must report verify_phone_failed, got {data.get('code')}")
+        check("业务码 1" in str(data.get("msg")),
+              f"the message must name the business code, got {data.get('msg')}")
+        tickets = [url for url in session.urls() if "sendPhoneTicket" in url]
+        check(tickets == [],
+              f"a rejected verifyPhone must never reach sendPhoneTicket, got {tickets}")
+        check(len(session.calls) == calls_before + 1,
+              f"a rejected verifyPhone must stop after the trigger, got {session.calls[calls_before:]}")
+        check(not h.otp_state().get("cooldown_until"),
+              f"a rejected verifyPhone must not start a cooldown, got {h.otp_state()}")
+        check(h.otp_state().get("sent") is not True,
+              "a rejected verifyPhone must not claim the code was sent")
+        check(h.snapshot_data() == before, "a rejected verifyPhone must not write any file")
+        check(session.closed is False, "a rejected verifyPhone may keep the session for a retry")
+
+        # (b) HTTP 200 + non-JSON body: the same explicit failure, no SMS
+        session.responses = [response(200, raw=b"<html>not json</html>")]
+        data = send(h)
+        check(data.get("ok") is False and data.get("code") == "verify_phone_failed",
+              f"a non-JSON verifyPhone body must fail explicitly, got {data}")
+        check([url for url in session.urls() if "sendPhoneTicket" in url] == [],
+              "a non-JSON verifyPhone body must not trigger the ticket")
+        check(not h.otp_state().get("cooldown_until"),
+              "a non-JSON verifyPhone body must not start a cooldown")
+        check(h.snapshot_data() == before, "a non-JSON body must not write any file")
+
+        # (c) HTTP 200 + code 0: the positive path is unchanged
+        session.responses = [response(200, {"code": 0}), response(200, {"code": 0})]
+        data = send(h)
+        check(data.get("ok") is True and data.get("sent") is True,
+              f"a business code 0 must still send the code, got {data}")
+        tickets = [url for url in session.urls() if "sendPhoneTicket" in url]
+        check(len(tickets) == 1, f"exactly one SMS trigger expected, got {tickets}")
+        check(bool(h.otp_state().get("cooldown_until")),
+              "a sent code must still start the cooldown")
+        ok("send: verifyPhone business code gates sendPhoneTicket and the cooldown")
     finally:
         h.cleanup()
 
@@ -1007,6 +1071,225 @@ def scenario_location_allowlist():
         check("https://account.xiaomi.com/pass/verify/ok?t=1" in session.urls(),
               f"the relative location must be prefixed, got {session.urls()}")
         ok("allowlist: only https://account.xiaomi.com is followed (6 hostile forms refused)")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 10b. post-code 302: one hand-walked hop, then the resume ───────────────
+REDIRECT_ACCEPTED = "https://account.xiaomi.com/pass/verify/redirected?token=abc"
+
+
+def _resume_reply(sign="resume", ssecurity="resume-ssecurity", nonce="resume-nonce"):
+    return {
+        "code": 0, "userId": "login-user", "passToken": "login-pass",
+        "deviceId": "login-device", "ssecurity": ssecurity,
+        "location": "https://api2.mina.mi.com/sts?sign=" + sign, "nonce": nonce,
+    }
+
+
+def scenario_redirect_after_code():
+    h = Harness()
+    try:
+        need_otp(h)
+        session = h.otp_session()
+        session.responses = [response(200, {"code": 0}), response(200, {"code": 0})]
+        send(h)
+        session.responses = [
+            redirect("/pass/verify/redirected?token=abc"),
+            response(200, raw=b"<html>verified</html>"),
+        ]
+        CURRENT["login_script"] = [_resume_reply("redirect", "redirect-ssecurity", "redirect-nonce")]
+        CURRENT["service_token"] = "service-token-after-redirect"
+        accounts_before = len(CURRENT["accounts"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is True, f"a 302 answer must still finish the login, got {data}")
+        check(data.get("verified") is True, "a redirected login must be marked verified")
+        check(len(data.get("devices") or []) == 1, "the device list must come from the probe")
+
+        calls = session.calls
+        follows = [index for index, (_m, url, _k) in enumerate(calls) if url == REDIRECT_ACCEPTED]
+        check(len(follows) == 1,
+              f"the trusted 302 Location must be fetched exactly once, got {session.urls()}")
+        if follows:
+            method, _url, kwargs = calls[follows[0]]
+            check(method == "GET", f"the redirect hop must be a GET, got {method}")
+            check(kwargs.get("allow_redirects") is False,
+                  f"the redirect hop must be walked by hand, got {kwargs.get('allow_redirects')}")
+            check(kwargs.get("headers", {}).get("User-Agent") is not None,
+                  "the redirect hop must keep the OTP headers (same session state)")
+        resume = [index for index, (m, url, _k) in enumerate(calls)
+                  if url.startswith(LOGIN_PREFIX) and m == "GET"]
+        check(len(resume) == 2,
+              f"the path must keep exactly the initial and the resumed serviceLogin, got "
+              f"{session.urls()}")
+        if follows and resume:
+            check(resume[-1] > follows[0],
+                  "the 302 target must be opened before the login is resumed")
+        check(all(call[2].get("allow_redirects") is False for call in calls),
+              "no request of the redirect chain may follow redirects")
+        check(len(CURRENT["accounts"]) == accounts_before + 2,
+              f"the 302 path must keep the resume account and the probe, got "
+              f"{len(CURRENT['accounts']) - accounts_before} new accounts")
+        if check(h.auth_path.exists() and h.token_path.exists(),
+                 "a verified redirected login must persist both credential files"):
+            token = json.loads(h.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["redirect-ssecurity", "service-token-after-redirect"],
+                  f"the persisted token must come from the resume, got {token.get('micoapi')}")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "a successful redirected login must close and clear the OTP state")
+        check(session.closed is True, "the OTP session must be closed after success")
+        check("token=abc" not in h.log.joined(),
+              "the redirect target (its query holds a token) must never be logged")
+        ok("verify 302: trusted Location followed once by hand, then the same-session resume")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 10c. hostile redirect targets and an over-long chain are refused ───────────────
+def scenario_redirect_allowlist_and_limit():
+    h = Harness()
+    try:
+        cases = [
+            ("http://account.xiaomi.com/pass/verify?t=1", "plain http"),
+            ("https://evil.example/pass/verify?t=1", "foreign host"),
+            ("//evil.example/pass/verify?t=1", "scheme relative"),
+            ("https://account.xiaomi.com:8443/pass/verify?t=1", "non-443 port"),
+            ("https://user:pw@account.xiaomi.com/pass/verify?t=1", "userinfo"),
+        ]
+        for location, label in cases:
+            need_otp(h)
+            session = h.otp_session()
+            session.responses = [redirect(location)]
+            calls_before = len(session.calls)
+            before = h.snapshot_data()
+            accounts_before = len(CURRENT["accounts"])
+            data = verify(h, "123456")
+            check(data.get("ok") is False and data.get("action") == "unsupported",
+                  f"{label}: must be an explicit unsupported failure, got {data}")
+            check(data.get("code") == "unsafe_redirect",
+                  f"{label}: must report unsafe_redirect, got {data.get('code')}")
+            urls = session.urls()
+            check(len(session.calls) == calls_before + 1,
+                  f"{label}: the hostile target must never be fetched, got {urls}")
+            check(not any("evil.example" in str(url) for url in urls),
+                  f"{label}: an untrusted host must never be fetched, got {urls}")
+            check(not any("sendPhoneTicket" in str(url) for url in urls),
+                  f"{label}: no SMS may be sent on a refused redirect")
+            check(len(CURRENT["accounts"]) == accounts_before,
+                  f"{label}: the login must not be resumed")
+            check(h.snapshot_data() == before, f"{label}: nothing may be written")
+            check(h.otp_session() is None and h.otp_state() == {},
+                  f"{label}: the OTP state must be cleared")
+            check(session.closed is True, f"{label}: the OTP session must be closed")
+
+        # a chain longer than OTP_MAX_REDIRECTS (5) is refused instead of walked forever
+        need_otp(h)
+        session = h.otp_session()
+        session.responses = [redirect("/pass/verify/hop1?t=1")] + [
+            redirect("/pass/verify/hop%d?t=%d" % (index + 1, index + 1))
+            for index in range(1, 7)
+        ]
+        before = h.snapshot_data()
+        accounts_before = len(CURRENT["accounts"])
+        data = verify(h, "123456")
+        check(data.get("ok") is False and data.get("action") == "unsupported",
+              f"a 6-hop chain must be refused, got {data}")
+        check(data.get("code") == "too_many_redirects",
+              f"a 6-hop chain must report too_many_redirects, got {data.get('code')}")
+        urls = session.urls()
+        hops = [url for url in urls if "/pass/verify/hop" in url]
+        check(len(hops) == 6,
+              f"at most OTP_MAX_REDIRECTS redirects may be walked before the refusal, got {hops}")
+        check(not any("hop7" in url for url in urls),
+              f"the 6th redirect target must never be fetched, got {urls}")
+        check(len(CURRENT["accounts"]) == accounts_before, "an over-long chain must not resume")
+        check(h.snapshot_data() == before, "an over-long chain must not write any file")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "an over-long chain must clear the OTP state")
+        check(session.closed is True, "an over-long chain must close the OTP session")
+
+        # the hop normaliser only ever lands on the allowlisted account host
+        normalize = h.ns["_otp_normalize_auth_hop"]
+        for relative in ("/pass/verify/x?t=1", "pass/verify/x?t=1"):
+            check(normalize(relative) == "https://account.xiaomi.com/pass/verify/x?t=1",
+                  f"{relative!r} must be completed onto the account host, "
+                  f"got {normalize(relative)!r}")
+        ok("redirects: http/foreign/scheme-relative/port/userinfo and a 6-hop chain are refused")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 10d. confirmUrl: same allowlist, then the resume ───────────────
+CONFIRM_URL = "https://account.xiaomi.com/pass/confirm?token=c1"
+
+
+def scenario_confirm_url():
+    h = Harness()
+    try:
+        need_otp(h)
+        session = h.otp_session()
+        session.responses = [
+            response(200, {"code": 0, "confirmUrl": "/pass/confirm?token=c1"}),
+            response(200, raw=b"<html>confirmed</html>"),
+        ]
+        CURRENT["login_script"] = [_resume_reply("confirm", "confirm-ssecurity", "confirm-nonce")]
+        CURRENT["service_token"] = "service-token-after-confirm"
+        accounts_before = len(CURRENT["accounts"])
+        data = verify(h, "123456")
+        check(data.get("ok") is True, f"a confirmUrl answer must finish the login, got {data}")
+        check(len(data.get("devices") or []) == 1, "the device list must come from the probe")
+        calls = session.calls
+        follows = [index for index, (_m, url, _k) in enumerate(calls) if url == CONFIRM_URL]
+        check(len(follows) == 1,
+              f"the confirmUrl must be opened exactly once in the same session, got {session.urls()}")
+        if follows:
+            method, _url, kwargs = calls[follows[0]]
+            check(method == "GET", f"the confirmation must be a GET, got {method}")
+            check(kwargs.get("allow_redirects") is False,
+                  f"the confirmation must not follow redirects, got {kwargs.get('allow_redirects')}")
+        resume = [index for index, (m, url, _k) in enumerate(calls)
+                  if url.startswith(LOGIN_PREFIX) and m == "GET"]
+        check(len(resume) == 2,
+              f"the path must keep exactly the initial and the resumed serviceLogin, got "
+              f"{session.urls()}")
+        if follows and resume:
+            check(resume[-1] > follows[0],
+                  "the confirmation must happen before the login is resumed")
+        check(len(CURRENT["accounts"]) == accounts_before + 2,
+              "the confirmUrl path must keep the resume account and the probe")
+        if check(h.auth_path.exists() and h.token_path.exists(),
+                 "a verified confirmation must persist both credential files"):
+            token = json.loads(h.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["confirm-ssecurity", "service-token-after-confirm"],
+                  f"the persisted token must come from the resume, got {token.get('micoapi')}")
+        check("token=c1" not in h.log.joined(),
+              "the confirmUrl (its query holds a token) must never be logged")
+        check(h.otp_state() == {}, "a successful confirmation must clear the OTP state")
+
+        # an untrusted confirmUrl is refused before any request or resume
+        need_otp(h)
+        session = h.otp_session()
+        session.responses = [response(200, {
+            "code": 0, "confirmUrl": "https://evil.example/pass/confirm?token=c2",
+        })]
+        calls_before = len(session.calls)
+        before = h.snapshot_data()
+        accounts_before = len(CURRENT["accounts"])
+        data = verify(h, "123456")
+        check(data.get("ok") is False and data.get("action") == "unsupported",
+              f"an untrusted confirmUrl must be refused, got {data}")
+        check(data.get("code") == "unsafe_redirect",
+              f"an untrusted confirmUrl must report unsafe_redirect, got {data.get('code')}")
+        check(len(session.calls) == calls_before + 1,
+              f"an untrusted confirmUrl must never be fetched, got {session.urls()}")
+        check(len(CURRENT["accounts"]) == accounts_before,
+              "an untrusted confirmUrl must not be resumed")
+        check(h.snapshot_data() == before, "an untrusted confirmUrl must not write any file")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "an untrusted confirmUrl must clear the OTP state")
+        check(session.closed is True, "an untrusted confirmUrl must close the OTP session")
+        ok("confirmUrl: followed in-session on the trusted host, refused elsewhere without a resume")
     finally:
         h.cleanup()
 
@@ -1911,6 +2194,7 @@ def main():
         scenario_start_needs_otp,
         scenario_send_cooldown,
         scenario_send_after_cooldown,
+        scenario_verify_phone_business_code,
         scenario_verify_success,
         scenario_wrong_code,
         scenario_otp_device_probe_gates_writes,
@@ -1918,6 +2202,9 @@ def main():
         scenario_restart,
         scenario_unsupported_flows,
         scenario_location_allowlist,
+        scenario_redirect_after_code,
+        scenario_redirect_allowlist_and_limit,
+        scenario_confirm_url,
         scenario_cookie_login,
         scenario_cookie_login_errors,
         scenario_cookie_login_clears_otp,

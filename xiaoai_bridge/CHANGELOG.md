@@ -56,7 +56,7 @@
   没有 `name` 字段也能正常编辑、保存、导入导出（后端只读 `pattern` 与 `action`，未知字段原样保留）。
 
 ### 构建与测试
-- 新增 `test_xiaomi_login.py`（359 项检查 / 33 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
+- 新增 `test_xiaomi_login.py`（465 项检查 / 37 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
   发送冷却与「只在显式点击时发送」、同会话 8 步换 Token（含断言所有 identity/verify 请求
   用的是同一个会话对象）、错误验证码计数与耗尽、TTL 过期、重新开始、unsupported 响应、
   `location` 白名单（6 种恶意形式）、Cookie 登录（换取 / 直连 / 过期 / 缺字段 / 探测失败）、

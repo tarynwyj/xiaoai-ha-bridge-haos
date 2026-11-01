@@ -3,8 +3,8 @@ name: CI
 # Test-only pipeline: builds the image and runs every test, but NEVER publishes.
 #
 # - pull_request  : full Docker build + all in-image tests. No GHCR login exists in
-#                   this workflow and the token has no `packages: write` scope, so a
-#                   push is impossible even by accident.
+#                   this workflow, its token is read-only and the build stays local,
+#                   so publishing is impossible even by accident.
 # - push to main  : the same test pipeline. Merging does NOT publish an image.
 # - release       : see release.yml (manual dispatch only, main only).
 on:
@@ -231,19 +231,25 @@ jobs:
         run: |
           set -euo pipefail
           # Structural guard: this workflow must stay push-free. The forbidden
-          # literals are assembled at runtime so the guard cannot match itself.
+          # literals are assembled at runtime so the guard cannot match itself, and
+          # comment lines are dropped first - a comment cannot grant a permission,
+          # but it could (and once did) trip the guard by merely naming one.
+          STRIPPED="$(mktemp)"
+          trap 'rm -f "$STRIPPED"' EXIT
+          sed 's/#.*//' .github/workflows/ci.yml > "$STRIPPED"
+
           LOGIN_ACTION="docker/login""-action"
           PUSH_CMD="docker ""push"
           WRITE_SCOPE="packages: ""write"
           PUSH_ON="push: ""true"
           fail=0
           for needle in "$LOGIN_ACTION" "$PUSH_CMD" "$WRITE_SCOPE" "$PUSH_ON"; do
-            if grep -qF -- "$needle" .github/workflows/ci.yml; then
+            if grep -qF -- "$needle" "$STRIPPED"; then
               echo "::error::CI workflow must not publish images; found: $needle"
               fail=1
             fi
           done
-          if ! grep -qF -- "push: ""false" .github/workflows/ci.yml; then
+          if ! grep -qF -- "push: ""false" "$STRIPPED"; then
             echo "::error::the build step must explicitly set push: false"
             fail=1
           fi

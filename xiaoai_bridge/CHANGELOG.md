@@ -23,7 +23,8 @@
 - 新增「手动 Cookie 登录」：`POST /api/test/xiaomi/cookie-login`，用 `http.cookies.SimpleCookie`
   解析 `name=value; name=value`。空/无法解析/缺 `userId`/缺 `passToken` 分别返回
   `action:"fix_cookie"` 与具体原因（`userId` 与 `passToken` 都是必需的）；没有 `serviceToken` 时
-  用 `MiAccount(session,"","",None)` + `account.login("micoapi")` 换取（失败 →
+  用 `MiAccount(session,"","",None)`（预置 `account.token` 的 userId/passToken/deviceId）
+  + 经 `_mi_service_login_verified` 在保持 TLS 校验的前提下换取（失败 →
   `action:"exchange_failed"`）；拿到 serviceToken 后**必须**先通过设备列表校验才写盘，
   失败 → `action:"device_list"` 且不写任何文件。Cookie 登录在验证码会话进行中也可以使用，
   成功后清空验证码状态。
@@ -41,14 +42,33 @@
 - 新端点全部挂在现有 app 对象上、走同一套鉴权中间件；验证码流程在设备列表校验通过前
   **不写任何文件**；进行中的验证码会话不会阻塞扫码登录，也不会阻塞 Cookie 登录。
 
+### 意图规则界面（复选框设备选择、分条保存、规则名称）
+- 设备选择从「按住 Ctrl 才能多选」的下拉框改为**复选框列表**：点选即可、显示名称与 `entity_id`、
+  顶部「已选择 N 个设备」，支持按名称/`entity_id` 搜索、全选、清空；设备列表异步刷新与 HA
+  暂时离线都不会清掉已选实体。
+- 每条规则新增**独立「保存」**（编辑/收起 | 保存 | 删除）：只提交当前规则的修改，不会顺带提交
+  其他规则未保存的内容；保存失败保留编辑内容并显示原因；顶部保留「保存全部」。规则标题显示
+  「未保存」标识，收起/展开与切换页签都不会丢草稿。
+- 新增可选的**规则名称**（仅用于展示与管理，不参与语音匹配）。列表标题优先级：规则名称 →
+  触发语句 → 「新规则 #N」；原「你说的话」改名为「触发语句（支持匹配表达式）」，底层仍用
+  `pattern`，`{num}` 等匹配写法与执行优先级不变。
+- 数据兼容：单实体仍保存为字符串、多实体保存为数组、无实体保存为空字符串；旧规则/旧 JSON
+  没有 `name` 字段也能正常编辑、保存、导入导出（后端只读 `pattern` 与 `action`，未知字段原样保留）。
+
 ### 构建与测试
-- 新增 `test_xiaomi_login.py`（309 项检查 / 31 个场景）：密码登录直接成功、触发验证码、
+- 新增 `test_xiaomi_login.py`（359 项检查 / 33 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
   发送冷却与「只在显式点击时发送」、同会话 8 步换 Token（含断言所有 identity/verify 请求
   用的是同一个会话对象）、错误验证码计数与耗尽、TTL 过期、重新开始、unsupported 响应、
   `location` 白名单（6 种恶意形式）、Cookie 登录（换取 / 直连 / 过期 / 缺字段 / 探测失败）、
   Cookie 登录与验证码状态互不影响、日志与 JSON 响应不泄露密码/验证码/passToken/serviceToken、
-  失败不写 `/data`、前端三个入口与每个按钮实际调用的相对端点（Node + DOM stub）。
-- 该套件已纳入镜像构建期测试与 CI（host job + 镜像内 `docker run`），并加了 6 个变异体检查
+  失败不写 `/data`、前端三个入口与每个按钮实际调用的相对端点（Node + DOM stub）；
+  `[real 2.9.3]` 段用官方 sdist 里的真实 `miaccount.py` 钉住两个契约：Cookie 换取依赖
+  `account.token` 预置的 userId/passToken/deviceId，以及依赖的 `_serviceLogin` 仍关闭
+  TLS 校验（`ssl=False`）而新增流程必须走 `_mi_service_login_verified` 保持校验证书。
+- 规则页测试重写为 26 个用例 / 235 条断言（复选框单选/多选、全选/清空/搜索、单条保存与
+  草稿隔离、保存失败恢复、规则名称与旧数据兼容、导入导出、设备类型切换），另加真实
+  `IntentParser` 行为校验，证明规则名称不参与语音匹配。
+- 上述套件已纳入镜像构建期测试与 CI（host job + 镜像内 `docker run`），并加了 6 个变异体检查
   （忽略冷却、绕过 location 白名单、先写凭据后探测设备、容忍缺失 context、Cookie 登录跳过
   设备探测、验证时换新会话），全部被测试杀死。
 
@@ -57,7 +77,6 @@
 > 返回 `flag` / `location` 需要在一台真实 HAOS 上用隔离账号走一遍。失败时界面会给出明确错误
 > （`unsupported` / `retry_code` / `restart`），不会假装登录成功；扫码登录始终可用。
 > 邮箱验证码（`flag=8`）本版本只做识别，发送接口未实现，会明确返回「暂不支持」。
-
 ## 1.0.11
 
 ### 登录（短信验证闭环）

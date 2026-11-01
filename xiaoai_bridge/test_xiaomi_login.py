@@ -17,12 +17,25 @@ Everything runs against the *patched* bridge.py with fake aiohttp/miservice
 objects: no network, no real Xiaomi account. Real Xiaomi behaviour still needs a
 device test (see CHANGELOG 1.0.12).
 
+The "[real 2.9.3]" section at the end is the exception: it loads the genuine
+miservice_fork 2.9.3 miaccount.py (unpacked sdist source, no network) and pins
+two contracts against it — the token preload that makes the Cookie exchange
+possible, and the TLS behaviour (the dependency disables certificate
+verification inside MiAccount._serviceLogin, the bridge must not). Point
+MISERVICE_REAL_PATH at a directory containing the miservice package, or leave it
+alone and let the two candidate paths under the repo parent be tried; when the
+package is missing the section prints SKIP and the rest of the suite still runs.
+
 Usage: python test_xiaomi_login.py [/app/bridge.py] [--html /app/web/index.html]
 """
 
 import ast
 import asyncio
+import hashlib
+import inspect
 import json
+import os
+import re
 import shutil
 import stat
 import subprocess
@@ -38,6 +51,10 @@ if "--html" in sys.argv:
     html_path = Path(sys.argv[sys.argv.index("--html") + 1])
 source = source_path.read_text(encoding="utf-8")
 tree = ast.parse(source)
+
+# the 1.0.12 section is the only place the new login flows may live
+F_SECTION_MARKER = "# ──────────────── 账号密码 + 验证码登录（1.0.12）"
+f_section_source = source.split(F_SECTION_MARKER)[-1]
 
 checks = 0
 failures = []
@@ -96,10 +113,16 @@ class FakeJar:
         self.cookie.update(dict(cookies or {}))
 
 
+ACCOUNT_PASS_URL = "https://account.xiaomi.com/pass/"
+LOGIN_PREFIX = ACCOUNT_PASS_URL + "serviceLogin"
+
+
 class FakeSession:
-    def __init__(self, name="session", responses=None):
+    def __init__(self, name="session", responses=None, login_responses=None):
         self.name = name
         self.responses = list(responses or [])
+        # None means "take the next scripted password-login answer from CURRENT"
+        self.login_responses = login_responses
         self.calls = []
         self.closed = False
         self.jar = FakeJar()
@@ -108,8 +131,34 @@ class FakeSession:
     def cookie_jar(self):
         return self.jar
 
+    def _login_reply(self):
+        '''One password-login answer: scripted per session, per scenario, or a failure knob.'''
+        if self.login_responses is not None:
+            return self.login_responses.pop(0) if self.login_responses else {}
+        behaviour = CURRENT.get("cookie_login", "ok")
+        if behaviour == "raise":
+            raise RuntimeError("scripted exchange failure")
+        if behaviour == "fail":
+            return {"code": 70016, "description": "scripted exchange rejection"}
+        if CURRENT["login_script"]:
+            return CURRENT["login_script"].pop(0)
+        raise RuntimeError("no scripted login response")
+
     def _request(self, method, url, **kwargs):
         self.calls.append((method, url, kwargs))
+        if str(url).startswith(LOGIN_PREFIX):
+            # the 1.0.12 flows reach account.xiaomi.com/pass/serviceLogin through
+            # _mi_service_login_verified, so the fake must answer on the session
+            payload = self._login_reply()
+            CURRENT["verified_login_calls"].append({
+                "session": self, "method": method, "url": str(url),
+                "kwargs": kwargs, "payload": payload,
+            })
+            CURRENT["service_login_calls"].append(
+                (self, str(url)[len(ACCOUNT_PASS_URL):], kwargs.get("data"))
+            )
+            body = b"&&&START&&&" + json.dumps(payload).encode("utf-8")
+            return _ResponseContext(FakeResponse(200, body))
         response = self.responses.pop(0) if self.responses else FakeResponse(200, b"")
         return _ResponseContext(response)
 
@@ -148,6 +197,7 @@ def reset_current():
         "sessions": [],
         "accounts": [],
         "service_login_calls": [],
+        "verified_login_calls": [],
         "security_calls": [],
         "micoapi_login_calls": [],
     })
@@ -268,6 +318,7 @@ FUNCTIONS = (
     "_otp_int",
     "_otp_field",
     "_otp_json",
+    "_mi_service_login_verified",
     "_otp_age_seconds",
     "_otp_is_fresh",
     "_close_otp_session",
@@ -544,12 +595,15 @@ def scenario_start_needs_otp():
             return "no OTP session"
         check(session.closed is False, "the verification session must stay open")
         urls = session.urls()
-        check(len(urls) == 2, f"start must only open authStart + identity/list, got {urls}")
-        if len(urls) >= 2:
-            check(urls[0].startswith("https://account.xiaomi.com/fe/service/identity/authStart"),
-                  f"step 1 must open the notificationUrl, got {urls[0]}")
-            check("/identity/list?" in urls[1] and "context=ctx-123" in urls[1],
-                  f"step 2 must call identity/list with the context, got {urls[1]}")
+        check(len(urls) == 3,
+              f"start must log in, then open authStart + identity/list, got {urls}")
+        if len(urls) >= 3:
+            check(urls[0] == "https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true",
+                  f"step 0 must be the TLS-verified password login, got {urls[0]}")
+            check(urls[1].startswith("https://account.xiaomi.com/fe/service/identity/authStart"),
+                  f"step 1 must open the notificationUrl, got {urls[1]}")
+            check("/identity/list?" in urls[2] and "context=ctx-123" in urls[2],
+                  f"step 2 must call identity/list with the context, got {urls[2]}")
         check(not any("sendPhoneTicket" in url for url in urls),
               f"start must never send the SMS by itself, got {urls}")
         check(not any("verifyPhone" in url for url in urls),
@@ -858,7 +912,8 @@ def scenario_unsupported_flows():
               f"a missing notificationUrl must be an explicit error, got {data}")
         check(h.otp_state() == {} and h.otp_session() is None,
               "an unsupported start must not keep state")
-        check(not any(session.calls for session in CURRENT["sessions"]),
+        check(not any("/identity/" in str(url) or "authStart" in str(url)
+                      for session in CURRENT["sessions"] for _m, url, _k in session.calls),
               "an unsupported start must not issue verification requests")
 
         # (b) notificationUrl without context
@@ -960,13 +1015,44 @@ def scenario_location_allowlist():
 def scenario_cookie_login():
     h = Harness()
     try:
-        # (a) userId + passToken only: exchange through MiAccount.login('micoapi')
+        # (a) userId + passToken only: the exchange runs through the verified helper
+        CURRENT["login_script"] = [{
+            "code": 0,
+            "userId": "cookie-user",
+            "passToken": "cookie-pass",
+            "ssecurity": "cookie-ssecurity",
+            "location": "https://api2.mina.mi.com/sts?sign=cookie",
+            "nonce": "cookie-nonce",
+        }]
+        CURRENT["service_token"] = "cookie-service-token"
         data = cookie_login(h, "userId=cookie-user; passToken=cookie-pass; deviceId=cookie-dev")
         check(data.get("ok") is True, f"an exchanged cookie must log in, got {data}")
-        check(len(CURRENT["micoapi_login_calls"]) == 1,
-              f"exactly one micoapi exchange expected, got {CURRENT['micoapi_login_calls']}")
-        check(CURRENT["micoapi_login_calls"][0][1] == "micoapi",
-              "the exchange must ask for the micoapi sid")
+        exchange = CURRENT["verified_login_calls"]
+        check(len(exchange) == 1,
+              f"exactly one micoapi exchange expected, got {exchange}")
+        if exchange:
+            call = exchange[0]
+            check(call["url"] ==
+                  "https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true",
+                  f"the exchange must ask for the micoapi sid, got {call['url']}")
+            check(call["method"] == "GET", f"a bodiless exchange must be a GET, got {call['method']}")
+            check(call["kwargs"].get("data") is None,
+                  f"a bodiless exchange must not send a body, got {call['kwargs'].get('data')}")
+            check(call["kwargs"].get("allow_redirects") is False,
+                  "the exchange must never follow redirects")
+            check("ssl" not in call["kwargs"] or call["kwargs"]["ssl"] is not False,
+                  f"the exchange may not disable TLS verification, got {call['kwargs'].get('ssl')}")
+            sent = call["kwargs"].get("cookies") or {}
+            check(sent.get("userId") == "cookie-user"
+                  and sent.get("passToken") == "cookie-pass"
+                  and sent.get("deviceId") == "cookie-dev"
+                  and sent.get("sdkVersion") == "3.9",
+                  f"the preloaded userId/passToken/deviceId must be the cookies, got {sent}")
+        check(CURRENT["micoapi_login_calls"] == [],
+              "the exchange must not use MiAccount.login() any more (it disables TLS checks)")
+        account = CURRENT["accounts"][-1]
+        check(account.token.get("micoapi") == ("cookie-ssecurity", "cookie-service-token"),
+              f"the exchange must write the micoapi tuple onto account.token, got {account.token}")
         token = json.loads(h.token_path.read_text(encoding="utf-8"))
         check(token.get("micoapi") == ["cookie-ssecurity", "cookie-service-token"],
               f"the exchanged token must be persisted, got {token.get('micoapi')}")
@@ -979,14 +1065,14 @@ def scenario_cookie_login():
         try:
             data = cookie_login(h2, "userId=u; passToken=p; serviceToken=svc-direct; deviceId=d")
             check(data.get("ok") is True, f"a direct serviceToken cookie must log in, got {data}")
-            check(CURRENT["micoapi_login_calls"] == [],
-                  "a cookie with serviceToken must not call the exchange")
+            check(CURRENT["verified_login_calls"] == [],
+                  "a cookie with serviceToken must not run any exchange")
             token = json.loads(h2.token_path.read_text(encoding="utf-8"))
             check(token.get("micoapi") == ["", "svc-direct"],
                   f"the direct serviceToken must be persisted, got {token.get('micoapi')}")
         finally:
             h2.cleanup()
-        ok("cookie: exchange via login('micoapi') and direct serviceToken both verify + persist")
+        ok("cookie: preloaded-token exchange over verified TLS, direct serviceToken also verified")
     finally:
         h.cleanup()
 
@@ -1536,6 +1622,281 @@ def scenario_frontend_behaviour():
     return "frontend behaviour verified"
 
 
+# ─────────────── 18. contract B: the new flows keep TLS verification on ───────────────
+def _helper_node():
+    return next((node for node in tree.body
+                 if isinstance(node, ast.AsyncFunctionDef)
+                 and node.name == "_mi_service_login_verified"), None)
+
+
+def scenario_verified_transport():
+    # B(b) static: the 1.0.12 section never re-disables certificate verification
+    check(F_SECTION_MARKER in source,
+          "bridge.py must carry the 1.0.12 section marker (not only the whole-file check)")
+    check(re.findall(r"ssl\s*=\s*False", f_section_source) == [],
+          "the 1.0.12 section must contain zero occurrences of a disabled-TLS override")
+    node = _helper_node()
+    check(node is not None,
+          "bridge.py must define the async helper _mi_service_login_verified()")
+    if node is not None:
+        keywords = [(kw.arg, kw.value) for call in ast.walk(node)
+                    if isinstance(call, ast.Call) for kw in call.keywords]
+        check(all(name != "ssl" for name, _value in keywords),
+              "the verified helper must never pass an ssl kwarg to aiohttp")
+        redirects = [value for name, value in keywords if name == "allow_redirects"]
+        check(redirects and all(isinstance(value, ast.Constant) and value.value is False
+                                for value in redirects),
+              "the verified helper must keep allow_redirects=False")
+        into_dependency = [call.func.attr for call in ast.walk(node)
+                           if isinstance(call, ast.Call)
+                           and isinstance(call.func, ast.Attribute)
+                           and call.func.attr == "_serviceLogin"]
+        check(into_dependency == [],
+              "the verified helper must not call the dependency's _serviceLogin")
+
+    # B(c) behavioural: the OTP password login runs through that helper
+    h = Harness()
+    try:
+        CURRENT["login_script"] = [
+            {"code": 70016, "description": "密码错误", "qs": "q", "sid": "s",
+             "_sign": "x", "callback": "c"},
+            {"code": 70016, "description": "密码错误"},
+        ]
+        data = start(h)
+        check(data.get("ok") is False and data.get("action") == "login_failed",
+              f"the scripted rejection must stay an explicit login_failed, got {data}")
+        calls = CURRENT["verified_login_calls"]
+        check(len(calls) == 2,
+              f"one password login plus one Auth2 submit expected, got {len(calls)}")
+        if len(calls) == 2:
+            first, second = calls
+            check(first["method"] == "GET" and first["kwargs"].get("data") is None,
+                  f"the first serviceLogin must be a bodyless GET, got {first['method']}")
+            check(first["url"] == LOGIN_PREFIX + "?sid=micoapi&_json=true",
+                  f"the first serviceLogin must hit the pinned URL, got {first['url']}")
+            cookies = first["kwargs"].get("cookies") or {}
+            check(cookies.get("deviceId") == "RANDOMDEVICEID"
+                  and cookies.get("sdkVersion") == "3.9",
+                  f"the login must carry deviceId/sdkVersion cookies, got {cookies}")
+            check(cookies.get("passToken") == "" and "userId" not in cookies,
+                  f"a token without passToken sends only an empty passToken, got {cookies}")
+            check(second["method"] == "POST"
+                  and second["url"] == LOGIN_PREFIX + "Auth2",
+                  f"the Auth2 submit must POST serviceLoginAuth2, got {second['url']}")
+            form = second["kwargs"].get("data") or {}
+            check(form.get("user") == "13800000000" and form.get("_sign") == "x"
+                  and form.get("hash") == hashlib.md5(b"pw").hexdigest().upper(),
+                  f"the Auth2 body must carry the signed password hash, got {form}")
+            check(second["kwargs"].get("cookies", {}).get("deviceId") == "RANDOMDEVICEID",
+                  "the Auth2 submit must reuse the same deviceId cookie")
+        check(all("ssl" not in call["kwargs"] or call["kwargs"]["ssl"] is not False
+                  for call in calls),
+              "no OTP login request may pass ssl=False")
+        check(all(call["kwargs"].get("allow_redirects") is False for call in calls),
+              "no OTP login request may follow redirects")
+        check(all(call["kwargs"].get("timeout") is not None for call in calls),
+              "every OTP login request must carry a timeout")
+        exposure = [call for session in CURRENT["sessions"] for call in session.calls
+                    if "ssl" in call[2]]
+        check(exposure == [],
+              f"no request of the new flow may pass an ssl override at all, got {exposure}")
+        check(CURRENT["micoapi_login_calls"] == [],
+              "the OTP flow must not use MiAccount.login()")
+        ok("contract B: 1.0.12 section has zero TLS overrides; the helper never sends ssl")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 19. [real 2.9.3] contracts against the genuine dependency ───────────────
+# The package used here is the genuine miservice_fork 2.9.3 code, taken from the
+# official sdist (miservice_fork-2.9.3.tar.gz) that the runtime pins. It is either
+# an unpacked copy next to the repo or a copy placed under
+# venv-contract/Lib/site-packages; nothing is downloaded and no fake stands in for
+# MiAccount itself. Only fake_useragent (an unrelated UA-string dependency, absent
+# offline) is replaced by a two-line stand-in when it cannot be imported.
+REAL_PACKAGE_VERSION = "2.9.3"
+
+
+def _find_real_miaccount_path():
+    candidates = []
+    override = os.environ.get("MISERVICE_REAL_PATH", "").strip()
+    if override:
+        candidates.append(Path(override))
+    root = Path(__file__).resolve().parent.parent
+    candidates.extend([
+        root / "venv-contract" / "Lib" / "site-packages",
+        root / "venv-contract" / "lib" / "python3.11" / "site-packages",
+        root.parent / "venv-contract" / "Lib" / "site-packages",
+        root.parent / "venv-contract" / "lib" / "python3.11" / "site-packages",
+        root.parent / "research" / "pkgs" / "fork-2.9.3" / "miservice_fork-2.9.3",
+    ])
+    for candidate in candidates:
+        for base in (candidate, candidate / "miservice"):
+            module = base / "miaccount.py"
+            if module.is_file():
+                return module
+    return None
+
+
+def _real_package_version(module_path):
+    package = module_path.parent
+    metadata = [
+        package.parent / "PKG-INFO",
+        package.parent / ("miservice_fork-%s.dist-info" % REAL_PACKAGE_VERSION) / "METADATA",
+    ]
+    try:
+        metadata.extend(sorted(package.parent.glob("miservice_fork-*.dist-info/METADATA")))
+    except OSError:
+        pass
+    for path in metadata:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("Version:"):
+                return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _load_real_miaccount(module_path):
+    '''Execute the genuine miaccount.py by path (the fake one is in sys.modules).'''
+    import importlib.util
+    saved = {name: sys.modules.get(name) for name in
+             ("miservice", "miservice.miaccount", "aiohttp", "fake_useragent")}
+    stubbed = None
+    try:
+        for name in ("miservice", "miservice.miaccount", "aiohttp"):
+            sys.modules.pop(name, None)
+        try:
+            __import__("fake_useragent")
+        except ImportError:
+            stubbed = types.ModuleType("fake_useragent")
+
+            class _StandInUserAgent:   # only supplies the random UA string
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                @property
+                def random(self):
+                    return "python-test-agent"
+
+            stubbed.UserAgent = _StandInUserAgent
+            sys.modules["fake_useragent"] = stubbed
+        spec = importlib.util.spec_from_file_location("miservice_real_miaccount", module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if stubbed is not None:
+            sys.modules.pop("fake_useragent", None)
+        for name, value in saved.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+
+
+def scenario_real_293_contracts():
+    module_path = _find_real_miaccount_path()
+    if module_path is None:
+        print("SKIP [real 2.9.3] no miservice_fork 2.9.3 source found "
+              "(set MISERVICE_REAL_PATH to a directory containing the miservice package)")
+        return None
+    version = _real_package_version(module_path)
+    if version and version != REAL_PACKAGE_VERSION:
+        print(f"SKIP [real 2.9.3] {module_path} reports version {version}; "
+              f"these contracts pin {REAL_PACKAGE_VERSION}")
+        return None
+    try:
+        real = _load_real_miaccount(module_path)
+    except Exception as exc:
+        print(f"SKIP [real 2.9.3] cannot import {module_path}: "
+              f"{type(exc).__name__}: {exc}")
+        return None
+    real_account = real.MiAccount
+    real_source = module_path.read_text(encoding="utf-8", errors="replace")
+    reset_current()
+
+    # B(a) the documented pin: 2.9.3 disables certificate verification in _serviceLogin
+    check(re.search(r"ssl\s*=\s*False", real_source) is not None,
+          "miservice_fork 2.9.3 must still disable TLS verification (documented pin)")
+    login_source = inspect.getsource(real_account._serviceLogin)
+    check(re.search(r"ssl\s*=\s*False", login_source) is not None,
+          "MiAccount._serviceLogin in the pinned version is expected to pass ssl=False")
+    check("allow_redirects" not in login_source,
+          "the pinned _serviceLogin relies on aiohttp's default redirect handling")
+
+    token = {"userId": "real-user", "passToken": "real-pass", "deviceId": "REALDEVICE123456"}
+    reply = {"code": 0, "ssecurity": "real-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=real", "nonce": "real-nonce"}
+
+    # A.1 the real class: the preloaded token is what makes the exchange possible
+    real_session = FakeSession(login_responses=[dict(reply)])
+    account = real_account(real_session, "", "", None)
+    account.token = dict(token)
+    exchanged = asyncio.run(account._serviceLogin("serviceLogin?sid=micoapi&_json=true"))
+    real_calls = list(real_session.calls)
+    check(len(real_calls) == 1,
+          f"the real _serviceLogin must issue exactly one request, got {real_calls}")
+    method = url = None
+    real_cookies = {}
+    real_body = None
+    if real_calls:
+        method, url, kwargs = real_calls[0]
+        real_cookies = kwargs.get("cookies") or {}
+        real_body = kwargs.get("data")
+        check(method == "GET", f"a bodiless exchange must be a GET, got {method}")
+        check(url == LOGIN_PREFIX + "?sid=micoapi&_json=true",
+              f"the real class must POST/GET the pinned URL, got {url}")
+        check(real_cookies.get("userId") == "real-user",
+              f"the userId cookie must come from the preload, got {real_cookies}")
+        check(real_cookies.get("passToken") == "real-pass",
+              f"the passToken cookie must come from the preload, got {real_cookies}")
+        check(real_cookies.get("deviceId") == "REALDEVICE123456",
+              f"the deviceId cookie must come from the preload, got {real_cookies}")
+        check(real_cookies.get("sdkVersion") == "3.9",
+              f"the sdkVersion cookie must match the protocol, got {real_cookies}")
+        check(kwargs.get("ssl") is False,
+              "2.9.3 is expected to disable TLS verification here (pin check)")
+    check(exchanged.get("code") == 0 and exchanged.get("ssecurity") == "real-ssecurity",
+          f"the real class must parse the &&&START&&& body, got {exchanged}")
+
+    # A.2 the production helper must send the same essential request, with TLS on
+    h = Harness()
+    try:
+        helper = h.ns["_mi_service_login_verified"]
+        our_session = FakeSession(login_responses=[dict(reply)])
+        ours = asyncio.run(helper(
+            our_session, "serviceLogin?sid=micoapi&_json=true",
+            device_id=token["deviceId"], token=dict(token), user_agent="bridge-agent",
+        ))
+        our_calls = list(our_session.calls)
+        check(len(our_calls) == 1,
+              f"the bridge helper must issue exactly one request, got {our_calls}")
+        if our_calls:
+            our_method, our_url, our_kwargs = our_calls[0]
+            check(our_method == method,
+                  f"the helper must use the same HTTP method as 2.9.3 ({method}), got {our_method}")
+            check(our_url == url, f"the helper must hit the same URL as 2.9.3, got {our_url}")
+            our_cookies = our_kwargs.get("cookies") or {}
+            check(our_cookies == real_cookies,
+                  f"the helper must send the same cookies as 2.9.3, got {our_cookies}")
+            check(our_kwargs.get("data") == real_body,
+                  f"the helper must send the same body as 2.9.3, got {our_kwargs.get('data')}")
+            check("ssl" not in our_kwargs or our_kwargs["ssl"] is not False,
+                  "the helper may never disable TLS verification")
+            check(our_kwargs.get("allow_redirects") is False,
+                  "the helper must never follow redirects")
+        check(ours == exchanged,
+              f"the helper must parse the same response as 2.9.3, got {ours}")
+        ok(f"[real 2.9.3] token preload contract proven against the genuine class "
+           f"(version {version or 'unlabelled copy'}, {module_path.parent.name}/miaccount.py); "
+           f"the bridge helper matches its request without the TLS override")
+    finally:
+        h.cleanup()
+
+
 def main():
     probe = Harness()
     probe.cleanup()
@@ -1564,6 +1925,8 @@ def main():
         scenario_secrets_not_logged,
         scenario_failures_leave_data_untouched,
         scenario_compatibility,
+        scenario_verified_transport,
+        scenario_real_293_contracts,
     ]
     for scenario in scenarios:
         scenario()

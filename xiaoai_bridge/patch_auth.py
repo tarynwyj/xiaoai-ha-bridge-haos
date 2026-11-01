@@ -2112,8 +2112,10 @@ replace_exact(
 # 说明：本段代码由 patch_auth.py 插入 bridge.py，docstring 一律用三单引号。
 # 协议来自 miservice 2.4+/3.x 的 _verify_otp（MiIO 抓包注释）：验证必须在
 # 同一个 aiohttp 会话里完成，换会话或换浏览器都会让验证结果失效；这也是
-# 1.0.11「浏览器验证 + 粘贴回调地址」稳定 401 的根因。本段只复用
-# miservice_fork==2.9.3 已有的 _serviceLogin / _securityTokenService，不换库。
+# 1.0.11「浏览器验证 + 粘贴回调地址」稳定 401 的根因。本段复用
+# miservice_fork==2.9.3 的 MiAccount 做 token 状态与 _securityTokenService，
+# 但密码/换取请求改走 _mi_service_login_verified：依赖里的 _serviceLogin
+# 把 aiohttp 的 ssl 参数置为假（关闭 TLS 证书校验），新增流程不得继承。
 
 OTP_ACCOUNT_BASE = "https://account.xiaomi.com"
 OTP_VERIFY_HOST = "account.xiaomi.com"
@@ -2197,6 +2199,56 @@ def _otp_json(raw) -> dict:
             "小米返回了无法解析的响应（不是预期的 JSON），无法继续验证；请改用扫码登录",
         )
     return payload
+
+
+async def _mi_service_login_verified(session, uri: str, data: dict | None = None,
+                                     device_id: str = "", token: dict | None = None,
+                                     user_agent: str = "") -> dict:
+    '''Replica of MiAccount._serviceLogin (miservice_fork 2.9.3) with TLS verified.
+
+    The pinned dependency turns certificate verification OFF inside
+    _serviceLogin: it passes the aiohttp "ssl" argument as False. The new OTP
+    and Cookie flows must not inherit that, so this helper builds the same
+    request — same URL, same sdkVersion/deviceId/userId/passToken cookies, same
+    body, same "GET when there is no body" rule, redirects never followed — and
+    simply never passes an "ssl" override, so aiohttp keeps verifying the
+    certificate chain. It returns the parsed JSON (the "&&&START&&&" prefix
+    tolerated). Keep it in sync with the pinned version: test_xiaomi_login.py
+    asserts the dependency still disables verification and that this helper
+    never sends such an override.
+    '''
+    state = token if isinstance(token, dict) else {}
+    cookies = {
+        "sdkVersion": "3.9",
+        "deviceId": str(device_id or state.get("deviceId") or ""),
+    }
+    if "passToken" in state:
+        cookies["userId"] = str(state.get("userId") or "")
+        cookies["passToken"] = str(state.get("passToken") or "")
+    else:
+        cookies["passToken"] = ""
+    url = OTP_ACCOUNT_BASE + "/pass/" + uri
+    headers = {"User-Agent": user_agent or OTP_USER_AGENT}
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with session.request(
+            "GET" if data is None else "POST",
+            url,
+            data=data,
+            cookies=cookies,
+            headers=headers,
+            timeout=timeout,
+            allow_redirects=False,
+        ) as resp:
+            raw = await resp.read()
+    except OtpFlowError:
+        raise
+    except Exception as e:
+        log.warning("小米账号登录请求失败 (%s)", type(e).__name__)
+        raise OtpFlowError(
+            "retry", "network", "访问小米账号服务失败（网络错误），请稍后重试"
+        ) from None
+    return _otp_json(raw)
 
 
 def _otp_age_seconds() -> int:
@@ -2527,7 +2579,11 @@ async def _otp_password_login(username: str, password: str) -> dict:
         device_id = str(token.get("deviceId") or "").strip() or get_random(16).upper()
         token["deviceId"] = device_id
         log.info("OTP 登录：提交密码登录（stage=service_login）")
-        resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+        # 走本地 helper 而不是 account._serviceLogin：后者在 2.9.3 里关闭了 TLS 证书校验
+        resp = await _mi_service_login_verified(
+            session, "serviceLogin?sid=micoapi&_json=true", device_id=device_id,
+            token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
+        )
         if _otp_int(resp.get("code"), 0) != 0:
             payload = {
                 "_json": "true",
@@ -2539,7 +2595,10 @@ async def _otp_password_login(username: str, password: str) -> dict:
                 "hash": hashlib.md5(password.encode("utf-8")).hexdigest().upper(),
             }
             log.info("OTP 登录：提交密码校验（stage=service_login_auth2）")
-            resp = await account._serviceLogin("serviceLoginAuth2", payload)
+            resp = await _mi_service_login_verified(
+                session, "serviceLoginAuth2", payload, device_id=device_id,
+                token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
+            )
         code = _otp_int(resp.get("code"), -1)
         if code != 0:
             desc = str(resp.get("description") or resp.get("desc") or "小米拒绝了本次登录")
@@ -2712,7 +2771,10 @@ async def _otp_verify_code(code: str) -> dict:
     account.token = token
     token["deviceId"] = device_id or str(token.get("deviceId") or "")
     log.info("OTP 登录：在同一会话内恢复登录（stage=resume_login）")
-    resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+    resp = await _mi_service_login_verified(
+        session, "serviceLogin?sid=micoapi&_json=true", device_id=device_id,
+        token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
+    )
     if _otp_int(resp.get("code"), -1) != 0:
         raise OtpFlowError(
             "unsupported", "resume_failed",
@@ -2954,12 +3016,33 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
             }
             log.info("Cookie 登录：用 userId/passToken 换取 micoapi serviceToken")
             exchanged = False
+            token = getattr(account, "token", None)
+            if not isinstance(token, dict):
+                token = {}
+                account.token = token
             try:
-                exchanged = bool(await account.login("micoapi"))
+                # 契约：先预置 userId/passToken/deviceId，服务端才认这次换取；
+                # 请求本身走本地 helper，避免继承依赖里关闭证书校验的行为。
+                resp = await _mi_service_login_verified(
+                    session, "serviceLogin?sid=micoapi&_json=true",
+                    device_id=device_id, token=token,
+                    user_agent=str(getattr(account, "now_ua", "") or ""),
+                )
+                if _otp_int(resp.get("code"), -1) == 0:
+                    location = str(resp.get("location") or "")
+                    nonce = str(resp.get("nonce") or "")
+                    ssecurity_resp = str(resp.get("ssecurity") or "")
+                    if location and nonce and ssecurity_resp:
+                        service = str(await account._securityTokenService(
+                            location, nonce, ssecurity_resp) or "").strip()
+                        if service:
+                            token["micoapi"] = (ssecurity_resp, service)
+                            exchanged = True
+                else:
+                    log.info("Cookie 登录：换取请求被拒绝 (code=%s)", resp.get("code"))
             except Exception as e:
                 log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
                 exchanged = False
-            token = getattr(account, "token", None) or {}
             pair = token.get("micoapi") if isinstance(token, dict) else None
             if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[1]:
                 ssecurity = str(ssecurity or pair[0] or "")

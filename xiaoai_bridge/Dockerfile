@@ -24,7 +24,10 @@ RUN pip install --no-cache-dir -r /tmp/requirements.lock.txt \
 COPY patch_web.py /tmp/patch_web.py
 RUN python -m py_compile /tmp/patch_web.py \
     && python /tmp/patch_web.py \
-    && grep -Fq '<select class="r-e" multiple size="6">' /app/web/index.html \
+    && grep -Fq 'type="checkbox" class="r-e"' /app/web/index.html \
+    && grep -Fq 'function saveOneRule(' /app/web/index.html \
+    && grep -Fq '保存全部' /app/web/index.html \
+    && ! grep -Fq 'multiple size="6"' /app/web/index.html \
     && grep -Fq 'function ruleSummaryHtml(rule)' /app/web/index.html \
     && grep -Fq 'async function loadRuleDevices()' /app/web/index.html \
     && grep -Fq 'window.fetch=function(input,init)' /app/web/index.html \

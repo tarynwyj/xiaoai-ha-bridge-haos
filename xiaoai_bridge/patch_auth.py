@@ -1846,6 +1846,34 @@ async def _probe_devices_with_token(username: str, password: str, creds: dict) -
             pass
 
 
+def _write_private_file(path, payload: str) -> None:
+    '''Create ``path`` with mode 0600 before any bytes are written.'''
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # umask could still strip bits on POSIX; pin the mode before writing anything
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def _restore_credential_files(previous: dict) -> None:
     '''Put the previous credential files back after a half applied write.'''
     for path, content in previous.items():
@@ -1854,17 +1882,21 @@ def _restore_credential_files(previous: dict) -> None:
                 if path.exists():
                     path.unlink()
             else:
-                path.write_bytes(content)
+                _write_private_file(path, content.decode("utf-8"))
         except OSError as e:
+            log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
+        except Exception as e:
             log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
 
 
 def _persist_sms_credentials(creds: dict) -> None:
-    '''Persist a fully validated credential set atomically (all or nothing).
+    '''Persist a fully validated credential set as a best-effort pair write.
 
-    Both files go to temporaries first; the originals are snapshotted so that a
-    failure between the two renames can be rolled back. auth.json and .mi.token
-    therefore always describe the same login.
+    Both files are written to 0600 temporaries first and then renamed into place.
+    The old bytes are snapshotted, so a failure between the two renames is rolled
+    back and auth.json / .mi.token keep describing the same login. This is not a
+    crash-safe transaction: a hard kill between the two renames can still leave a
+    mixed pair on disk.
     '''
     missing = _missing_credentials(creds)
     if missing:
@@ -1881,21 +1913,24 @@ def _persist_sms_credentials(creds: dict) -> None:
     TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_auth = AUTH_PATH.with_name(AUTH_PATH.name + ".tmp")
     tmp_token = TOKEN_PATH.with_name(TOKEN_PATH.name + ".tmp")
+    # 先把旧文件读进内存：读失败必须中止，绝不能当成「旧文件不存在」，
+    # 否则回滚时会把用户现有的凭据文件当成多余文件删掉。
     previous = {}
     for path in (AUTH_PATH, TOKEN_PATH):
         try:
-            previous[path] = path.read_bytes() if path.exists() else None
-        except OSError:
+            previous[path] = path.read_bytes()
+        except FileNotFoundError:
             previous[path] = None
+        except OSError as e:
+            raise OSError(
+                "无法读取原有的凭据文件，已中止写入以免覆盖或误删: " + path.name
+            ) from e
     try:
-        tmp_auth.write_text(json.dumps(identity, ensure_ascii=False), encoding="utf-8")
-        tmp_token.write_text(json.dumps(token_data, ensure_ascii=False), encoding="utf-8")
+        # 临时文件在创建时就是 0600，替换后权限随文件一起生效，不存在「先 0644 再改」的窗口
+        _write_private_file(tmp_auth, json.dumps(identity, ensure_ascii=False))
+        _write_private_file(tmp_token, json.dumps(token_data, ensure_ascii=False))
         os.replace(tmp_auth, AUTH_PATH)
         os.replace(tmp_token, TOKEN_PATH)
-        try:
-            os.chmod(TOKEN_PATH, 0o600)
-        except OSError:
-            pass
     except Exception:
         _restore_credential_files(previous)
         raise

@@ -18,6 +18,9 @@ Usage: python test_sms_login.py [/app/bridge.py] [--html /app/web/index.html]
 import ast
 import asyncio
 import json
+import os as real_os_module
+import pathlib
+import stat
 import shutil
 import subprocess
 import sys
@@ -237,6 +240,7 @@ FUNCTIONS = (
     "_probe_devices_with_token",
     "_persist_sms_credentials",
     "_restore_credential_files",
+    "_write_private_file",
     "_finish_sms_verification",
     "_finish_cookie_login",
     "xiaomi_verify",
@@ -701,6 +705,93 @@ def scenario_persistence_rollback():
         h.cleanup()
 
 
+# ─────────────── 6c. credential files are 0600 from creation ───────────────
+def scenario_credential_file_permissions():
+    h = Harness()
+    try:
+        creds = {
+            "userId": "perm-user", "passToken": "perm-pass", "deviceId": "perm-dev",
+            "ssecurity": "perm-sec", "serviceToken": "perm-svc",
+        }
+        h.ns["_persist_sms_credentials"](creds)
+
+        real_os = h.ns["os"]
+        observed = []
+
+        def inspecting_replace(src, dst):
+            # look at the temporary file *before* it is renamed into place
+            observed.append((str(dst), real_os_module.stat(str(src)).st_mode & 0o777))
+            return real_os.replace(src, dst)
+
+        proxy = types.SimpleNamespace(**{name: getattr(real_os, name)
+                                         for name in dir(real_os) if not name.startswith("_")})
+        proxy.replace = inspecting_replace
+        h.ns["os"] = proxy
+        try:
+            h.ns["_persist_sms_credentials"](creds)
+        finally:
+            h.ns["os"] = real_os
+
+        check(len(observed) == 2, f"expected both files to be renamed, saw {observed}")
+
+        if real_os_module.name != "posix":
+            # Windows has no POSIX permission bits: os.stat always reports 0o666, so the
+            # 0600 contract can only be asserted on Linux (CI + the in-image build do it).
+            print("SKIPPED 0600 assertions: POSIX modes are not observable on "
+                  f"{real_os_module.name} (Linux CI runs this test for real)")
+            ok("credential temporaries are renamed through the private writer "
+               "(0600 assertions skipped off POSIX)")
+            return None
+
+        for destination, mode in observed:
+            check(mode == 0o600,
+                  f"temporary credential file for {destination} must be 0600 before the rename, got {oct(mode)}")
+        for path in (h.auth_path, h.token_path):
+            mode = stat.S_IMODE(path.stat().st_mode)
+            check(mode == 0o600, f"{path.name} must stay 0600 after the rename, got {oct(mode)}")
+        ok("credential files are 0600 at creation and stay 0600 after the rename")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 6d. an unreadable snapshot aborts the write ───────────────
+def scenario_snapshot_read_failure_aborts():
+    h = Harness()
+    try:
+        h.auth_path.write_text('{"passToken": "old-pass", "userId": "old-user"}', encoding="utf-8")
+        h.token_path.write_text('{"passToken": "old-pass", "userId": "old-user", '
+                                '"micoapi": ["old-sec", "old-svc"]}', encoding="utf-8")
+        before = h.snapshot_data()
+
+        original_read = pathlib.Path.read_bytes
+
+        def failing_read(self, *args, **kwargs):
+            if str(self) == str(h.token_path):
+                raise PermissionError(13, "Permission denied")
+            return original_read(self, *args, **kwargs)
+
+        pathlib.Path.read_bytes = failing_read
+        try:
+            h.ns["_persist_sms_credentials"]({
+                "userId": "new-user", "passToken": "new-pass",
+                "deviceId": "new-dev", "ssecurity": "new-sec", "serviceToken": "new-svc",
+            })
+            check(False, "an unreadable old credential file must abort the write")
+        except OSError as exc:
+            check("无法读取" in str(exc), f"the abort must name the cause, got {exc}")
+        finally:
+            pathlib.Path.read_bytes = original_read
+
+        check(h.snapshot_data() == before,
+              "an aborted write must leave /data byte identical")
+        check(h.auth_path.exists() and h.token_path.exists(),
+              "an aborted write must never delete a credential file it could not read")
+        check(not list(h.root.rglob("*.tmp")), "an aborted write must not leave temporaries")
+        ok("an unreadable credential snapshot aborts the write instead of risking a delete")
+    finally:
+        h.cleanup()
+
+
 # ─────────────── 7. session expiry + repeat requests + concurrency ───────────────
 def scenario_pending_lifecycle_and_concurrency():
     h = Harness()
@@ -942,6 +1033,8 @@ def main():
         scenario_retry_login_keeps_pass_token_and_ssecurity,
         scenario_failures_do_not_pollute_data,
         scenario_persistence_rollback,
+        scenario_credential_file_permissions,
+        scenario_snapshot_read_failure_aborts,
         scenario_pending_lifecycle_and_concurrency,
         scenario_cookie_login_still_works,
         scenario_logs_do_not_leak_secrets,

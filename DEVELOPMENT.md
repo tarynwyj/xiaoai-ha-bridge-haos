@@ -24,6 +24,7 @@ xiaoai_bridge/
 ├── test_api_auth.py       # HTTP 层鉴权与 CSRF
 ├── test_ingress_contract.py  # Ingress 契约（端口、相对路径、对端信任、令牌不泄露）
 ├── test_poll_auth.py      # 对话轮询的 Cookie 最小权限与重定向保护
+├── test_sms_login.py      # 密码 + 短信验证 + STS 全链路（假 MiService/假 STS）
 ├── test_web_patch.py      # 规则页 JS 行为回归（Node + DOM stub）
 ├── test_upgrade_data.py   # 1.0.9 ⇄ 1.0.10 的 /data 升级与回退往返
 └── test_workflow_policy.py   # 把「CI 不发布 / 发布仅手动」写成断言
@@ -77,6 +78,8 @@ python -m py_compile /tmp/app/bridge.py
 python xiaoai_bridge/test_workflow_policy.py
 python xiaoai_bridge/test_startup_patch.py  /tmp/app/bridge.py
 python xiaoai_bridge/test_poll_auth.py      /tmp/app/bridge.py
+python xiaoai_bridge/test_sms_login.py      /tmp/app/bridge.py \
+    --html /tmp/app/web/index.html
 python xiaoai_bridge/test_api_auth.py       /tmp/app
 python xiaoai_bridge/test_web_patch.py      --pristine /tmp/pinned/index.html
 python xiaoai_bridge/test_web_patch.py      --html /tmp/app/web/index.html
@@ -91,13 +94,15 @@ python xiaoai_bridge/test_upgrade_data.py --pristine-bridge /tmp/pinned/bridge.p
 | `test_workflow_policy.py` | CI 不得发布、release 仅手动/main-only/无 `:latest` | PyYAML |
 | `test_startup_patch.py` | 缓存 Token 启动、过期刷新、扫码登录、401 恢复与退避、凭据合并不清空 | 无 |
 | `test_poll_auth.py` | 轮询携带 `userId`+`serviceToken`+目标 `deviceId`、不泄漏 `passToken`、重定向不跟随 | aiohttp |
+| `test_sms_login.py` | 短信验证触发、验证链接归一化、恶意 STS 地址拒绝、STS 换 Token、凭据原子写入与部分失败回滚、失败不污染 `/data`、过期/重复/并发、前端按钮真实调用 `/verify` | aiohttp、Node（可缺） |
 | `test_api_auth.py` | 全部 `/api/*` 未授权 401、`/api/config` 脱敏、CSRF、Ingress 信任、清除凭据 | FastAPI |
 | `test_web_patch.py` | 规则页未保存编辑保护、多实体、Ingress 相对路径、双击拒绝 | Node |
 | `test_ingress_contract.py` | 端口契约、前端相对资源、对端信任、令牌不泄露、旧 `/data` 加载 | Node（可 `--no-node`） |
 | `test_upgrade_data.py` | 用真实 1.0.9/1.0.10 补丁做 `/data` 往返与回退 | 需要 git 历史 |
 
 镜像构建时会在镜像内再跑一遍 `test_startup_patch.py`、`test_api_auth.py`、
-`test_ingress_contract.py --no-node`、`test_poll_auth.py`，任一失败即拒绝产出镜像。
+`test_ingress_contract.py --no-node`、`test_poll_auth.py`、`test_sms_login.py`（无 Node 时
+前端那部分自动跳过），任一失败即拒绝产出镜像。
 
 ## 4. CI 与发布
 
@@ -145,10 +150,12 @@ python xiaoai_bridge/test_upgrade_data.py --pristine-bridge /tmp/pinned/bridge.p
 
 ## 7. 已知限制与待办
 
-- **账号密码 + 短信验证登录未闭环**（计划在 1.0.11 修复）：前端没有调用
-  `/api/test/xiaomi/verify`，且该端点的 STS 分支会把 `pending` 覆盖成 Cookie 对象、
-  丢失 `passToken`，失败时还会把坏的 `cookie_text` 写进 `config.yaml`。扫码与 Cookie
-  登录不受影响。
+- **账号密码 + 短信验证：1.0.11 已实现闭环**（前端「完成验证」按钮 → `/api/test/xiaomi/verify`；
+  登录态与 CookieJar 分离；凭据校验 + 设备列表通过后才原子落盘；失败不写任何文件），并由
+  `test_sms_login.py` 覆盖（119 检查 / 13 场景，含 4 个变异体验证）。**但真实小米短信流程
+  尚未实机验证**：上线前需在一台真实 HAOS 上用隔离账号走一遍。扫码与 Cookie 登录不受影响。
+- **许可证未定**：本仓库与上游均无 LICENSE 文件，未声明任何许可证；需单独决定并补上
+  （见根 `README.md` 的 License 一节）。
 - `config.yaml` 内容损坏（非法 YAML）时 `load_config()` 会抛异常导致启动失败
   （1.0.9 同款行为），计划在后续版本改为「备份坏文件 + 明确报错」。
 - 界面仍从 `fonts.googleapis.com` 加载字体（上游自带）；离线环境会退回系统字体。

@@ -1,39 +1,52 @@
 # XiaoAI HA Bridge
 
-Bridge XiaoAI voice commands to Home Assistant services.
+让小爱同学控制 Home Assistant 里的设备：说「打开客厅灯」，家里的灯就亮了。
 
-## Opening the interface
+## 打开管理界面
 
-- **Recommended:** the **XiaoAI HA Bridge** entry in the Home Assistant sidebar. It is
-  served through HAOS Ingress and uses your Home Assistant login (admins only), so no
-  extra password is needed.
-- **Direct port:** `http://<haos-host>:47521` still works but now requires the
-  direct-access token stored in `/data/config/.access_token`. The token is also
-  printed in the add-on log on every start and accepted as
-  `Authorization: Bearer <token>`.
+- **推荐**：Home Assistant 左侧边栏的 **小爱语音桥接** 面板。它通过 HAOS Ingress 打开，
+  沿用 Home Assistant 登录，只有管理员可见，不需要额外密码。
+- **直连端口**：`http://<主机IP>:47521` 仍然可用，但需要**直连访问令牌**：
+  - 令牌在容器内 `/data/config/.access_token`，可在面板 **高级** 页点
+    **显示直连令牌** 查看；
+  - 附加组件日志**不会打印令牌**，只提示令牌文件位置；
+  - 脚本调用可用 `Authorization: Bearer <令牌>` 或 `X-Admin-Token: <令牌>`；
+  - 直连是明文 HTTP，只建议在可信局域网使用。
 
-## Configuration
+## 配置三件事
 
-- Xiaomi account and speaker (QR code, browser cookie, or account password)
-- Home Assistant URL and Long-Lived Access Token
-- Voice intent rules
-- Device aliases and schedules
+1. **小米账号**：小米账号页 → 用米家 App 扫描二维码登录（也可以粘贴浏览器 Cookie；
+   1.0.11 起还支持账号密码 + 短信验证，但真实小米账号兼容性仍待验证，推荐扫码）。
+2. **Home Assistant**：填 HA 地址和长期访问令牌（HA 左下角头像 → 个人资料 →
+   长期访问令牌 → 创建），点「测试」。
+3. **意图规则**：新增一条规则，填「你说的话」、选设备类型与实体、保存，然后启动桥接器。
 
-This build adds an HA entity selector to intent rules. The list is loaded from the
-existing `/api/devices` endpoint and filtered by the selected domain. Hold Ctrl to
-select several entities for one action; saved rules apply to the next voice command
-without restarting the bridge.
+之后对小爱说出规则里的语句，设备就会被控制，小爱会念出你设置的回复。
 
-The rules page shows compact summaries by default. Search by spoken phrase, entity ID,
-or device name, then click Edit on a rule to inspect or change its details. Unsaved
-edits are marked in the UI and are never silently replaced when the device list
-refreshes or you switch pages; a failed save keeps your edits and reports the reason.
+## 常见操作
 
-QR and Cookie logins exchange the Xiaomi account `passToken` for a fresh `micoapi`
-service token. A login is only saved after Xiaomi returns a non-empty service token.
-If that token expires later, the bridge refreshes it from the saved passToken with
-exponential backoff and resumes polling; it never deletes or blanks credentials it
-could not verify.
+| 想做什么 | 怎么做 |
+|---|---|
+| 启动 / 停止桥接 | **仪表盘** 页的「启动」「停止」按钮 |
+| 看有没有收到语音 | **仪表盘** 显示最近一条语音与执行数；**实时日志** 页有实时日志 |
+| 试一条规则 | **意图规则** 页顶部测试区输入一句话 |
+| 备份 / 恢复规则 | 规则页 **导出 / 导入**；完整备份用 Home Assistant 的备份功能 |
+| 换小米账号 | 小米账号页 **清除登录凭据**，然后重新扫码（会停止桥接器） |
+| 语音没反应 | 先看仪表盘：没有语音记录 = 小米登录态失效；有记录没执行 = 规则未匹配 |
+| 定时任务 | 语音创建的任务会出现在 **定时任务** 页，对应 HA 里 `xiaoai_bridge_*` 自动化 |
+| 改轮询间隔 / 开 AI 托管 | **高级设置** 页 |
 
-The **清除登录凭据** button on the Xiaomi page deletes `auth.json`, `.mi.token` and
-the stored cookie/password so you can start over from a clean state.
+## 已知限制
+
+- 账号密码 + 短信验证登录在 1.0.11 已实现（模拟测试通过），**真实小米账号兼容性仍待验证**；
+  推荐使用扫码或 Cookie 登录；
+- 直连端口为明文 HTTP，跨网段/公网请走侧边栏面板。
+
+## 需要更多帮助
+
+- 完整配置、FAQ、升级与回退：[DOCS.md](DOCS.md)（也就是加载项界面里的「文档」页）
+- 版本变更：[CHANGELOG.md](CHANGELOG.md)
+- 项目主页与开发说明：[README.md](../README.md) / [DEVELOPMENT.md](../DEVELOPMENT.md)
+
+本项目基于 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge)，
+感谢上游作者与所有贡献者（含 **@caideone**）。

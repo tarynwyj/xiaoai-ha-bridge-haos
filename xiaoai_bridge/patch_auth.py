@@ -1270,40 +1270,10 @@ replace_exact(
     "acct = MiAccount(cs, username, password, None)",
 )
 
-replace_exact(
-    "sms verify sts path must not hand MiService the token file",
-    '''        from miservice.miaccount import get_random
-        account = MiAccount(s, username, password, str(TOKEN_PATH))
-        account.token = {
-            'deviceId': pending.get('deviceId', get_random(16).upper()),
-''',
-    '''        from miservice.miaccount import get_random
-        account = MiAccount(s, username, password, None)
-        account.token = {
-            'deviceId': pending.get('deviceId', get_random(16).upper()),
-''',
-)
-
-replace_exact(
-    "sms verify cookie path must not hand MiService the token file",
-    """        from miservice.miaccount import get_random
-        account = MiAccount(s, username, password, str(TOKEN_PATH))
-        account.token = {
-            'deviceId': cookies.get('deviceId', get_random(16).upper()),
-""",
-    """        from miservice.miaccount import get_random
-        account = MiAccount(s, username, password, None)
-        account.token = {
-            'deviceId': cookies.get('deviceId', get_random(16).upper()),
-""",
-)
-
-# ──────────────── D: 日志中不得出现 Token ────────────────
-replace_exact(
-    "never log the service token",
-    '            log.info("已获取 serviceToken: %s...", service_token[:30])',
-    '            log.info("已获取 micoapi serviceToken")',
-)
+# 注：短信验证端点在 1.0.11 被整体重写（见文件末尾 E 段）。新实现不再创建持有
+# TOKEN_PATH 的 MiAccount，也不打印任何令牌，因此原来针对该端点的
+# 「不得把 token 文件交给 MiService」与「不得打印 serviceToken」两条补丁随之移除；
+# 同一约束仍由 Dockerfile / CI 的 grep 守卫保证。
 
 # ──────────────── A: 启动时公布直连令牌（HA 附加组件日志界面可见，避免锁死） ────────────────
 replace_exact(
@@ -1350,6 +1320,781 @@ replace_exact(
                 return [], last_ts, False
 """,
 )
+
+
+# ════════════════ E: 短信验证登录闭环（1.0.11） ════════════════
+replace_exact(
+    'sms login: retry login instead of restarting the verification',
+    r'''    global _pending_session
+    if _pending_session and not _pending_session.closed:
+        await _pending_session.close()
+
+    try:
+        from miservice.miaccount import get_random
+''',
+    r"""    global _pending_session
+    # 短信验证期间再次点「测试连接」时，绝不能把正在等验证的会话关掉：
+    # 那样会丢掉验证状态，让用户陷入「验证做完却一直登不上」的循环。
+    if _pending_is_fresh():
+        return {
+            "ok": False,
+            "need_verify": True,
+            "verify_url": _pending_verify_url,
+            "pending_seconds_left": max(0, SMS_PENDING_TTL - _pending_age_seconds()),
+            "msg": "上一次短信验证还在进行中。\n①打开下方链接完成验证 ②回到本页把跳转地址粘贴到「短信验证」卡片并点「完成验证」",
+        }
+    await _close_pending_session()
+    _clear_pending_login()
+
+    try:
+        from miservice.miaccount import get_random
+""",
+)
+
+replace_exact(
+    'sms login: remember when the verification was requested',
+    r'''            _pending_session = s
+            return {
+                "ok": False,
+                "msg": "密码验证通过，但需要手机验证码确认。\n①复制下方链接在浏览器中打开 ②完成短信验证 ③将跳转后页面的完整 Cookie 粘贴到下方输入框",
+                "need_verify": True,
+                "verify_url": verify_url,
+            }
+''',
+    r"""            _pending_session = s
+            _remember_pending_verification(verify_url)
+            return {
+                "ok": False,
+                "msg": "密码验证通过，但需要手机验证码确认。\n①复制下方链接在浏览器中打开并完成验证 ②把跳转后的完整地址粘贴到「短信验证」卡片 ③点「完成验证」\n（也可以直接把完整浏览器 Cookie 粘贴到上方输入框后点「测试」）",
+                "need_verify": True,
+                "verify_url": verify_url,
+                "pending_seconds_left": SMS_PENDING_TTL,
+            }
+""",
+)
+
+replace_exact(
+    'sms login: sanitize the verification link',
+    r'''            notif_url = resp.get('notificationUrl', '')
+            if not notif_url:
+                verify_url = "https://account.xiaomi.com"
+            elif notif_url.startswith("https://") or notif_url.startswith("http://"):
+                verify_url = notif_url
+            elif notif_url.startswith("https//"):
+                verify_url = notif_url.replace("https//", "https://", 1)
+            elif notif_url.startswith("//"):
+                verify_url = f"https:{notif_url}"
+            elif notif_url.startswith("/"):
+                verify_url = f"https://account.xiaomi.com{notif_url}"
+            else:
+                verify_url = f"https://account.xiaomi.com/{notif_url}"
+''',
+    r"""            verify_url = _normalize_verify_url(resp.get('notificationUrl', ''))
+""",
+)
+
+replace_exact(
+    'sms login: closed-loop verification endpoint',
+    r'''@app.post("/api/test/xiaomi/verify")
+async def xiaomi_verify(req: XiaomiVerifyRequest):
+    """处理短信验证回调：支持 STS URL 或浏览器 Cookie"""
+    global _pending_session
+    try:
+        from miservice import MiAccount, MiNAService
+    except ImportError:
+        return {"ok": False, "msg": "缺少依赖: pip install miservice"}
+
+    if not _pending_login.get('username'):
+        return {"ok": False, "msg": "请先点击「测试连接」触发验证流程"}
+
+    username = _pending_login['username']
+    password = _pending_login['password']
+    pending = dict(_pending_login)
+
+    if not req.cookie_text:
+        return {"ok": False, "msg": "请粘贴短信验证完成后的跳转 URL"}
+
+    # ── 方式A：短信验证回调 URL（自动获取 serviceToken）──
+    if req.cookie_text.startswith("https://api2.mina.mi.com/sts"):
+        log.info("检测到 STS 回调 URL，自动获取 serviceToken...")
+        s = aiohttp.ClientSession()
+        try:
+            # 用 pending session 的 cookies 请求 STS 端点
+            if _pending_session and not _pending_session.closed:
+                import yarl
+                for domain in ['account.xiaomi.com', '.mina.mi.com']:
+                    pending = _pending_session.cookie_jar.filter_cookies(yarl.URL(f'https://{domain}/'))
+                    s.cookie_jar.update_cookies(pending, yarl.URL(f'https://{domain}/'))
+            async with s.get(req.cookie_text, timeout=aiohttp.ClientTimeout(total=15)):
+                pass
+            sts_cookies = {k: v.value for k, v in
+                           s.cookie_jar.filter_cookies(yarl.URL('https://api2.mina.mi.com/')).items()}
+            service_token = sts_cookies.get('serviceToken', '')
+            if not service_token:
+                raise Exception("未从 STS 响应中获取到 serviceToken，请重试")
+            log.info("已获取 serviceToken: %s...", service_token[:30])
+        except Exception as e:
+            await s.close()
+            return {"ok": False, "msg": f"STS 请求失败: {e}"}
+
+        # 构造 token
+        from miservice.miaccount import get_random
+        account = MiAccount(s, username, password, str(TOKEN_PATH))
+        account.token = {
+            'deviceId': pending.get('deviceId', get_random(16).upper()),
+            'userId': pending.get('userId', ''),
+            'passToken': pending.get('passToken', ''),
+            'micoapi': (pending.get('ssecurity', ''), service_token),
+        }
+        _save_auth_and_token(account)
+        # 保存精简 cookie 到配置
+        simple_cookie = f"userId={account.token['userId']}; passToken={account.token['passToken']}; serviceToken={service_token}; deviceId={account.token['deviceId']}"
+        cfg = load_config()
+        cfg.setdefault("xiaomi", {})["cookie_text"] = simple_cookie
+        save_config(cfg)
+
+        na = MiNAService(account)
+        devices = await na.device_list()
+        await s.close()
+        _pending_login.clear()
+        _pending_session = None
+        if devices:
+            return {"ok": True, "msg": f"短信验证完成！发现 {len(devices)} 台设备", "devices": devices}
+        return {"ok": True, "msg": "短信验证完成，但未发现小爱音箱设备", "devices": []}
+
+    # ── 方式B：浏览器 Cookie ──
+    from http.cookies import SimpleCookie
+    sc = SimpleCookie()
+    sc.load(req.cookie_text)
+    cookies = {k: m.value for k, m in sc.items()}
+
+    if not cookies.get('userId'):
+        return {"ok": False, "msg": "未识别有效内容。请确认粘贴的是短信验证后的跳转 URL（以 https://api2.mina.mi.com/sts 开头）或完整 Cookie"}
+    if not cookies.get('passToken') or not cookies.get('serviceToken'):
+        return {"ok": False, "msg": "Cookie 缺少 passToken 或 serviceToken，请复制完整 Cookie"}
+
+    try:
+        if _pending_session and not _pending_session.closed:
+            await _pending_session.close()
+
+        s = aiohttp.ClientSession()
+        import yarl
+        sc2 = SimpleCookie()
+        for k, v in cookies.items():
+            try: sc2[k] = v
+            except Exception: pass
+        for domain in ['account.xiaomi.com', '.mina.mi.com']:
+            s.cookie_jar.update_cookies(sc2, yarl.URL(f'https://{domain}/'))
+
+        from miservice.miaccount import get_random
+        account = MiAccount(s, username, password, str(TOKEN_PATH))
+        account.token = {
+            'deviceId': cookies.get('deviceId', get_random(16).upper()),
+            'userId': cookies['userId'],
+            'passToken': cookies['passToken'],
+            'micoapi': ('', cookies['serviceToken']),
+        }
+        na = MiNAService(account)
+        devices = await na.device_list()
+        _save_auth_and_token(account)
+        cfg = load_config()
+        cfg.setdefault("xiaomi", {})["cookie_text"] = req.cookie_text
+        save_config(cfg)
+        await s.close()
+        _pending_login.clear()
+        _pending_session = None
+        if devices:
+            return {"ok": True, "msg": f"登录成功，发现 {len(devices)} 台设备", "devices": devices}
+        return {"ok": True, "msg": "登录成功，但未发现小爱音箱设备", "devices": []}
+    except Exception as e:
+        log.info(f"verify failed: {e}")
+        return {"ok": False, "msg": f"验证失败: {e}"}''',
+    r"""@app.post("/api/test/xiaomi/verify")
+async def xiaomi_verify(req: XiaomiVerifyRequest):
+    '''完成短信验证登录：粘贴回调地址，或直接粘贴完整浏览器 Cookie。'''
+    try:
+        from miservice import MiAccount, MiNAService  # noqa: F401  依赖检查
+    except ImportError:
+        return {"ok": False, "msg": "缺少依赖: pip install miservice"}
+
+    raw = (req.cookie_text or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "retry": True,
+            "msg": "请粘贴短信验证完成后的跳转地址，或完整的浏览器 Cookie",
+        }
+
+    looks_like_url = raw.lower().startswith(("http://", "https://", "https//", "//"))
+    if not looks_like_url:
+        return await _finish_cookie_login(raw)
+
+    lock = _sms_lock_obj()
+    if lock.locked():
+        return {"ok": False, "retry": True, "msg": "上一次验证仍在处理中，请稍候再试"}
+    async with lock:
+        return await _finish_sms_verification(raw)
+""",
+)
+
+replace_exact(
+    'sms login: pending state, strict URL checks and atomic persistence',
+    r'''# ──────────────── HA 设备列表 ────────────────
+''',
+    r"""# ──────────────── 短信验证登录闭环（1.0.11） ────────────────
+# 说明：本段代码由 patch_auth.py 插入 bridge.py，docstring 一律用三单引号，
+# 以便它本身能被 patch_auth.py 的三双引号字面量包裹。
+
+SMS_PENDING_TTL = 900          # 短信验证会话有效期（秒）
+SMS_STS_HOST = "api2.mina.mi.com"
+SMS_STS_PATH_PREFIX = "/sts"
+SMS_VERIFY_URL_HOSTS = ("account.xiaomi.com", "api2.mina.mi.com")
+SMS_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_\-]{24,}")
+
+_pending_created_at: float = 0.0
+_pending_verify_url: str = ""
+_sms_verify_lock: asyncio.Lock | None = None
+
+
+class SmsVerifyError(Exception):
+    '''Typed SMS verification failure: stable code for tests, safe message for the UI.'''
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _mask_secret_text(text: str) -> str:
+    '''Drop token-like runs so a log line can never contain a credential.'''
+    return SMS_SECRET_PATTERN.sub("***", str(text or ""))
+
+
+def _redact_url(raw: str) -> str:
+    '''Host and a short path prefix only: the query carries one-time signatures.'''
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(str(raw or "").strip())
+    except Exception:
+        return "<invalid-url>"
+    path = parts.path or ""
+    if len(path) > 12:
+        path = path[:12] + "..."
+    return f"{parts.scheme}://{parts.hostname or '?'}{path}"
+
+
+def _normalize_verify_url(notif_url: str) -> str:
+    '''Normalize the notificationUrl of the login response, or fall back safely.
+
+    Xiaomi sometimes returns the path only ('/pass/...'), sometimes 'https//host'
+    or '//host'. Only https URLs on a Xiaomi host are accepted: anything else
+    falls back to the account page so a tampered response cannot send the user
+    to an arbitrary site.
+    '''
+    from urllib.parse import urlsplit, urlunsplit
+    fallback = "https://account.xiaomi.com"
+    text = str(notif_url or "").strip()
+    if not text:
+        return fallback
+    candidates = [text]
+    lowered = text.lower()
+    if lowered.startswith("https//"):
+        candidates.insert(0, text.replace("https//", "https://", 1))
+    elif text.startswith("//"):
+        candidates.insert(0, "https:" + text)
+    elif text.startswith("/"):
+        candidates.insert(0, fallback + text)
+    elif not lowered.startswith(("http://", "https://")):
+        candidates.insert(0, fallback + "/" + text)
+    for candidate in candidates:
+        try:
+            parts = urlsplit(candidate)
+            port = parts.port
+        except Exception:
+            continue
+        host = (parts.hostname or "").lower()
+        if parts.scheme.lower() != "https" or parts.username or parts.password:
+            continue
+        if port not in (None, 443):
+            continue
+        allowed = host in SMS_VERIFY_URL_HOSTS \
+            or host.endswith(".xiaomi.com") or host.endswith(".mi.com")
+        if not allowed:
+            continue
+        return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+    return fallback
+
+
+def _pending_age_seconds() -> int:
+    '''Age of the pending SMS verification, -1 when there is none.'''
+    if not _pending_created_at:
+        return -1
+    return int(time.time() - _pending_created_at)
+
+
+def _pending_is_fresh() -> bool:
+    '''A SMS verification is still in flight and its session is usable.'''
+    return bool(
+        _pending_login.get("username")
+        and _pending_session is not None
+        and not _pending_session.closed
+        and _pending_created_at > 0
+        and (time.time() - _pending_created_at) < SMS_PENDING_TTL
+    )
+
+
+def _remember_pending_verification(verify_url: str) -> None:
+    '''Mark the moment the SMS verification started (used for the TTL check).'''
+    global _pending_created_at, _pending_verify_url
+    _pending_created_at = time.time()
+    _pending_verify_url = str(verify_url or "")
+
+
+def _clear_pending_login() -> None:
+    '''Drop the pending verification state; caller closes the session first.'''
+    global _pending_session, _pending_created_at, _pending_verify_url
+    _pending_login.clear()
+    _pending_session = None
+    _pending_created_at = 0.0
+    _pending_verify_url = ""
+
+
+async def _close_pending_session() -> None:
+    '''Close (and forget) the session that held the SMS verification state.'''
+    global _pending_session
+    session = _pending_session
+    _pending_session = None
+    if session is not None and not session.closed:
+        try:
+            await session.close()
+        except Exception as e:
+            log.debug("关闭待验证会话失败: %s", e)
+
+
+def _sms_lock_obj() -> "asyncio.Lock":
+    '''Serialise SMS verification attempts so two requests cannot interleave.'''
+    global _sms_verify_lock
+    if _sms_verify_lock is None:
+        _sms_verify_lock = asyncio.Lock()
+    return _sms_verify_lock
+
+
+def _validate_sts_url(raw: str) -> str:
+    '''Strictly validate the pasted SMS verification callback URL.
+
+    Only https://api2.mina.mi.com/sts... is accepted: no other host, no userinfo,
+    no explicit port, no fragment. The query is kept because the exchange needs it,
+    but it is never logged (see _redact_url).
+    '''
+    from urllib.parse import urlsplit, urlunsplit
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("请粘贴短信验证完成后的跳转地址")
+    if any(ch in text for ch in " \t\r\n"):
+        raise ValueError("地址中不能包含空格或换行，请复制完整的单行地址")
+    parts = urlsplit(text)
+    if parts.scheme.lower() != "https":
+        raise ValueError("地址必须以 https:// 开头")
+    if parts.username or parts.password:
+        raise ValueError("地址不能包含用户名或密码信息")
+    host = (parts.hostname or "").lower()
+    if host != SMS_STS_HOST:
+        raise ValueError("地址主机必须是 " + SMS_STS_HOST)
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("地址端口不合法")
+    if port not in (None, 443):
+        raise ValueError("地址只能使用标准 HTTPS 端口")
+    path = parts.path or ""
+    if not path.startswith(SMS_STS_PATH_PREFIX):
+        raise ValueError("地址路径必须以 " + SMS_STS_PATH_PREFIX + " 开头")
+    return urlunsplit(("https", host, path, parts.query, ""))
+
+
+def _credentials_from_pending(pending: dict, service_token: str, ssecurity: str = "") -> dict:
+    '''Build the credential dict from the pending login state, never from cookies.'''
+    return {
+        "userId": str(pending.get("userId") or "").strip(),
+        "passToken": str(pending.get("passToken") or "").strip(),
+        "deviceId": str(pending.get("deviceId") or "").strip(),
+        "ssecurity": str(ssecurity or pending.get("ssecurity") or "").strip(),
+        "serviceToken": str(service_token or "").strip(),
+    }
+
+
+def _missing_credentials(creds: dict) -> list:
+    '''Keys that must be present before a credential set may be persisted.'''
+    return [key for key in ("userId", "passToken", "serviceToken") if not creds.get(key)]
+
+
+async def _retry_login_for_sms(username: str, password: str, session, pending: dict):
+    '''Retry the password login on the pending session.
+
+    Xiaomi remembers the completed verification for the account/session, so this is
+    usually what turns a "securityStatus 16" login into a full token, and it never
+    sends another SMS by itself. Returns a credential dict, or None when Xiaomi
+    still asks for verification (or the retry failed for any reason).
+    '''
+    if not username or not password:
+        return None
+    from miservice import MiAccount
+    from miservice.miaccount import get_random
+    account = MiAccount(session, username, password, None)
+    if not isinstance(getattr(account, "token", None), dict) or not account.token:
+        account.token = {"deviceId": pending.get("deviceId") or get_random(16).upper()}
+    try:
+        resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+        if resp.get("code") != 0:
+            payload = {
+                "_json": "true",
+                "qs": resp["qs"],
+                "sid": resp["sid"],
+                "_sign": resp["_sign"],
+                "callback": resp["callback"],
+                "user": username,
+                "hash": __import__("hashlib").md5(password.encode()).hexdigest().upper(),
+            }
+            resp = await account._serviceLogin("serviceLoginAuth2", payload)
+        if resp.get("code") != 0:
+            return None
+        if resp.get("securityStatus", 0) & 16:
+            return None
+        if not resp.get("ssecurity") or not resp.get("location"):
+            return None
+        service_token = await account._securityTokenService(
+            resp["location"], resp["nonce"], resp["ssecurity"]
+        )
+    except Exception as e:
+        log.info("短信验证：重试登录未成功 (%s)", type(e).__name__)
+        return None
+    if not service_token:
+        return None
+    log.info("短信验证：重试登录已取得 micoapi serviceToken")
+    return {
+        "userId": str(resp.get("userId") or pending.get("userId") or ""),
+        "passToken": str(resp.get("passToken") or pending.get("passToken") or ""),
+        "deviceId": str(resp.get("deviceId") or pending.get("deviceId") or ""),
+        "ssecurity": str(resp.get("ssecurity") or ""),
+        "serviceToken": str(service_token),
+    }
+
+
+async def _exchange_sts_service_token(session, sts_url: str) -> str:
+    '''Exchange the verification callback URL for a micoapi serviceToken.
+
+    Runs on the *pending* login session because that is where the post-verification
+    cookies live, and never follows a redirect: the URL carries one-time signatures
+    and the cookies must not travel to another host.
+    '''
+    import yarl
+    try:
+        async with session.get(
+            sts_url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=False
+        ) as resp:
+            if 300 <= resp.status < 400:
+                log.warning("短信验证回调返回重定向 (%s)，已拒绝跟随", resp.status)
+                raise SmsVerifyError(
+                    "sts_redirect",
+                    "短信验证地址返回了重定向，已停止跟随以避免凭据外泄。请重新点击「测试连接」再验证",
+                )
+            if resp.status >= 400:
+                log.warning("短信验证回调返回 HTTP %s", resp.status)
+                raise SmsVerifyError(
+                    "sts_http",
+                    "短信验证地址返回 HTTP " + str(resp.status) + "，链接可能已过期",
+                )
+    except SmsVerifyError:
+        raise
+    except Exception as e:
+        log.warning("短信验证回调请求失败 (%s)", type(e).__name__)
+        raise SmsVerifyError("sts_request", "访问短信验证地址失败（网络错误），请重试") from None
+    jar = session.cookie_jar.filter_cookies(yarl.URL("https://" + SMS_STS_HOST + "/"))
+    service_token = str(({k: m.value for k, m in jar.items()}).get("serviceToken") or "").strip()
+    if not service_token:
+        raise SmsVerifyError(
+            "sts_no_token",
+            "短信验证已完成，但回调没有返回 serviceToken。请重新点击「测试连接」再验证一次",
+        )
+    return service_token
+
+
+async def _probe_devices_with_token(username: str, password: str, creds: dict) -> list:
+    '''Validate a credential set by querying the speaker list. Never persists.'''
+    from miservice import MiAccount, MiNAService
+    from miservice.miaccount import get_random
+    session = aiohttp.ClientSession()
+    try:
+        account = MiAccount(session, username, password, None)
+        account.token = {
+            "deviceId": creds.get("deviceId") or get_random(16).upper(),
+            "userId": creds["userId"],
+            "passToken": creds["passToken"],
+            "micoapi": (creds.get("ssecurity") or "", creds["serviceToken"]),
+        }
+        devices = await MiNAService(account).device_list()
+        return list(devices or [])
+    except Exception as e:
+        log.warning("短信验证凭据校验失败 (%s)", type(e).__name__)
+        raise SmsVerifyError(
+            "device_list", "登录凭据校验失败（无法获取小爱设备列表），请重试"
+        ) from None
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+def _write_private_file(path, payload: str) -> None:
+    '''Create ``path`` with mode 0600 before any bytes are written.'''
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        # umask could still strip bits on POSIX; pin the mode before writing anything
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def _restore_credential_files(previous: dict) -> None:
+    '''Put the previous credential files back after a half applied write.'''
+    for path, content in previous.items():
+        try:
+            if content is None:
+                if path.exists():
+                    path.unlink()
+            else:
+                _write_private_file(path, content.decode("utf-8"))
+        except OSError as e:
+            log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
+        except Exception as e:
+            log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
+
+
+def _persist_sms_credentials(creds: dict) -> None:
+    '''Persist a fully validated credential set as a best-effort pair write.
+
+    Both files are written to 0600 temporaries first and then renamed into place.
+    The old bytes are snapshotted, so a failure between the two renames is rolled
+    back and auth.json / .mi.token keep describing the same login. This is not a
+    crash-safe transaction: a hard kill between the two renames can still leave a
+    mixed pair on disk.
+    '''
+    missing = _missing_credentials(creds)
+    if missing:
+        raise ValueError("凭据不完整: " + "、".join(missing))
+    identity = {
+        "passToken": creds["passToken"],
+        "userId": creds["userId"],
+        "deviceId": creds.get("deviceId") or "",
+    }
+    token_data = dict(identity)
+    token_data["micoapi"] = [creds.get("ssecurity") or "", creds["serviceToken"]]
+
+    AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_auth = AUTH_PATH.with_name(AUTH_PATH.name + ".tmp")
+    tmp_token = TOKEN_PATH.with_name(TOKEN_PATH.name + ".tmp")
+    # 先把旧文件读进内存：读失败必须中止，绝不能当成「旧文件不存在」，
+    # 否则回滚时会把用户现有的凭据文件当成多余文件删掉。
+    previous = {}
+    for path in (AUTH_PATH, TOKEN_PATH):
+        try:
+            previous[path] = path.read_bytes()
+        except FileNotFoundError:
+            previous[path] = None
+        except OSError as e:
+            raise OSError(
+                "无法读取原有的凭据文件，已中止写入以免覆盖或误删: " + path.name
+            ) from e
+    try:
+        # 临时文件在创建时就是 0600，替换后权限随文件一起生效，不存在「先 0644 再改」的窗口
+        _write_private_file(tmp_auth, json.dumps(identity, ensure_ascii=False))
+        _write_private_file(tmp_token, json.dumps(token_data, ensure_ascii=False))
+        os.replace(tmp_auth, AUTH_PATH)
+        os.replace(tmp_token, TOKEN_PATH)
+    except Exception:
+        _restore_credential_files(previous)
+        raise
+    finally:
+        for stale in (tmp_auth, tmp_token):
+            try:
+                if stale.exists():
+                    stale.unlink()
+            except OSError:
+                pass
+
+    # cookie_text 只是给 _get_cookie 的提示，最后写；失败不影响已经保存的凭据
+    try:
+        cfg = load_config()
+        cfg.setdefault("xiaomi", {})["cookie_text"] = (
+            "userId=" + creds["userId"]
+            + "; passToken=" + creds["passToken"]
+            + "; serviceToken=" + creds["serviceToken"]
+            + "; deviceId=" + (creds.get("deviceId") or "")
+        )
+        save_config(cfg)
+    except Exception as e:
+        log.warning("保存 cookie_text 失败 (%s)", type(e).__name__)
+
+
+async def _finish_sms_verification(raw_url: str) -> dict:
+    '''Complete a SMS login from the pasted verification callback URL.'''
+    log_pending = _pending_is_fresh()
+    try:
+        sts_url = _validate_sts_url(raw_url)
+    except ValueError as e:
+        return {"ok": False, "retry": True, "msg": "短信验证地址不合法：" + str(e)}
+
+    if not log_pending:
+        await _close_pending_session()
+        _clear_pending_login()
+        return {
+            "ok": False,
+            "retry": False,
+            "msg": "短信验证会话已失效（有效期 " + str(SMS_PENDING_TTL // 60)
+                   + " 分钟），请重新点击「测试连接」获取新的验证链接",
+        }
+
+    session = _pending_session
+    pending = dict(_pending_login)
+    username = str(pending.get("username") or "")
+    password = str(pending.get("password") or "")
+    log.info("短信验证：收到回调地址 %s", _redact_url(sts_url))
+
+    # 1) 先重试登录：验证状态保存在会话/账号上，回调地址只是一次性凭证
+    creds = await _retry_login_for_sms(username, password, session, pending)
+
+    # 2) 仍要求验证时，才用回调地址在同一个会话里换 serviceToken
+    if not creds:
+        try:
+            service_token = await _exchange_sts_service_token(session, sts_url)
+        except SmsVerifyError as e:
+            log.warning("短信验证失败 (code=%s)", e.code)
+            return {"ok": False, "retry": e.code != "sts_redirect", "msg": e.message}
+        creds = _credentials_from_pending(pending, service_token)
+
+    missing = _missing_credentials(creds)
+    if missing:
+        log.warning("短信验证：凭据不完整，缺少 %s", _mask_secret_text(",".join(missing)))
+        return {
+            "ok": False,
+            "retry": True,
+            "msg": "短信验证已完成，但缺少 " + "、".join(missing)
+                   + "，请重新点击「测试连接」再验证一次",
+        }
+
+    # 3) 先验证可用性，通过后才落盘
+    try:
+        devices = await _probe_devices_with_token(username, password, creds)
+    except SmsVerifyError as e:
+        log.warning("短信验证：设备查询失败 (%s)", e.code)
+        return {"ok": False, "retry": True, "msg": e.message}
+
+    try:
+        _persist_sms_credentials(creds)
+    except Exception as e:
+        log.warning("短信验证：保存凭据失败 (%s)", type(e).__name__)
+        return {"ok": False, "retry": True, "msg": "短信验证成功，但保存凭据失败，请重试"}
+
+    await _close_pending_session()
+    _clear_pending_login()
+    log.info("短信验证登录成功，发现 %d 台设备", len(devices))
+    if devices:
+        return {
+            "ok": True,
+            "msg": "短信验证完成，登录可用，发现 " + str(len(devices)) + " 台设备",
+            "devices": devices,
+            "verified": True,
+        }
+    return {
+        "ok": True,
+        "msg": "短信验证完成，登录可用，但未发现小爱音箱设备（可在设备列表页重试）",
+        "devices": [],
+        "verified": True,
+    }
+
+
+async def _finish_cookie_login(cookie_text: str) -> dict:
+    '''Keep the original "paste a whole browser Cookie" login path working.'''
+    from http.cookies import SimpleCookie
+    sc = SimpleCookie()
+    try:
+        sc.load(cookie_text)
+    except Exception:
+        return {"ok": False, "retry": True, "msg": "Cookie 格式无法解析，请重新复制"}
+    cookies = {k: m.value for k, m in sc.items()}
+    if not cookies.get("userId"):
+        return {
+            "ok": False,
+            "retry": True,
+            "msg": "未识别有效内容。请粘贴短信验证后的跳转地址（以 https://api2.mina.mi.com/sts 开头）或完整 Cookie",
+        }
+    missing = [key for key in ("passToken", "serviceToken") if not cookies.get(key)]
+    if missing:
+        return {"ok": False, "retry": True, "msg": "Cookie 缺少 " + "、".join(missing) + "，请复制完整 Cookie"}
+
+    mi_cfg = load_config().get("xiaomi", {})
+    pending = dict(_pending_login or {})
+    username = str(pending.get("username") or mi_cfg.get("username") or "")
+    password = str(pending.get("password") or mi_cfg.get("password") or "")
+    creds = {
+        "userId": cookies["userId"],
+        "passToken": cookies["passToken"],
+        "deviceId": cookies.get("deviceId") or "",
+        "ssecurity": cookies.get("ssecurity") or "",
+        "serviceToken": cookies["serviceToken"],
+    }
+    try:
+        devices = await _probe_devices_with_token(username, password, creds)
+    except SmsVerifyError as e:
+        log.warning("Cookie 登录校验失败 (%s)", e.code)
+        return {"ok": False, "retry": True, "msg": e.message}
+
+    try:
+        _persist_sms_credentials(creds)
+    except Exception as e:
+        log.warning("Cookie 登录保存凭据失败 (%s)", type(e).__name__)
+        return {"ok": False, "retry": True, "msg": "Cookie 登录成功，但保存凭据失败，请重试"}
+
+    await _close_pending_session()
+    _clear_pending_login()
+    log.info("Cookie 登录成功，发现 %d 台设备", len(devices))
+    if devices:
+        return {
+            "ok": True,
+            "msg": "Cookie 登录成功，发现 " + str(len(devices)) + " 台设备",
+            "devices": devices,
+            "verified": True,
+        }
+    return {
+        "ok": True,
+        "msg": "Cookie 登录成功，但未发现小爱音箱设备（可在设备列表页重试）",
+        "devices": [],
+        "verified": True,
+    }
+# ──────────────── HA 设备列表 ────────────────
+""",
+)
+
 
 path.write_text(source, encoding="utf-8")
 print(f"Patched {path} with validated micoapi token exchange")

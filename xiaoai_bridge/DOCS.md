@@ -1,10 +1,81 @@
-# Configuration
+# 配置
 
-1. Open the app web UI.
-2. Configure and test the Xiaomi account.
-3. Configure and test the Home Assistant connection.
-4. Open **意图规则** and choose the device type.
-5. Select the Home Assistant entity from the entity drop-down.
-6. Save the rule and start the bridge.
+## 打开管理界面（两种入口）
 
-Persistent bridge configuration is stored under the app's `/data` volume.
+**推荐：Home Assistant 侧边栏**
+安装后在 Home Assistant 左侧边栏会出现 **小爱语音桥接** 面板（Ingress）。它沿用
+Home Assistant 自己的登录认证，只有管理员可见，不需要额外令牌。
+
+**直连端口（1.0.9 及更早的旧入口）**
+`http://<HAOS 主机IP>:47521` 仍然保留，但 1.0.10 起**必须输入直连访问令牌**：
+
+- 令牌保存在容器内 `/data/config/.access_token`（随机 256 位，首次启动生成）；
+- 查看方式：在侧边栏面板打开 **高级** 页 → 点 **🔑 显示直连令牌**；
+  该接口只接受来自 Supervisor 的 Ingress 请求，直连会话拿不到；
+- 出于安全考虑，附加组件日志**不再打印令牌本身**，只提示令牌文件位置；
+- 想换一个令牌：删除 `.access_token` 文件后重启附加组件即可重新生成；
+- 脚本调用可以不用 Cookie：`curl -H "Authorization: Bearer <令牌>" ...`；
+  `X-Admin-Token: <令牌>` 是 Bearer 的等价备用通道（同样的权限，不是更弱的模式）。
+- 令牌文件位于 `/data`，会随 Home Assistant 备份一起备份；怀疑泄露时删除该文件并重启附加组件即可轮换。
+- 直连端口是**明文 HTTP**：令牌与会话 Cookie 在局域网内明文传输。**只建议在可信局域网使用**，
+  跨网段/公网请始终走 Ingress 面板。
+- 面板可见性由 `config.yaml` 的 `panel_admin: true` 保证（只有 HA 管理员能看到面板）。
+  若把它改成 `false`，任何 HA 用户都能打开面板并读到直连令牌，请勿随意修改。
+
+> 升级后浏览器如果仍停在旧页面，会看到「会话已失效，正在返回登录页」并自动刷新到
+> 登录页，这是正常行为。
+
+## 配置步骤
+
+1. 打开管理界面（侧边栏面板，或直连端口登录后）。
+2. 填写并测试小米账号：可以扫码登录，也可以填 Cookie，或使用账号密码。
+3. 填写并测试 Home Assistant 地址与 Long-Lived Access Token。
+4. 打开 **意图规则**，选择设备类型。
+5. 在实体下拉框中按住 Ctrl 选择多个实体（可选）。
+6. 保存规则并启动桥接器。
+
+规则页会显示「● 有未保存修改」提示；未保存前切换到其它页面或设备列表刷新完成，
+都不会覆盖正在编辑的内容。保存失败会显示具体原因并保留编辑内容。
+
+## 清除已保存的小米登录
+
+小米账号页的 **🗑 清除登录凭据** 按钮会删除 `auth.json`、`.mi.token` 以及配置里的
+Cookie / 密码，并停止桥接器。之后需要重新扫码登录。此操作不可撤销。
+
+## 数据与持久化
+
+- 配置：`/data/config/config.yaml`
+- 登录凭据：`/data/config/auth.json`、`/data/config/.mi.token`
+- 直连令牌：`/data/config/.access_token`
+- 日志：`/data/logs/bridge.log`
+- 已处理消息的去重时间戳：`/data/config/last_timestamp.json`
+
+升级附加组件不会删除以上文件。
+
+## 升级前备份与验证
+
+> **诚实的验证边界**：`/data` 的升级与回退兼容性是**用真实代码跑过**的（1.0.9 补丁 → 1.0.10 补丁 → 再退回 1.0.9，
+> 见 `test_upgrade_data.py`）。但**附加组件安装器本身**（Supervisor 拉镜像、创建 Ingress 面板、快照/还原）
+> 无法在本项目的 CI 里验证，必须在一台真实 HAOS 上按下面步骤人工确认一次。
+
+1. Web 界面右上角 **导出** 保存当前意图规则 JSON；再在 **设置 → 系统 → 备份** 里做一次完整备份。
+2. 记录当前小米登录方式（扫码 / Cookie / 密码）。升级后如需重新登录，重新扫码即可，规则不用重配。
+3. 升级到 1.0.10 后逐项确认：
+   - **侧边栏面板**：设置 → 加载项 → XiaoAI HA Bridge → 打开，能看到状态/规则/设备；
+   - **直连旧入口**：`http://<主机IP>:47521` 会先显示登录页；在面板「高级」页复制「显示直连令牌」后粘贴即可；
+   - **规则未丢**：规则页能看到原有规则与多实体选择；
+   - **语音链路**：对小爱说一条已有规则，确认**下一条**指令即时生效（不需要重新登录小米）；
+   - **定时/自动化**：定时任务页面仍能看到由本插件创建的 `xiaoai_bridge_*` 自动化。
+4. **回退**（任一步失败就回退）：**HAOS 附加组件商店不会列出历史版本**，所以回退只能这样做：
+   - **首选：从备份还原**。设置 → 系统 → 备份 → 选择升级前那份备份 → **部分还原** → 只勾选
+     XiaoAI HA Bridge（含其数据）。还原后附加组件会回到 1.0.9，镜像标签仍然存在，可以正常拉取。
+     注意：这会把这期间写入的 `/data`（如新处理的消息去重时间戳）一起回退到备份时刻。
+   - **只想回退代码、保留当前 `/data`**：需要手工拉 1.0.9 镜像并让商店指向它（高级操作，不推荐）：
+     `docker pull ghcr.io/tarynwyj/xiaoai-ha-bridge-haos:1.0.9` 后在本地重新打标签；或临时把
+     本地仓库的 `config.yaml` 版本改回 1.0.9 再安装。
+   - `/data` 无需手工清理：1.0.10 只新增 `.access_token` 文件，未改动/未删除任何 1.0.9 的文件与字段；
+     1.0.9 会直接忽略这个文件。
+   - 回退后在旧界面重新登录小米（如提示）并确认语音链路。
+5. 如果侧边栏面板打不开（Ingress 异常）：直连令牌在 `/data/config/.access_token`，可用 SSH 或文件管理插件读取
+   （日志只提示文件位置、不打印令牌）；同时日志里会明确打印「收到 Ingress 请求但来源 X 不是 Supervisor」
+   这类的诊断行，便于判断是 Supervisor 地址不同还是 Ingress 未生效。

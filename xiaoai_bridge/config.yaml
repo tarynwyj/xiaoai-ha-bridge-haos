@@ -1,5 +1,5 @@
 name: "XiaoAI HA Bridge"
-version: "1.0.9"
+version: "1.0.10"
 slug: "xiaoai_bridge"
 description: "小爱音箱语音桥接 Home Assistant"
 url: "https://github.com/tarynwyj/xiaoai-ha-bridge-haos"
@@ -12,11 +12,20 @@ init: false
 
 image: "ghcr.io/tarynwyj/xiaoai-ha-bridge-haos"
 
+# HAOS Ingress：在 Home Assistant 侧边栏直接打开管理界面，沿用 Home Assistant
+# 自身的登录认证（只有管理员可见），不需要额外令牌。
+ingress: true
+ingress_port: 47521
+panel_icon: "mdi:home-assistant"
+panel_title: "小爱语音桥接"
+panel_admin: true
+
+# 直连端口保留（兼容 1.0.9 以前的访问方式），但必须携带访问令牌。
 ports:
   47521/tcp: 47521
 
 ports_description:
-  47521/tcp: "Web 配置界面"
+  47521/tcp: "Web 配置界面（直连需访问令牌，推荐用侧边栏面板）"
 
 webui: "http://[HOST]:[PORT:47521]"
 

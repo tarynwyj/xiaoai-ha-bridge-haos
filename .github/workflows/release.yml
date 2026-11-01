@@ -1,0 +1,202 @@
+name: Release image
+
+# Manual, main-only, version-tag-only release.
+#
+# Deliberate constraints:
+# - Only `workflow_dispatch` (no push/PR trigger), so merging to main never publishes.
+# - The job only runs when dispatched on refs/heads/main.
+# - Only the immutable `<version>` tag is pushed. `latest` is NOT pushed and asking
+#   for it fails the run, because :latest must not move until release policy says so.
+# - Existing `<version>` tags are never overwritten unless `overwrite_existing=true`
+#   is passed explicitly on a re-run of the same version.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release; must match xiaoai_bridge/config.yaml"
+        required: true
+        type: string
+      overwrite_existing:
+        description: "Re-push this <version> even if the GHCR tag already exists (default: refuse)"
+        required: false
+        type: boolean
+        default: false
+      allow_latest:
+        description: "Move :latest as well - DISABLED by policy, must stay false"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, verify and push the version tag
+    runs-on: ubuntu-latest
+    # Hard gate: a manual dispatch from any other ref must not publish.
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    steps:
+      - name: Refuse to run outside main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::Releases are only allowed from refs/heads/main (got ${GITHUB_REF})."
+            exit 1
+          fi
+          echo "Releasing from ${GITHUB_REF} at ${GITHUB_SHA}."
+
+      - name: Refuse :latest (policy)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.allow_latest }}" = "true" ]; then
+            echo "::error::Moving :latest is disabled by release policy. Re-run with allow_latest=false."
+            exit 1
+          fi
+          echo "OK: only the version tag will be pushed."
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the requested version matches config.yaml
+        id: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONFIG_VERSION="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' xiaoai_bridge/config.yaml)"
+          test -n "$CONFIG_VERSION"
+          if [ "${CONFIG_VERSION}" != "${{ inputs.version }}" ]; then
+            echo "::error::Requested version '${{ inputs.version }}' does not match config.yaml '$CONFIG_VERSION'."
+            exit 1
+          fi
+          IMAGE_NAME="$(sed -n 's/^image:[[:space:]]*"\([^"]*\)".*/\1/p' xiaoai_bridge/config.yaml)"
+          EXPECTED="ghcr.io/${{ github.repository_owner }}/xiaoai-ha-bridge-haos"
+          if [ "${IMAGE_NAME}" != "${EXPECTED}" ]; then
+            echo "::error::config.yaml image is '${IMAGE_NAME}', expected '${EXPECTED}'."
+            exit 1
+          fi
+          echo "version=${CONFIG_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${IMAGE_NAME}:${CONFIG_VERSION}"
+
+      - name: Re-run the release test gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r xiaoai_bridge/requirements.lock.txt
+          python -m compileall -q xiaoai_bridge
+          python xiaoai_bridge/test_workflow_policy.py
+          BASE="https://raw.githubusercontent.com/chenshuhe/xiaoai-ha-bridge/e4c82d4b4e872ff5d02d1baec089a6b4ad36734a"
+          mkdir -p /tmp/pinned /tmp/app/web
+          curl -fsSL -o /tmp/pinned/bridge.py "${BASE}/bridge.py"
+          curl -fsSL -o /tmp/pinned/index.html "${BASE}/web/index.html"
+          cp /tmp/pinned/bridge.py /tmp/app/bridge.py
+          cp /tmp/pinned/index.html /tmp/app/web/index.html
+          python xiaoai_bridge/patch_auth.py /tmp/app/bridge.py
+          python xiaoai_bridge/patch_web.py /tmp/app/web/index.html
+          python -m py_compile /tmp/app/bridge.py
+          if python xiaoai_bridge/patch_auth.py /tmp/app/bridge.py; then
+            echo "::error::patch_auth.py must refuse to patch twice" >&2
+            exit 1
+          fi
+          python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
+          python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
+          python xiaoai_bridge/test_api_auth.py /tmp/app
+          python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
+          python xiaoai_bridge/test_ingress_contract.py \
+            --bridge /tmp/app/bridge.py \
+            --html /tmp/app/web/index.html \
+            --config xiaoai_bridge/config.yaml \
+            --repo-root .
+          python xiaoai_bridge/test_upgrade_data.py \
+            --pristine-bridge /tmp/pinned/bridge.py \
+            --pristine-html /tmp/pinned/index.html \
+            --repo . \
+            --require-legacy
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an already published version tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.app.outputs.image }}:${{ inputs.version }}"
+          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+            if [ "${{ inputs.overwrite_existing }}" = "true" ]; then
+              echo "::warning::${IMAGE} already exists and overwrite_existing=true; it will be replaced."
+            else
+              echo "::error::${IMAGE} already exists. Bump the version, or re-run with overwrite_existing=true for a broken-release retry."
+              exit 1
+            fi
+          else
+            echo "${IMAGE} does not exist yet; safe to publish."
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: ./xiaoai_bridge
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            APP_VERSION=${{ steps.app.outputs.version }}
+          tags: |
+            ${{ steps.app.outputs.image }}:${{ steps.app.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=XiaoAI to Home Assistant bridge for HAOS
+
+      - name: Smoke-test the release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.app.outputs.image }}:${{ steps.app.outputs.version }}"
+          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'revealDirectToken' in w; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b"
+          test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_api_auth.py:/tmp/test_api_auth.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_api_auth.py /app
+
+      - name: Push the version tag only
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.app.outputs.image }}:${{ steps.app.outputs.version }}"
+          # :latest is intentionally NOT pushed (see the policy guard above).
+          docker push "${IMAGE}"
+          docker buildx imagetools inspect "${IMAGE}" | tee /tmp/pushed.txt
+          {
+            echo "## Released \`${IMAGE}\`"
+            echo ""
+            echo "- commit: \`${GITHUB_SHA}\`"
+            echo "- :latest: **not moved** (policy)"
+            echo "- next: install this version on a test HAOS and verify the Ingress panel"
+          } >> "$GITHUB_STEP_SUMMARY"

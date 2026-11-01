@@ -1,0 +1,257 @@
+name: CI
+
+# Test-only pipeline: builds the image and runs every test, but NEVER publishes.
+#
+# - pull_request  : full Docker build + all in-image tests. No GHCR login exists in
+#                   this workflow, its token is read-only and the build stays local,
+#                   so publishing is impossible even by accident.
+# - push to main  : the same test pipeline. Merging does NOT publish an image.
+# - release       : see release.yml (manual dispatch only, main only).
+on:
+  # Every pull request is validated (no path filter) so a required "CI" check can
+  # never be skipped and block a PR that only touches docs.
+  pull_request:
+  push:
+    branches:
+      - main
+    paths:
+      - "xiaoai_bridge/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REF: e4c82d4b4e872ff5d02d1baec089a6b4ad36734a
+
+jobs:
+  static-checks:
+    name: Static checks, patch rebuild and host tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so the 1.0.9 -> 1.0.10 upgrade/rollback test can rebuild
+          # the legacy patch scripts from commit d2fdbce.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the locked runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r xiaoai_bridge/requirements.lock.txt
+
+      - name: Compile every Python file
+        run: |
+          python -m compileall -q xiaoai_bridge
+          python -m py_compile \
+            xiaoai_bridge/patch_auth.py \
+            xiaoai_bridge/patch_web.py \
+            xiaoai_bridge/test_startup_patch.py \
+            xiaoai_bridge/test_api_auth.py \
+            xiaoai_bridge/test_web_patch.py \
+            xiaoai_bridge/test_ingress_contract.py \
+            xiaoai_bridge/test_upgrade_data.py \
+            xiaoai_bridge/test_poll_auth.py \
+            xiaoai_bridge/test_workflow_policy.py
+
+      - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
+        run: python xiaoai_bridge/test_workflow_policy.py
+
+      - name: Reject forbidden patterns in the patches
+        run: |
+          set -euo pipefail
+          ! grep -RIn "ssl=False" xiaoai_bridge/patch_auth.py
+          ! grep -RIn "str(TOKEN_PATH)" xiaoai_bridge/patch_auth.py
+          ! grep -RIn "proxy_headers=True" xiaoai_bridge/patch_auth.py
+
+      - name: Fetch the pinned upstream sources
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/chenshuhe/xiaoai-ha-bridge/${UPSTREAM_REF}"
+          mkdir -p /tmp/pinned
+          curl -fsSL -o /tmp/pinned/bridge.py "${BASE}/bridge.py"
+          curl -fsSL -o /tmp/pinned/index.html "${BASE}/web/index.html"
+          test -s /tmp/pinned/bridge.py
+          test -s /tmp/pinned/index.html
+
+      - name: Rebuild the patched app from the pinned upstream
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/app/web
+          cp /tmp/pinned/bridge.py /tmp/app/bridge.py
+          cp /tmp/pinned/index.html /tmp/app/web/index.html
+          python xiaoai_bridge/patch_auth.py /tmp/app/bridge.py
+          python xiaoai_bridge/patch_web.py /tmp/app/web/index.html
+          python -m py_compile /tmp/app/bridge.py
+
+      - name: Patches must refuse to run twice
+        run: |
+          set -euo pipefail
+          cp /tmp/pinned/bridge.py /tmp/twice.py
+          python xiaoai_bridge/patch_auth.py /tmp/twice.py
+          if python xiaoai_bridge/patch_auth.py /tmp/twice.py; then
+            echo "patch_auth.py must refuse to patch an already patched file" >&2
+            exit 1
+          fi
+          cp /tmp/pinned/index.html /tmp/twice.html
+          python xiaoai_bridge/patch_web.py /tmp/twice.html
+          if python xiaoai_bridge/patch_web.py /tmp/twice.html; then
+            echo "patch_web.py must refuse to patch an already patched file" >&2
+            exit 1
+          fi
+
+      - name: Login, token refresh and credential lifecycle
+        run: python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
+
+      - name: Conversation polling authentication
+        run: python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
+
+      - name: HTTP access control
+        run: python xiaoai_bridge/test_api_auth.py /tmp/app
+
+      - name: Rules page regression
+        run: |
+          python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
+          python xiaoai_bridge/test_web_patch.py --html /tmp/app/web/index.html
+
+      - name: HAOS Ingress contract
+        run: |
+          python xiaoai_bridge/test_ingress_contract.py \
+            --bridge /tmp/app/bridge.py \
+            --html /tmp/app/web/index.html \
+            --config xiaoai_bridge/config.yaml \
+            --repo-root .
+
+      - name: 1.0.9 -> 1.0.10 -> 1.0.9 upgrade and rollback of /data
+        run: |
+          python xiaoai_bridge/test_upgrade_data.py \
+            --pristine-bridge /tmp/pinned/bridge.py \
+            --pristine-html /tmp/pinned/index.html \
+            --repo . \
+            --require-legacy
+
+  docker-build-and-test:
+    name: Docker build and in-image tests (never publishes)
+    runs-on: ubuntu-latest
+    needs: static-checks
+    # Read-only token: there is deliberately no packages:write scope and no
+    # docker login step, so this job cannot push to GHCR.
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Read app version
+        id: app
+        shell: bash
+        run: |
+          VERSION="$(sed -n 's/^version:[[:space:]]*"\([^"]*\)".*/\1/p' xiaoai_bridge/config.yaml)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building and testing $VERSION locally only (no push)."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: ./xiaoai_bridge
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: |
+            APP_VERSION=${{ steps.app.outputs.version }}
+          tags: |
+            xiaoai-ha-bridge-ci:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=XiaoAI to Home Assistant bridge for HAOS
+
+      - name: Smoke-test the patched image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="xiaoai-ha-bridge-ci:${{ github.sha }}"
+          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\" multiple size=\"6\">' in w; assert '#rule-list .rule-item' in w; assert 'function ruleSummaryHtml(rule)' in w; assert 'id=\"rule-filter\"' in w; assert 'async function loadRuleDevices()' in w; assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'clearXiaomiLogin' in w; assert 'revealDirectToken' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b; assert 'async def _relogin_and_refresh' in b; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b; assert 'IntentParser(load_config().get(\"intent_rules\", [])).parse(query)' in b"
+          test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
+
+      - name: Run every in-image test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="xiaoai-ha-bridge-ci:${{ github.sha }}"
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_api_auth.py:/tmp/test_api_auth.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_api_auth.py /app
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_poll_auth.py:/tmp/test_poll_auth.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_poll_auth.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \
+              --bridge /app/bridge.py --html /app/web/index.html --no-node
+
+      - name: Rules-page JS from the shipped image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="xiaoai-ha-bridge-ci:${{ github.sha }}"
+          docker run --rm --entrypoint cat "$IMAGE" /app/web/index.html > /tmp/image-index.html
+          test -s /tmp/image-index.html
+          # Runs the real JS extracted from the shipped artifact on Node.
+          python xiaoai_bridge/test_web_patch.py --html /tmp/image-index.html
+
+      - name: Verify ingress metadata in config.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^ingress: true$' xiaoai_bridge/config.yaml
+          grep -Eq '^ingress_port: 47521$' xiaoai_bridge/config.yaml
+          grep -Eq '^panel_admin: true$' xiaoai_bridge/config.yaml
+          grep -Eq '^[[:space:]]+47521/tcp: 47521$' xiaoai_bridge/config.yaml
+
+      - name: Confirm nothing can be published from CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Structural guard: this workflow must stay push-free. The forbidden
+          # literals are assembled at runtime so the guard cannot match itself, and
+          # comment lines are dropped first - a comment cannot grant a permission,
+          # but it could (and once did) trip the guard by merely naming one.
+          STRIPPED="$(mktemp)"
+          trap 'rm -f "$STRIPPED"' EXIT
+          sed 's/#.*//' .github/workflows/ci.yml > "$STRIPPED"
+
+          LOGIN_ACTION="docker/login""-action"
+          PUSH_CMD="docker ""push"
+          WRITE_SCOPE="packages: ""write"
+          PUSH_ON="push: ""true"
+          fail=0
+          for needle in "$LOGIN_ACTION" "$PUSH_CMD" "$WRITE_SCOPE" "$PUSH_ON"; do
+            if grep -qF -- "$needle" "$STRIPPED"; then
+              echo "::error::CI workflow must not publish images; found: $needle"
+              fail=1
+            fi
+          done
+          if ! grep -qF -- "push: ""false" "$STRIPPED"; then
+            echo "::error::the build step must explicitly set push: false"
+            fail=1
+          fi
+          test "$fail" -eq 0
+          echo "OK: no registry login, no package write scope, push: false."

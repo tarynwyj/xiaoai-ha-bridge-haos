@@ -309,6 +309,59 @@ replace_exact(
 function toggleAISettings(){""",
 )
 
+# ════════════════ 短信验证登录闭环（1.0.11） ════════════════
+replace_exact(
+    "sms verify card: callback url input and finish button",
+    '<div id="mi-sts-card" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#128241;</span>短信验证</div></div><div style="font-size:12px;color:var(--txt-muted);line-height:1.8">① 点击上方链接验证<br>② 成功后复制 Cookie 到上方输入框 &rarr; 测试</div></div>',
+    '<div id="mi-sts-card" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#128241;</span>短信验证</div></div>'
+    '<div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:10px">'
+    '① 点击上方链接，在小米页面完成短信验证<br>'
+    '② 把跳转后的完整地址粘贴到下面输入框 &rarr; 点「完成验证」<br>'
+    '（也可以直接把完整浏览器 Cookie 粘贴到上方 Cookie 输入框后点「测试」）</div>'
+    '<div class="field"><label>验证完成后的跳转地址</label>'
+    '<input id="mi-sts-url" placeholder="https://api2.mina.mi.com/sts?..."></div>'
+    '<div class="input-row" style="margin-top:8px">'
+    '<button class="btn btn-primary" id="mi-sts-submit" onclick="completeSmsVerify()">&#10003;完成验证</button>'
+    '<span id="mi-sts-status" style="font-size:11px;color:var(--txt-muted)"></span></div></div>',
+)
+
+replace_exact(
+    "sms verify: finish-verification request handler",
+    "async function qrLogin(){",
+    """async function completeSmsVerify(){
+  const a=document.getElementById('xiaomi-alert');
+  const st=document.getElementById('mi-sts-status');
+  const box=document.getElementById('mi-sts-url');
+  const btn=document.getElementById('mi-sts-submit');
+  const url=((box&&box.value)||'').trim();
+  if(!url){showAlert(a,'err','✗ 先粘贴短信验证完成后的跳转地址');return;}
+  if(st)st.textContent='⟳ 验证中，请稍候...';
+  if(btn)btn.disabled=true;
+  showAlert(a,'warn','⟳ 正在完成短信验证...');
+  try{
+    const r=await fetch('/api/test/xiaomi/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_text:url})});
+    const d=await r.json();
+    if(d.ok){
+      showAlert(a,'ok','✓ '+(d.msg||'短信验证完成'));
+      const card=document.getElementById('mi-sts-card');
+      if(card)card.style.display='none';
+      if(box)box.value='';
+      if(st)st.textContent='';
+      if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
+    }else{
+      showAlert(a,'err','✗ '+(d.msg||'验证失败'));
+      if(st)st.textContent=(d.retry===false?'请重新点击「测试连接」':'可重试');
+    }
+  }catch(e){
+    showAlert(a,'err','✗ '+e.message);
+    if(st)st.textContent='可重试';
+  }finally{
+    if(btn)btn.disabled=false;
+  }
+}
+async function qrLogin(){""",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

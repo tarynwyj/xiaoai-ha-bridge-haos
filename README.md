@@ -48,6 +48,9 @@ build itself refuses to finish unless the freshly patched app passes these suite
 - `xiaoai_bridge/test_poll_auth.py` — the conversation poll really carries the Xiaomi
   auth cookies (not just `deviceId`), keeps the selected speaker, and never sends them to
   a redirect target.
+- `xiaoai_bridge/test_sms_login.py` — the password + SMS + STS login loop: trigger,
+  URL validation, token exchange, atomic credential persistence, failure paths that must
+  not touch `/data`, and the "complete verification" button really calling `/verify`.
 
 Run them locally against a patched tree:
 
@@ -56,6 +59,7 @@ python xiaoai_bridge/patch_auth.py  /tmp/app/bridge.py   # patched from the pinn
 python xiaoai_bridge/patch_web.py   /tmp/app/web/index.html
 python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
 python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
+python xiaoai_bridge/test_sms_login.py /tmp/app/bridge.py --html /tmp/app/web/index.html
 python xiaoai_bridge/test_api_auth.py /tmp/app
 python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
 python xiaoai_bridge/test_ingress_contract.py --bridge /tmp/app/bridge.py \

@@ -63,6 +63,7 @@ jobs:
             xiaoai_bridge/test_ingress_contract.py \
             xiaoai_bridge/test_upgrade_data.py \
             xiaoai_bridge/test_poll_auth.py \
+            xiaoai_bridge/test_sms_login.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
@@ -116,6 +117,11 @@ jobs:
 
       - name: Conversation polling authentication
         run: python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
+
+      - name: SMS verification login (password + SMS + STS)
+        run: |
+          python xiaoai_bridge/test_sms_login.py /tmp/app/bridge.py \
+            --html /tmp/app/web/index.html
 
       - name: HTTP access control
         run: python xiaoai_bridge/test_api_auth.py /tmp/app
@@ -202,6 +208,9 @@ jobs:
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_poll_auth.py:/tmp/test_poll_auth.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_poll_auth.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_sms_login.py:/tmp/test_sms_login.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_sms_login.py /app/bridge.py
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \

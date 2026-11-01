@@ -117,6 +117,8 @@ jobs:
           fi
           python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
           python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
+          python xiaoai_bridge/test_sms_login.py /tmp/app/bridge.py \
+            --html /tmp/app/web/index.html
           python xiaoai_bridge/test_api_auth.py /tmp/app
           python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
           python xiaoai_bridge/test_ingress_contract.py \

@@ -24,12 +24,20 @@ RUN pip install --no-cache-dir -r /tmp/requirements.lock.txt \
 COPY patch_web.py /tmp/patch_web.py
 RUN python -m py_compile /tmp/patch_web.py \
     && python /tmp/patch_web.py \
-    && grep -Fq '<select class="r-e" multiple size="6">' /app/web/index.html \
+    && grep -Fq 'type="checkbox" class="r-e"' /app/web/index.html \
+    && grep -Fq 'function saveOneRule(' /app/web/index.html \
+    && grep -Fq '保存全部' /app/web/index.html \
+    && ! grep -Fq 'multiple size="6"' /app/web/index.html \
     && grep -Fq 'function ruleSummaryHtml(rule)' /app/web/index.html \
     && grep -Fq 'async function loadRuleDevices()' /app/web/index.html \
     && grep -Fq 'window.fetch=function(input,init)' /app/web/index.html \
     && grep -Fq 'id="rules-dirty"' /app/web/index.html \
     && grep -Fq 'clearXiaomiLogin' /app/web/index.html \
+    && grep -Fq 'id="mi-otp-panel"' /app/web/index.html \
+    && grep -Fq 'id="mi-advanced-card"' /app/web/index.html \
+    && grep -Fq 'async function startPasswordLogin()' /app/web/index.html \
+    && grep -Fq 'async function verifyCookieLogin()' /app/web/index.html \
+    && ! grep -Fq '免短信' /app/web/index.html \
     && rm /tmp/patch_web.py
 
 COPY patch_auth.py /tmp/patch_auth.py
@@ -41,25 +49,32 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
     && grep -Fq 'async def _enforce_access_control' /app/bridge.py \
     && grep -Fq 'async def reveal_direct_token' /app/bridge.py \
+    && grep -Fq 'async def xiaomi_otp_start' /app/bridge.py \
+    && grep -Fq 'async def xiaomi_otp_send' /app/bridge.py \
+    && grep -Fq 'async def xiaomi_otp_verify' /app/bridge.py \
+    && grep -Fq 'async def xiaomi_otp_restart' /app/bridge.py \
+    && grep -Fq 'async def xiaomi_cookie_login' /app/bridge.py \
+    && ! grep -Fq '链接可能已过期' /app/bridge.py \
     && grep -Fq 'proxy_headers=False' /app/bridge.py \
     && ! grep -Fq 'ssl=False' /app/bridge.py \
     && ! grep -Fq 'str(TOKEN_PATH)' /app/bridge.py \
     && rm /tmp/patch_auth.py
 
 # Build-time regression suite: login/token/credential simulation, HTTP-level
-# access control and the HAOS Ingress contract (port, relative fetch paths).
-# They only need the runtime dependencies, so a broken patch fails the build
-# instead of reaching users.
-COPY test_startup_patch.py test_api_auth.py test_ingress_contract.py test_poll_auth.py test_sms_login.py /tmp/
+# access control, the HAOS Ingress contract and the two Xiaomi login flows
+# (password + verification code, manual Cookie). They only need the runtime
+# dependencies, so a broken patch fails the build instead of reaching users.
+COPY test_startup_patch.py test_api_auth.py test_ingress_contract.py test_poll_auth.py test_sms_login.py test_xiaomi_login.py /tmp/
 RUN python /tmp/test_startup_patch.py /app/bridge.py \
     && python /tmp/test_api_auth.py /app \
     && python /tmp/test_ingress_contract.py \
          --bridge /app/bridge.py --html /app/web/index.html --no-node \
     && python /tmp/test_poll_auth.py /app/bridge.py \
     && python /tmp/test_sms_login.py /app/bridge.py \
+    && python /tmp/test_xiaomi_login.py /app/bridge.py --html /app/web/index.html \
     && rm /tmp/test_startup_patch.py /tmp/test_api_auth.py \
           /tmp/test_ingress_contract.py /tmp/test_poll_auth.py \
-          /tmp/test_sms_login.py
+          /tmp/test_sms_login.py /tmp/test_xiaomi_login.py
 
 RUN rm -rf /app/config /app/logs \
     && ln -s /data/config /app/config \

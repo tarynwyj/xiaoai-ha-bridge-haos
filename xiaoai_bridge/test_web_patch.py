@@ -2,12 +2,14 @@
 """Regression tests for the xiaoai_bridge web UI patches (patch_web.py).
 
 The interesting behaviour of the patched page lives in inline JavaScript, so
-this test does two things:
+this test does three things:
 
 1. rebuilds web/index.html from the *pinned pristine* upstream file through
-   patch_web.py (so every patch anchor is proven to match exactly once), and
+   patch_web.py (so every patch anchor is proven to match exactly once),
 2. extracts the real JS functions out of the built HTML and runs them in Node
-   against a tiny hand written DOM stub (no npm install, no jsdom).
+   against a tiny hand written DOM stub (no npm install, no jsdom), and
+3. AST-extracts ``class IntentParser`` out of the built bridge.py and proves the
+   backend rule matcher ignores the new (UI only) ``name`` field.
 
 Run it (Windows, python 3.11 on PATH):
 
@@ -17,6 +19,13 @@ Run it (Windows, python 3.11 on PATH):
     # or test an already built file without rebuilding
     python xiaoai_bridge\\test_web_patch.py --html <path>\\web\\index.html
 
+    # optional: point the behavioural matcher check at a specific bridge build
+    python xiaoai_bridge\\test_web_patch.py --html <path>\\web\\index.html ^
+        --bridge <path>\\bridge.py
+
+``--bridge`` defaults to ``<repo>/../build-main/bridge.py`` when that file
+exists; otherwise the matcher check prints a SKIP line and is not counted.
+
 Exit codes: 0 = everything passed, 1 = test failure, 2 = usage / IO error.
 The Node harness is written to a temporary file and executed as
 ``node <harness>.mjs <built html>``; it exits non-zero when an assertion fails.
@@ -25,6 +34,7 @@ The Node harness is written to a temporary file and executed as
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import re
 import shutil
@@ -35,31 +45,66 @@ from pathlib import Path
 
 PATCH_SCRIPT = Path(__file__).resolve().with_name("patch_web.py")
 
+# <repo>/../build-main/bridge.py — the build the page is normally shipped with.
+DEFAULT_BRIDGE = Path(__file__).resolve().parents[2] / "build-main" / "bridge.py"
+
 # Names of the JS functions that must be present in the built HTML and that the
 # Node harness exercises.  Missing names are a hard failure (the patch drifted).
 EXTRACT_FUNCTIONS = [
+    # 通用
     "escHtml",
     "extraJ",
+    # 实体勾选框选择器
     "loadRuleDevices",
-    "entityOptions",
+    "entityOptionItems",
+    "entityRowHtml",
+    "entityPickerHtml",
+    "entityPickerOf",
+    "entityIdsOf",
+    "setEntitySelection",
+    "updateEntityCount",
+    "filterEntityOptions",
+    "visibleEntityOptions",
+    "selectAllEntities",
+    "clearEntities",
+    # 规则草稿 / 标题 / 摘要
     "ruleEntityIds",
     "ruleTargetNames",
+    "ruleName",
+    "ruleTitle",
     "ruleSearchText",
     "ruleSummaryHtml",
+    "ruleDraftFromRow",
+    "collectRuleDrafts",
+    # 渲染 / 交互
+    "renderRules",
+    "buildRule",
+    "renderRuleHead",
     "toggleRule",
     "filterRules",
+    "syncRuleEntityOptions",
+    # 脏标记
     "setRulesDirty",
     "markRulesDirty",
+    "anyRuleDirty",
     "bindRulesDirty",
-    "syncRuleEntityOptions",
-    "buildRule",
-    "renderRules",
-    "switchD",
+    "onRuleEdited",
+    # 草稿状态机 / 保存
+    "nextRuleUid",
+    "cloneRule",
+    "ruleStateInit",
+    "ruleIndexByUid",
+    "persistRules",
+    "saveOneRule",
     "collectRulesFromUI",
-    "addRule",
-    "deleteRule",
     "saveCfg",
     "saveRules",
+    "addRule",
+    "deleteRule",
+    "exportRules",
+    "importRules",
+    # 其他页面
+    "switchD",
     "showPage",
 ]
 
@@ -196,7 +241,7 @@ def extract_js_source(html: str) -> str:
 # ─────────────────────────── source level invariants ───────────────────────────
 
 def source_invariants(html: str) -> list[tuple[str, bool, str]]:
-    saved = html.count("saveCfg('rules')")
+    saved_rules = html.count("saveCfg('rules')")
     return [
         (
             "destructive device-load re-render removed",
@@ -225,23 +270,92 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "collectRulesFromUI still queries every .rule-item in the document",
         ),
         (
-            "zero entity selection saves upstream-compatible empty string",
-            "entity_id:ids.length===1?ids[0]:(ids.length?ids:'')" in html,
-            "entity_id collector does not normalise the zero-selection case",
+            "checkbox picker markup is produced by entityPickerHtml",
+            'class="r-e"' in html
+            and 'type="checkbox"' in html
+            and 'onclick="selectAllEntities(this)"' in html
+            and 'onclick="clearEntities(this)"' in html
+            and 'oninput="filterEntityOptions(this)"' in html,
+            "entityPickerHtml no longer renders the checkbox rows / toolbar",
         ),
         (
-            "failed save returns false and never re-renders",
-            "if(ok){setRulesDirty(false);renderRules()}return ok" in html
-            and "return ok}catch(e)" in html
-            and "return false}}" in html,
-            "saveCfg/saveRules do not gate the re-render on the save result",
+            "legacy multi-select entity input is gone",
+            "按住 Ctrl" not in html and 'multiple size="6"' not in html,
+            "the old <select multiple size=6> picker or its Ctrl hint is still present",
+        ),
+        (
+            "picker renders the 已选择 N 个设备 counter",
+            "已选择 '+selected.size+' 个设备" in html,
+            "entityPickerHtml does not render the selected counter",
+        ),
+        (
+            "per-rule save button wired to saveOneRule",
+            'onclick="saveOneRule(' in html and "function saveOneRule(" in html,
+            "per-rule save button or saveOneRule() missing",
+        ),
+        (
+            "save-all button is labelled 保存全部",
+            "保存全部" in html and 'onclick="saveRules()"' in html,
+            "缺少 保存全部 按钮",
+        ),
+        (
+            "rule name field rendered",
+            'class="r-n"' in html,
+            "缺少 input.r-n 规则名称输入框",
+        ),
+        (
+            "rule title priority implemented",
+            "function ruleTitle(" in html
+            and "const named=ruleName(rule)" in html
+            and "'新规则 #'" in html,
+            "ruleTitle() 没有实现 name > pattern > 新规则 #N 的优先级",
+        ),
+        (
+            "rule summary shows trigger / domain / operation / device count",
+            "rule-summary-pattern" in html and "' 个设备'" in html,
+            "ruleSummaryHtml 缺少触发语句 / 类型 · 操作 · N 个设备 结构",
+        ),
+        (
+            "rule search text includes the rule name",
+            "ruleName(rule),rule.pattern" in html,
+            "ruleSearchText 没有把规则名称纳入搜索",
+        ),
+        (
+            "zero entity selection saves upstream-compatible empty string",
+            "entity_id:ids.length===1?ids[0]:(ids.length?ids:'')" in html,
+            "ruleDraftFromRow does not normalise the zero-selection case",
+        ),
+        (
+            "optional name only written when filled in",
+            "if(name)rule.name=name" in html,
+            "ruleDraftFromRow always/never writes the name field",
+        ),
+        (
+            "sync rebuilds the picker in place and keeps the selection",
+            "const current=entityIdsOf(row)" in html and "picker.outerHTML=next" in html,
+            "syncRuleEntityOptions no longer preserves the checkbox selection",
         ),
         (
             "structural rule changes mark the page dirty",
             "renderRules();markRulesDirty()" in html
-            and "renderRules();markRulesDirty();const last=" in html
             and "renderRules();markRulesDirty();showAlert" in html,
             "addRule/deleteRule/importRules do not flag unsaved changes",
+        ),
+        (
+            "per-rule save refuses while a bulk change is pending",
+            "if(ruleBulkPending){showAlert" in html
+            and "if(ruleDeleted.length>0){showAlert" in html,
+            "saveOneRule 没有在导入 / 删除待保存时拒绝单条保存",
+        ),
+        (
+            "failed save returns false and never re-renders",
+            "return ok}catch(e)" in html and "return false}}" in html,
+            "saveCfg does not report the save result",
+        ),
+        (
+            "saveCfg('rules') still posts the whole config",
+            saved_rules >= 1,
+            f"saveCfg('rules') occurrences: {saved_rules}",
         ),
         (
             "ingress-safe fetch wrapper installed",
@@ -267,23 +381,14 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "cookie_text:o.cookie_text||''" in html,
             "saveXiaomi() cookie_text handling changed",
         ),
-        (
-            "multi-select entity input kept",
-            '<select class="r-e" multiple size="6">' in html,
-            "entity multi-select markup missing",
-        ),
-        (
-            "save button still wired",
-            saved == 1,
-            f"saveCfg('rules') occurrences: {saved}",
-        ),
     ]
 
 
 # ─────────────────────────────── node harness ────────────────────────────────
 
-# A deliberately tiny DOM subset: enough for buildRule / collectRulesFromUI /
-# filterRules / switchD / renderRules to run for real.  No jsdom, no npm.
+# A deliberately tiny DOM subset: enough for buildRule / ruleDraftFromRow /
+# filterRules / switchD / renderRules / saveOneRule to run for real.
+# No jsdom, no npm.  勾选框（input.checked）、style 属性与 outerHTML 替换都在这里补齐。
 DOM_STUB = r"""
 // ===== minimal DOM stub (subset sufficient for the rules page code) =====
 const VOID_TAGS = new Set(['input','br','img','hr','meta','link','source','area','base','col','embed','param','track','wbr']);
@@ -321,7 +426,8 @@ class El {
     this.dataset = Object.create(null);
     this.style = Object.create(null);
     this.id = '';
-    this.value = '';
+    this._value = undefined;
+    this._checked = undefined;
     this.multiple = false;
     this.classList = new ClassList();
     this.listeners = Object.create(null);
@@ -334,18 +440,58 @@ class El {
     return this._text;
   }
   set textContent(value){ this.children = []; this._text = String(value == null ? '' : value); }
+  // <select> 的 value 取选中项；其他元素就是写入值（初值来自 value 属性）。
+  get value(){
+    if (this.tagName === 'SELECT'){
+      if (this._value !== undefined) return this._value;
+      const options = this.querySelectorAll('option');
+      const chosen = options.find(option => option.hasAttribute('selected')) || options[0];
+      return chosen ? (chosen.attrs.value || '') : '';
+    }
+    return this._value === undefined ? '' : this._value;
+  }
+  set value(value){ this._value = String(value == null ? '' : value); }
+  // 勾选框：checked 属性 = 初始勾选；测试可以直接改 box.checked。
+  get checked(){
+    return this._checked === undefined ? this.hasAttribute('checked') : this._checked;
+  }
+  set checked(value){
+    this._checked = !!value;
+    if (this._checked) this.attrs.checked = '';
+    else delete this.attrs.checked;
+  }
   get innerHTML(){ return this.children.map(serializeNode).join(''); }
   set innerHTML(value){
     this.children = [];
     this._text = '';
     for (const node of parseHTML(String(value == null ? '' : value))) this.appendChild(node);
   }
+  get outerHTML(){ return serializeNode(this); }
+  set outerHTML(value){
+    // syncRuleEntityOptions() 用 picker.outerHTML=next 就地换掉整个 picker。
+    const parent = this.parentElement;
+    if (!parent) return;
+    const index = parent.children.indexOf(this);
+    if (index < 0) return;
+    const nodes = parseHTML(String(value == null ? '' : value));
+    for (const node of nodes) node.parentElement = parent;
+    parent.children.splice(index, 1, ...nodes);
+    this.parentElement = null;
+  }
   appendChild(node){ node.parentElement = this; this.children.push(node); return node; }
   addEventListener(type, fn){ (this.listeners[type] = this.listeners[type] || []).push(fn); }
+  // 事件按 DOM 语义向上冒泡：页面把 input/change 监听绑在 #rule-list 上。
   dispatchEvent_(type, ev){
-    const list = this.listeners[type] || [];
-    for (const fn of list) fn(ev || { type, target: this });
-    return list.length;
+    const event = ev || { type, target: this };
+    let node = this;
+    let fired = 0;
+    while (node){
+      const list = (node.listeners && node.listeners[type]) || [];
+      for (const fn of list) fn(event);
+      fired += list.length;
+      node = node.parentElement;
+    }
+    return fired;
   }
   hasAttribute(name){ return Object.prototype.hasOwnProperty.call(this.attrs, name); }
   getAttribute(name){ return this.hasAttribute(name) ? this.attrs[name] : null; }
@@ -362,6 +508,7 @@ class El {
   querySelector(selector){ return queryAll(this, selector)[0] || null; }
   querySelectorAll(selector){ return queryAll(this, selector); }
   scrollIntoView(){}
+  click(){}
   get selectedOptions(){
     if (this.tagName !== 'SELECT') return [];
     const options = this.querySelectorAll('option');
@@ -501,7 +648,22 @@ function applyAttr(el, name, value){
   if (name === 'id') el.id = value;
   else if (name === 'class') el.className = value;
   else if (name === 'value') el.value = value;
+  else if (name === 'checked') el._checked = true;
   else if (name === 'multiple') el.multiple = true;
+  else if (name === 'style'){
+    String(value).split(';').forEach(part => {
+      const m = /^\s*([\w-]+)\s*:\s*(.*?)\s*$/.exec(part);
+      if (m) el.style[camelKey(m[1])] = m[2];
+    });
+  }
+  else if (name === 'style'){
+    for (const part of String(value).split(';')){
+      const at = part.indexOf(':');
+      if (at <= 0) continue;
+      const key = part.slice(0, at).trim();
+      if (key) el.style[key] = part.slice(at + 1).trim();
+    }
+  }
   else if (name.startsWith('data-')) el.dataset[camelKey(name.slice(5))] = value;
 }
 
@@ -574,6 +736,12 @@ function matchesCompound(el, compound){
     } else if (pseudo === 'first-child'){
       const parent = el.parentElement;
       if (!parent || parent.children[0] !== el) return false;
+    } else if (pseudo === 'checked'){
+      if (!el.checked) return false;
+    } else if (pseudo === 'disabled'){
+      if (!el.hasAttribute('disabled')) return false;
+    } else if (pseudo === 'selected'){
+      if (!el.hasAttribute('selected')) return false;
     }
   }
   return true;
@@ -615,6 +783,40 @@ let haDevices = [];
 let deviceAliases = {};
 let __alerts = [];
 
+// 规则草稿状态：生产代码里是 script 级 let，harness 必须自己声明并逐例重置。
+let ruleState = [];
+let ruleBaseline = [];
+let ruleDeleted = [];
+let ruleBulkPending = false;
+let ruleStateReady = false;
+let ruleSeq = 0;
+
+// fetch 打桩：保存类用例靠它捕获 POST /api/config 的整包 cfg。
+let __fetchCalls = [];
+let __fetchResponder = null;
+function stubFetch(responder){ __fetchCalls = []; __fetchResponder = responder || null; }
+globalThis.fetch = function(url, init){
+  let body = null;
+  if (init && typeof init.body === 'string'){
+    try { body = JSON.parse(init.body); } catch (e) { body = init.body; }
+  }
+  const call = { url, init: init || null, body };
+  __fetchCalls.push(call);
+  const payload = __fetchResponder ? __fetchResponder(call) : { ok: true };
+  return Promise.resolve({ ok: true, status: 200, json: async function(){ return payload; } });
+};
+
+// exportRules() 用 Blob + URL.createObjectURL：抓下 blob 以便断言导出内容。
+let __lastBlob = null;
+if (typeof Blob === 'undefined'){
+  globalThis.Blob = class Blob {
+    constructor(parts){ this.parts = (parts || []).map(String); }
+    async text(){ return this.parts.join(''); }
+  };
+}
+URL.createObjectURL = function(blob){ __lastBlob = blob; return 'blob:test'; };
+URL.revokeObjectURL = function(){};
+
 function showAlert(target, kind, message){
   __alerts.push({ kind, message });
   if (target) target.className = 'alert ' + kind + ' show';
@@ -649,15 +851,7 @@ function checkEq(name, actual, expected){
   check(name, a === e, 'expected ' + e + ', got ' + a);
 }
 
-function resetDom(){
-  document.body.children = [];
-  document.body._text = '';
-  cfg = {};
-  haDevices = [];
-  deviceAliases = {};
-  __alerts = [];
-}
-
+// 包一层 renderRules：证明"不该重渲染"的路径确实没有重渲染。
 const realRenderRules = renderRules;
 let __renderCount = 0;
 renderRules = function(){
@@ -665,19 +859,56 @@ renderRules = function(){
   return realRenderRules();
 };
 
+function resetDom(){
+  document.body.children = [];
+  document.body._text = '';
+  cfg = {};
+  haDevices = [];
+  deviceAliases = {};
+  __alerts = [];
+  __fetchCalls = [];
+  __fetchResponder = null;
+  __lastBlob = null;
+  ruleState = [];
+  ruleBaseline = [];
+  ruleDeleted = [];
+  ruleBulkPending = false;
+  ruleStateReady = false;
+  ruleSeq = 0;
+  __renderCount = 0;
+}
+
 const RULES_PAGE_HTML =
   '<div class="sidebar-item" data-page="rules">意图规则</div>' +
   '<div class="page" id="page-rules">' +
     '<div id="rules-alert" class="alert"></div>' +
     '<div class="btn-group">' +
-      '<button class="btn btn-primary" onclick="saveRules()">保存</button>' +
-      '<span id="rules-dirty" style="display:none">有未保存修改</span>' +
+      '<button class="btn btn-primary" onclick="saveRules()">保存全部</button>' +
+      '<span id="rules-dirty" style="display:none">● 有未保存修改</span>' +
     '</div>' +
     '<div class="test-row"><input type="search" id="rule-filter">' +
       '<span id="rule-count"></span></div>' +
     '<div class="rule-list" id="rule-list"></div>' +
   '</div>';
 
+function rows(){ return document.querySelectorAll('#rule-list .rule-item'); }
+function boxes(row){ return row ? row.querySelectorAll('.r-e') : []; }
+function checkedIds(row){ return boxes(row).filter(box => box.checked).map(box => box.value); }
+function setChecked(row, ids){
+  const chosen = new Set(ids || []);
+  boxes(row).forEach(box => { box.checked = chosen.has(box.value); });
+}
+function pickerOf(row){ return row ? row.querySelector('.entity-picker') : null; }
+function pickerIds(row){ return row.querySelectorAll('.entity-option .entity-id').map(el => el.textContent); }
+function pickerCount(row){ const el = row ? row.querySelector('.entity-count') : null; return el ? el.textContent : null; }
+function chipOf(row){ return row ? row.querySelector('.rule-chip') : null; }
+function optionValues(el){ return el.querySelectorAll('option').map(option => option.attrs.value); }
+function postedCalls(){ return __fetchCalls.filter(call => call.body && call.body.config); }
+function postedRules(){
+  const calls = postedCalls();
+  return calls.length ? calls[calls.length - 1].body.config.intent_rules : null;
+}
+function cloneJson(value){ return JSON.parse(JSON.stringify(value)); }
 function makeRulesPage(rules, options){
   const opts = options || {};
   resetDom();
@@ -686,15 +917,23 @@ function makeRulesPage(rules, options){
   document.body.innerHTML = RULES_PAGE_HTML + (opts.extraHtml || '');
   cfg = { intent_rules: rules || [] };
   realRenderRules();
-  return document.querySelectorAll('#rule-list .rule-item');
+  bindRulesDirty();  // 和页面 init 一样：renderRules(); bindRulesDirty();
+  return rows();
 }
-
-function optionValues(el){
-  return el.querySelectorAll('option').map(option => option.attrs.value);
-}
-
-function selectedValues(el){
-  return el.selectedOptions.map(option => option.value);
+// importRules() 自己造 <input type=file>，这里抓住它并塞入文件内容。
+async function importFromJson(text){
+  const realCreate = document.createElement;
+  let input = null;
+  document.createElement = function(tag){
+    const el = realCreate.call(document, tag);
+    if (String(tag).toLowerCase() === 'input') input = el;
+    return el;
+  };
+  try { importRules(); } finally { document.createElement = realCreate; }
+  if (!input) throw new Error('importRules() did not create a file input');
+  input.files = [{ text: async function(){ return text; } }];
+  await input.onchange();
+  return input;
 }
 
 const LIGHT_DEVICES = [
@@ -721,59 +960,161 @@ test('ruleEntityIds: empty / missing -> []', () => {
   checkEq('ruleEntityIds(missing)', ruleEntityIds({ action: {} }), []);
 });
 
-// --- G2: entityOptions + search helpers accept string and array -------------
-test('entityOptions: string and array selections', () => {
+// --- G2: checkbox picker markup (replaces the old <select multiple>) --------
+test('entityPickerHtml: checkbox rows, checked state, aliases, domain filter', () => {
   resetDom();
   haDevices = LIGHT_DEVICES.slice();
   deviceAliases = { 'light.b': '客厅灯' };
-  const one = entityOptions('light', 'light.a');
-  check('entityOptions(string) marks that one selected',
-    one.includes('value="light.a" selected') && !one.includes('value="light.b" selected'), one);
-  const many = entityOptions('light', ['light.a', 'light.b']);
-  check('entityOptions(array) marks each selected',
-    many.includes('value="light.a" selected') && many.includes('value="light.b" selected'), many);
-  check('entityOptions uses aliases in labels', many.includes('客厅灯 · light.b'), many);
-  check('entityOptions only lists the requested domain',
-    !many.includes('climate.ac') && !many.includes('switch.c'), many);
+  const one = entityPickerHtml('light', ['light.a']);
+  check('picker renders checkbox rows',
+    one.includes('type="checkbox"') && one.includes('class="r-e"'), one);
+  check('picker has no legacy multi-select',
+    !one.includes('<select') && !one.includes('multiple') && !one.includes('按住 Ctrl'), one);
+  check('picker has a search box wired to filterEntityOptions',
+    one.includes('class="entity-search"') && one.includes('filterEntityOptions(this)'), one);
+  check('picker has wired 全选 / 清空 buttons',
+    one.includes('selectAllEntities(this)') && one.includes('clearEntities(this)') &&
+    one.includes('全选') && one.includes('清空'), one);
+  check('single selection marks exactly one box',
+    (one.match(/class="r-e" value="[^"]*" checked/g) || []).length === 1, one);
+  check('single selection marks the right box',
+    one.includes('value="light.a" checked') && !one.includes('value="light.b" checked'), one);
+  check('picker shows the selected counter', one.includes('已选择 1 个设备'), one);
+  check('picker uses the alias as the label',
+    one.includes('客厅灯') && one.includes('<code class="entity-id">light.b</code>'), one);
+  check('picker lists only the requested domain',
+    one.includes('light.a') && one.includes('light.b') &&
+    !one.includes('climate.ac') && !one.includes('switch.c'), one);
+  const many = entityPickerHtml('light', ['light.a', 'light.b']);
+  check('multi selection marks both boxes',
+    many.includes('value="light.a" checked') && many.includes('value="light.b" checked'), many);
+  check('multi selection counter', many.includes('已选择 2 个设备'), many);
+  const none = entityPickerHtml('light', []);
+  check('no selection marks no box',
+    (none.match(/class="r-e" value="[^"]*" checked/g) || []).length === 0, none);
+  check('no selection counter is zero', none.includes('已选择 0 个设备'), none);
 });
-test('entityOptions: unknown current entity is kept as an option', () => {
+test('entityPickerHtml: stale current entity and empty device list', () => {
   resetDom();
   haDevices = LIGHT_DEVICES.slice();
-  const options = entityOptions('light', 'light.legacy');
-  check('entityOptions keeps unknown current selection',
-    options.includes('value="light.legacy" selected') && options.includes('（当前）'), options);
-});
-test('entityOptions: empty device list degrades gracefully', () => {
+  const stale = entityPickerHtml('light', ['light.legacy']);
+  check('unknown current entity is kept checked', /value="light\.legacy" checked/.test(stale), stale);
+  check('stale row is flagged',
+    stale.includes('entity-option stale') && stale.includes('（当前，未在设备列表）'), stale);
   resetDom();
   haDevices = [];
-  check('entityOptions shows placeholder with no selection',
-    entityOptions('light', '').includes('未读取到此类型实体'), entityOptions('light', ''));
-  const kept = entityOptions('light', ['light.a']);
-  check('entityOptions keeps saved selection without device list',
-    kept.includes('value="light.a" selected'), kept);
-  check('entityOptions does not show disabled placeholder when a selection exists',
-    !kept.includes('未读取到此类型实体'), kept);
+  const empty = entityPickerHtml('light', []);
+  check('empty device list shows the empty hint', empty.includes('未读取到可用设备'), empty);
+  check('empty device list keeps the zero counter', empty.includes('已选择 0 个设备'), empty);
+  const kept = entityPickerHtml('light', ['light.a']);
+  check('saved selection survives an empty device list',
+    /value="light\.a" checked/.test(kept) && kept.includes('已选择 1 个设备'), kept);
 });
-test('ruleSearchText / ruleTargetNames handle string vs array', () => {
+
+// --- G3: checkbox selection -> entity_id string vs array --------------------
+test('checkbox selection: single -> string, multi -> array', () => {
+  const list = makeRulesPage([
+    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+    { pattern: '全开', action: { domain: 'light', service: 'turn_on', entity_id: ['light.a', 'light.b'], reply: '好的' } },
+    { pattern: '空选', action: { domain: 'light', service: 'turn_on', entity_id: '', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  checkEq('every rule renders two candidate boxes', list.map(row => boxes(row).length), [2, 2, 2]);
+  checkEq('string selection checks one box', checkedIds(list[0]), ['light.a']);
+  checkEq('array selection checks both boxes', checkedIds(list[1]), ['light.a', 'light.b']);
+  checkEq('empty selection checks nothing', checkedIds(list[2]), []);
+  checkEq('entityIdsOf reads the checked boxes', entityIdsOf(list[1]), ['light.a', 'light.b']);
+  checkEq('draft: one checkbox -> string', ruleDraftFromRow(list[0]).action.entity_id, 'light.a');
+  checkEq('draft: two checkboxes -> array', ruleDraftFromRow(list[1]).action.entity_id, ['light.a', 'light.b']);
+  checkEq('draft: zero checkboxes -> empty string', ruleDraftFromRow(list[2]).action.entity_id, '');
+  setChecked(list[0], ['light.a', 'light.b']);
+  updateEntityCount(pickerOf(list[0]));
+  checkEq('manual multi check -> array', ruleDraftFromRow(list[0]).action.entity_id, ['light.a', 'light.b']);
+  checkEq('manual multi check updates the counter', pickerCount(list[0]), '已选择 2 个设备');
+  setChecked(list[0], ['light.b']);
+  updateEntityCount(pickerOf(list[0]));
+  checkEq('manual single check -> string', ruleDraftFromRow(list[0]).action.entity_id, 'light.b');
+  checkEq('manual single check updates the counter', pickerCount(list[0]), '已选择 1 个设备');
+  setEntitySelection(list[0], ['light.a']);
+  checkEq('setEntitySelection replaces the whole selection', checkedIds(list[0]), ['light.a']);
+  checkEq('setEntitySelection updates the counter', pickerCount(list[0]), '已选择 1 个设备');
+});
+
+// --- G4: picker toolbar (全选 / 清空 / 搜索) --------------------------------
+test('picker toolbar: 全选 / 清空 / 搜索 / 已选择计数', () => {
+  const list = makeRulesPage([
+    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES, aliases: { 'light.b': '客厅灯' } });
+  const row = list[0];
+  const picker = pickerOf(row);
+  const buttons = picker.querySelectorAll('button');
+  const allBtn = buttons.find(button => String(button.attrs.onclick || '') === 'selectAllEntities(this)');
+  const clearBtn = buttons.find(button => String(button.attrs.onclick || '') === 'clearEntities(this)');
+  const searchBox = picker.querySelector('.entity-search');
+  check('全选 button exists and is wired', !!allBtn);
+  check('清空 button exists and is wired', !!clearBtn);
+  check('search box is wired to filterEntityOptions',
+    !!searchBox && String(searchBox.attrs.oninput || '') === 'filterEntityOptions(this)');
+  checkEq('the initial counter follows the saved selection', pickerCount(row), '已选择 1 个设备');
+
+  searchBox.value = '客厅';
+  checkEq('搜索只留下匹配的行', filterEntityOptions(searchBox), 1);
+  checkEq('搜索按 data-search 隐藏其他行',
+    visibleEntityOptions(picker).map(el => el.dataset.search), ['客厅灯 light.b']);
+  checkEq('搜索不改变已选择计数', pickerCount(row), '已选择 1 个设备');
+  checkEq('全选只勾选可见行', selectAllEntities(allBtn), 2);
+  checkEq('全选把可见行也勾上', checkedIds(row).slice().sort(), ['light.a', 'light.b']);
+  checkEq('全选之后计数文本更新', pickerCount(row), '已选择 2 个设备');
+
+  searchBox.value = '';
+  checkEq('清空搜索后所有行可见', filterEntityOptions(searchBox), 2);
+  checkEq('清空按钮取消全部勾选', clearEntities(clearBtn), 0);
+  checkEq('清空之后没有勾选', checkedIds(row), []);
+  checkEq('清空之后计数归零', pickerCount(row), '已选择 0 个设备');
+
+  searchBox.value = '客厅';
+  checkEq('清空后再次搜索仍只剩一行', filterEntityOptions(searchBox), 1);
+  checkEq('全选只勾选当前可见的那一行', selectAllEntities(allBtn), 1);
+  checkEq('全选结果的勾选集合', checkedIds(row), ['light.b']);
+  searchBox.value = '';
+  filterEntityOptions(searchBox);
+  checkEq('搜索清空后勾选保持不变', checkedIds(row), ['light.b']);
+});
+
+// --- G5: text / summary helpers -------------------------------------------
+test('ruleSearchText / ruleTargetNames / ruleSummaryHtml', () => {
   resetDom();
   haDevices = LIGHT_DEVICES.slice();
   deviceAliases = { 'light.b': '客厅灯' };
   checkEq('ruleTargetNames(string)', ruleTargetNames({ action: { entity_id: 'light.b' } }), ['客厅灯']);
   checkEq('ruleTargetNames(array)', ruleTargetNames({ action: { entity_id: ['light.a', 'light.b'] } }), ['A灯', '客厅灯']);
   checkEq('ruleTargetNames(unknown)', ruleTargetNames({ action: { entity_id: 'light.zzz' } }), ['light.zzz']);
-  const text = ruleSearchText({ pattern: '打开客厅灯', action: { entity_id: ['light.a', 'light.b'] } });
-  check('ruleSearchText includes pattern, ids and names',
-    text.includes('打开客厅灯') && text.includes('light.a') && text.includes('客厅灯'), text);
+  const text = ruleSearchText({ name: '客厅总控', pattern: '打开客厅灯', action: { entity_id: ['light.a', 'light.b'] } });
+  check('ruleSearchText includes the name, pattern, ids and names',
+    text.includes('客厅总控') && text.includes('打开客厅灯') &&
+    text.includes('light.a') && text.includes('客厅灯'), text);
   check('ruleSearchText is lower case', text === text.toLowerCase(), text);
+  const summary = ruleSummaryHtml({
+    pattern: '打开客厅灯',
+    action: { domain: 'light', service: 'turn_on', entity_id: ['light.a', 'light.b'] },
+  });
+  check('summary shows the trigger sentence', summary.includes('打开客厅灯'), summary);
+  check('summary shows domain, operation and device count',
+    summary.includes('灯光') && summary.includes('2 个设备'), summary);
+  check('summary lists the target names',
+    summary.includes('A灯') && summary.includes('客厅灯'), summary);
+  check('summary marks an empty trigger sentence',
+    ruleSummaryHtml({ pattern: '', action: {} }).includes('未填写触发语句'),
+    ruleSummaryHtml({ pattern: '', action: {} }));
 });
 
-// --- G3: collectRulesFromUI entity_id normalisation -------------------------
-test('collectRulesFromUI: string / array / zero selection round-trip', () => {
-  makeRulesPage([
+// --- G6: collectRulesFromUI ------------------------------------------------
+test('collectRulesFromUI: checkbox selection round-trip', () => {
+  const list = makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
     { pattern: '全开', action: { domain: 'light', service: 'turn_on', entity_id: ['light.a', 'light.b'], reply: '好的' } },
     { pattern: '空选', action: { domain: 'light', service: 'turn_on', entity_id: '', reply: '好的' } },
   ], { devices: LIGHT_DEVICES });
+  checkEq('fixture built three rows', list.length, 3);
   collectRulesFromUI();
   checkEq('collect: rule count', cfg.intent_rules.length, 3);
   checkEq('collect: single entity id stays a string', cfg.intent_rules[0].action.entity_id, 'light.a');
@@ -781,6 +1122,8 @@ test('collectRulesFromUI: string / array / zero selection round-trip', () => {
   checkEq('collect: zero selection becomes an empty string', cfg.intent_rules[2].action.entity_id, '');
   checkEq('collect: pattern preserved', cfg.intent_rules[0].pattern, '开灯');
   checkEq('collect: reply default applied', cfg.intent_rules[2].action.reply, '好的');
+  checkEq('collect: service preserved', cfg.intent_rules[0].action.service, 'turn_on');
+  checkEq('collect: no name key when the field is empty', 'name' in cfg.intent_rules[0], false);
 });
 test('collectRulesFromUI: ignores .rule-item nodes from other pages', () => {
   makeRulesPage(
@@ -807,94 +1150,100 @@ test('collectRulesFromUI: extra fields and JSON extras survive', () => {
   checkEq('collect keeps entity id', cfg.intent_rules[0].action.entity_id, 'light.a');
 });
 
-// --- G4: filterRules respects dataset.search and count ----------------------
+// --- G7: filterRules respects dataset.search and count ---------------------
 test('filterRules: filters on dataset.search and updates the count', () => {
-  const rows = makeRulesPage([
+  const list = makeRulesPage([
     { pattern: '打开客厅灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.b', reply: '好的' } },
     { pattern: '关闭卧室灯', action: { domain: 'light', service: 'turn_off', entity_id: 'light.a', reply: '好的' } },
     { pattern: '开空调', action: { domain: 'climate', service: 'set_temperature', entity_id: 'climate.ac', reply: '好的' } },
   ], { devices: LIGHT_DEVICES, aliases: { 'light.b': '客厅灯' } });
-  checkEq('fixture built 3 rows', rows.length, 3);
-  check('rows carry dataset.search', rows.every(row => typeof row.dataset.search === 'string' && row.dataset.search.length > 0));
+  checkEq('fixture built 3 rows', list.length, 3);
+  check('rows carry dataset.search', list.every(row => typeof row.dataset.search === 'string' && row.dataset.search.length > 0));
   document.getElementById('rule-filter').value = '客厅';
   filterRules();
-  checkEq('filter shows matching row', rows[0].style.display, '');
-  checkEq('filter hides non matching row', rows[1].style.display, 'none');
+  checkEq('filter shows matching row', list[0].style.display, '');
+  checkEq('filter hides non matching row', list[1].style.display, 'none');
   checkEq('filter count text', document.getElementById('rule-count').textContent, '1/3 条');
   document.getElementById('rule-filter').value = 'light.a';
   filterRules();
-  checkEq('filter matches raw entity id', rows[1].style.display, '');
+  checkEq('filter matches raw entity id', list[1].style.display, '');
   checkEq('filter by entity id count', document.getElementById('rule-count').textContent, '1/3 条');
   document.getElementById('rule-filter').value = '';
   filterRules();
-  check('filter cleared shows every row', rows.every(row => row.style.display === ''),
-    rows.map(row => row.style.display).join(','));
+  check('filter cleared shows every row', list.every(row => row.style.display === ''),
+    list.map(row => row.style.display).join(','));
   checkEq('filter cleared count', document.getElementById('rule-count').textContent, '3/3 条');
 });
 
-// --- G5: editing one rule must not corrupt the others ----------------------
+// --- G8: editing one rule must not corrupt the others ---------------------
 test('switchD rebuilds only that rule and keeps other rules intact', () => {
-  const rows = makeRulesPage([
+  const list = makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', brightness_pct: '{0}', reply: '好的' } },
-    { pattern: '关灯', action: { domain: 'light', service: 'turn_off', entity_id: 'light.b', reply: '收到' } },
+    { pattern: '关灯', action: { domain: 'light', service: 'turn_off', entity_id: ['light.a', 'light.b'], reply: '收到' } },
   ], { devices: LIGHT_DEVICES });
-  checkEq('two rows built', rows.length, 2);
-  rows[0].querySelector('.r-p').value = '开灯(改)';
-  const buttons = rows[0].querySelectorAll('.domain-btn');
+  checkEq('two rows built', list.length, 2);
+  list[0].querySelector('.r-p').value = '开灯(改)';
+  const buttons = list[0].querySelectorAll('.domain-btn');
   const climateButton = buttons.find(button => String(button.attrs.onclick || '').includes("'climate'"));
   check('climate domain button exists', !!climateButton);
   switchD(climateButton, 'climate');
-  checkEq('switchD rewrites the hidden domain field', rows[0].querySelector('.r-d').value, 'climate');
-  checkEq('switchD rebuilds that rule entity options for the new domain',
-    optionValues(rows[0].querySelector('.r-e')), ['climate.ac']);
+  const row = rows()[0];
+  checkEq('switchD rewrites the hidden domain field', row.querySelector('.r-d').value, 'climate');
+  checkEq('switchD updates the candidate list for the new domain', pickerIds(row).includes('climate.ac'), true);
+  checkEq('switchD clears the old-domain entity', row.querySelectorAll('.entity-option.stale').length, 0);
+  checkEq('switchD clears the old-domain checkboxes', checkedIds(row), []);
   checkEq('switchD rebuilds that rule service options',
-    optionValues(rows[0].querySelector('.r-s')), ['set_hvac_mode', 'turn_off', 'set_temperature']);
-  checkEq('switchD rebuilds that rule extra fields',
-    rows[0].querySelectorAll('.r-xk').length, 3);
-  checkEq('switchD keeps the in progress pattern edit', rows[0].querySelector('.r-p').value, '开灯(改)');
-  checkEq('other rule entity options untouched', optionValues(rows[1].querySelector('.r-e')), ['light.a', 'light.b']);
-  checkEq('other rule entity selection untouched', selectedValues(rows[1].querySelector('.r-e')), ['light.b']);
-  checkEq('other rule pattern untouched', rows[1].querySelector('.r-p').value, '关灯');
+    optionValues(row.querySelector('.r-s')), ['set_hvac_mode', 'turn_off', 'set_temperature']);
+  checkEq('switchD rebuilds that rule extra fields', row.querySelectorAll('.r-xk').length, 3);
+  checkEq('switchD keeps the in progress pattern edit', row.querySelector('.r-p').value, '开灯(改)');
+  checkEq('switchD keeps the reply field', row.querySelector('.r-r').value, '好的');
+  checkEq('other rule candidate list untouched', pickerIds(rows()[1]).slice().sort(), ['light.a', 'light.b']);
+  checkEq('other rule selection untouched', checkedIds(rows()[1]), ['light.a', 'light.b']);
+  checkEq('other rule pattern untouched', rows()[1].querySelector('.r-p').value, '关灯');
   checkEq('other rule service options untouched',
-    optionValues(rows[1].querySelector('.r-s')), ['turn_on', 'turn_off', 'toggle']);
-  checkEq('other rule extra fields untouched', rows[1].querySelectorAll('.r-xk').length, 1);
+    optionValues(rows()[1].querySelector('.r-s')), ['turn_on', 'turn_off', 'toggle']);
+  checkEq('other rule extra fields untouched', rows()[1].querySelectorAll('.r-xk').length, 1);
   collectRulesFromUI();
   checkEq('collect: edited rule kept its pattern', cfg.intent_rules[0].pattern, '开灯(改)');
   checkEq('collect: edited rule uses the new domain', cfg.intent_rules[0].action.domain, 'climate');
-  checkEq('collect: edited rule has no entity after the domain switch', cfg.intent_rules[0].action.entity_id, '');
-  checkEq('collect: other rule untouched after collecting', cfg.intent_rules[1].action.entity_id, 'light.b');
+  // 设备类型切换只保留新域里合法的实体：旧域的 light.a 必须被清掉。
+  checkEq('collect: edited rule has no entity after the domain switch',
+    cfg.intent_rules[0].action.entity_id, '');
+  checkEq('collect: other rule untouched after collecting',
+    cfg.intent_rules[1].action.entity_id, ['light.a', 'light.b']);
   checkEq('collect: other rule pattern untouched after collecting', cfg.intent_rules[1].pattern, '关灯');
 });
 
-// --- F1: async device load must not clobber edits ---------------------------
+// --- F1: async device load must not clobber edits --------------------------
 test('syncRuleEntityOptions refreshes options without re-rendering the list', () => {
   haDevices = [];
-  const rows = makeRulesPage([
+  const list = makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
   ]);
-  rows[0].querySelector('.r-p').value = '未保存的修改';
+  rows()[0].querySelector('.r-p').value = '未保存的修改';
   haDevices = LIGHT_DEVICES.slice();
   const before = __renderCount;
   const touched = syncRuleEntityOptions();
   checkEq('sync touches the rendered rows', touched, 1);
   checkEq('sync does not call renderRules', __renderCount, before);
-  checkEq('sync keeps the unsaved pattern edit', rows[0].querySelector('.r-p').value, '未保存的修改');
-  checkEq('sync keeps the saved entity selection', selectedValues(rows[0].querySelector('.r-e')), ['light.a']);
+  checkEq('sync keeps the unsaved pattern edit', rows()[0].querySelector('.r-p').value, '未保存的修改');
+  checkEq('sync keeps the saved entity selection', checkedIds(rows()[0]), ['light.a']);
   checkEq('sync fills in the freshly loaded device options',
-    optionValues(rows[0].querySelector('.r-e')), ['light.a', 'light.b']);
+    pickerIds(rows()[0]).slice().sort(), ['light.a', 'light.b']);
+  checkEq('sync keeps the selected counter', pickerCount(rows()[0]), '已选择 1 个设备');
   const again = syncRuleEntityOptions();
   checkEq('sync is repeatable', again, 1);
-  checkEq('sync does not reset the selection on a second run',
-    selectedValues(rows[0].querySelector('.r-e')), ['light.a']);
+  checkEq('sync does not reset the selection on a second run', checkedIds(rows()[0]), ['light.a']);
+  checkEq('fixture row count is stable', list.length, 1);
 });
 
 // --- F2: entering the rules tab must not clobber edits ---------------------
 test('showPage(rules) reloads entity options without re-rendering', async () => {
   haDevices = [];
-  const rows = makeRulesPage([
+  const list = makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
   ]);
-  rows[0].querySelector('.r-p').value = '切页前改的';
+  rows()[0].querySelector('.r-p').value = '切页前改的';
   const calls = { load: 0, logs: 0, devices: 0, schedules: 0 };
   const realLoadRuleDevices = loadRuleDevices;
   loadRuleDevices = async function(){
@@ -909,74 +1258,298 @@ test('showPage(rules) reloads entity options without re-rendering', async () => 
   await new Promise(resolve => setImmediate(resolve));
   checkEq('showPage(rules) does not call renderRules', __renderCount, before);
   checkEq('showPage(rules) reloads the device list', calls.load, 1);
-  checkEq('showPage(rules) keeps the unsaved edit', rows[0].querySelector('.r-p').value, '切页前改的');
-  checkEq('showPage(rules) refreshes the entity options',
-    optionValues(rows[0].querySelector('.r-e')), ['light.a', 'light.b']);
-  checkEq('showPage(rules) keeps the entity selection',
-    selectedValues(rows[0].querySelector('.r-e')), ['light.a']);
+  checkEq('showPage(rules) keeps the unsaved edit', rows()[0].querySelector('.r-p').value, '切页前改的');
+  checkEq('showPage(rules) refreshes the candidate list',
+    pickerIds(rows()[0]).slice().sort(), ['light.a', 'light.b']);
+  checkEq('showPage(rules) keeps the entity selection', checkedIds(rows()[0]), ['light.a']);
   showPage('logs');
   checkEq('showPage(logs) still fetches logs', calls.logs, 1);
   loadRuleDevices = realLoadRuleDevices;
+  checkEq('fixture row count is stable', list.length, 1);
 });
 
-// --- F3: a failed save must not look like a refresh ------------------------
-test('failed save keeps the edits and the unsaved marker', async () => {
-  haDevices = LIGHT_DEVICES.slice();
-  const rows = makeRulesPage([
+// --- S1: 单条保存只提交 baseline + 这一条 ----------------------------------
+test('saveOneRule posts the baseline with only that rule replaced', async () => {
+  const list = makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
-  ]);
-  rows[0].querySelector('.r-p').value = '改到一半';
-  markRulesDirty();
-  checkEq('dirty marker is visible after an edit', document.getElementById('rules-dirty').style.display, '');
-  const realSaveCfg = saveCfg;
-  saveCfg = async function(){ return false; };
-  const before = __renderCount;
-  const ok = await saveRules();
-  checkEq('saveRules reports the failure', ok, false);
-  checkEq('failed save does not re-render (no fake refresh)', __renderCount, before);
-  checkEq('failed save keeps the edited text in the DOM', rows[0].querySelector('.r-p').value, '改到一半');
-  checkEq('failed save keeps the unsaved marker', document.getElementById('rules-dirty').style.display, '');
-  checkEq('failed save keeps the in-memory edit', cfg.intent_rules[0].pattern, '改到一半');
-  saveCfg = realSaveCfg;
+    { pattern: '关灯', action: { domain: 'light', service: 'turn_off', entity_id: 'light.b', reply: '收到' } },
+  ], { devices: LIGHT_DEVICES });
+  list[0].querySelector('.r-p').value = '开灯(改)';
+  list[1].querySelector('.r-p').value = '关灯(未保存)';
+  stubFetch();
+  const ok = await saveOneRule(0);
+  checkEq('saveOneRule reports success', ok, true);
+  checkEq('saveOneRule posts exactly once', __fetchCalls.length, 1);
+  checkEq('saveOneRule posts to /api/config', __fetchCalls[0].url, '/api/config');
+  const posted = postedRules();
+  checkEq('both rules are posted', posted.length, 2);
+  checkEq('saved rule carries the edit', posted[0].pattern, '开灯(改)');
+  checkEq("other rule's saved value is posted untouched", posted[1].pattern, '关灯');
+  checkEq("other rule's unsaved draft is not posted",
+    posted.some(rule => rule.pattern === '关灯(未保存)'), false);
+  checkEq("other row's DOM keeps its draft", list[1].querySelector('.r-p').value, '关灯(未保存)');
+  checkEq('baseline updated for the saved rule', ruleBaseline[0].rule.pattern, '开灯(改)');
+  checkEq('baseline untouched for the other rule', ruleBaseline[1].rule.pattern, '关灯');
+  checkEq('saved row no longer shows the unsaved chip', chipOf(rows()[0]).style.display, 'none');
 });
-test('successful save re-renders once and clears the unsaved marker', async () => {
-  haDevices = LIGHT_DEVICES.slice();
-  const rows = makeRulesPage([
-    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
-  ]);
-  rows[0].querySelector('.r-p').value = '改到一半';
-  markRulesDirty();
-  const realSaveCfg = saveCfg;
-  saveCfg = async function(){ return true; };
+
+// --- S2: 草稿隔离：编辑 A、编辑 B、只保存 B -------------------------------
+test('draft isolation: saving B leaves A untouched', async () => {
+  const list = makeRulesPage([
+    { pattern: 'A', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+    { pattern: 'B', action: { domain: 'light', service: 'turn_on', entity_id: 'light.b', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  list[0].querySelector('.r-p').value = 'A(草稿)';
+  list[0].querySelector('.r-p').dispatchEvent_('input');
+  list[1].querySelector('.r-p').value = 'B(已保存)';
+  stubFetch();
+  const ok = await saveOneRule(1);
+  checkEq('saveOneRule(B) reports success', ok, true);
+  checkEq("A's DOM draft is untouched", list[0].querySelector('.r-p').value, 'A(草稿)');
+  checkEq("A's chip is still visible", chipOf(list[0]).style.display, '');
+  checkEq("A's draft is still not part of the baseline", ruleBaseline[0].rule.pattern, 'A');
+  checkEq("B's draft is saved", ruleState[1].draft.pattern, 'B(已保存)');
+  checkEq("B's chip is hidden again", chipOf(rows()[1]).style.display, 'none');
+  const posted = postedRules();
+  checkEq('posted A is the baseline value', posted[0].pattern, 'A');
+  checkEq('posted B is the draft', posted[1].pattern, 'B(已保存)');
+  checkEq('the page still shows the unsaved marker because A is dirty',
+    document.getElementById('rules-dirty').style.display, '');
+});
+
+// --- S3: 保存全部 ---------------------------------------------------------
+test('saveRules posts every draft and replaces the baseline', async () => {
+  const list = makeRulesPage([
+    { pattern: 'A', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+    { pattern: 'B', action: { domain: 'light', service: 'turn_off', entity_id: 'light.b', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  list[0].querySelector('.r-p').value = 'A2';
+  list[1].querySelector('.r-p').value = 'B2';
+  list[0].querySelector('.r-p').dispatchEvent_('input');
+  stubFetch();
   const before = __renderCount;
   const ok = await saveRules();
   checkEq('saveRules reports success', ok, true);
-  checkEq('successful save re-renders exactly once', __renderCount - before, 1);
-  checkEq('successful save clears the unsaved marker',
-    document.getElementById('rules-dirty').style.display, 'none');
-  checkEq('successful save renders the collected edit',
-    document.querySelector('#rule-list .rule-item .r-p').value, '改到一半');
-  saveCfg = realSaveCfg;
+  checkEq('saveRules posts exactly once', __fetchCalls.length, 1);
+  const posted = postedRules();
+  checkEq('both drafts are posted', posted.map(rule => rule.pattern), ['A2', 'B2']);
+  checkEq('baseline replaced by the drafts', ruleBaseline.map(entry => entry.rule.pattern), ['A2', 'B2']);
+  checkEq('successful save-all re-renders once', __renderCount - before, 1);
+  checkEq('unsaved marker cleared', document.getElementById('rules-dirty').style.display, 'none');
+  checkEq('rows re-rendered from the saved drafts',
+    rows().map(row => row.querySelector('.r-p').value), ['A2', 'B2']);
+  checkEq('chips hidden after save-all',
+    rows().map(row => chipOf(row).style.display), ['none', 'none']);
+  checkEq('no delete is pending any more', ruleDeleted, []);
+});
+
+// --- S4: 保存失败 ---------------------------------------------------------
+test('failed per-rule save keeps edits, chip and marker', async () => {
+  const list = makeRulesPage([
+    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  list[0].querySelector('.r-p').value = '改到一半';
+  list[0].querySelector('.r-p').dispatchEvent_('input');
+  const row = rows()[0];
+  stubFetch(function(){ return { ok: false, msg: '服务器拒绝' }; });
+  const ok = await saveOneRule(0);
+  checkEq('saveOneRule reports the failure', ok, false);
+  checkEq('failed save does not re-render', __renderCount, 0);
+  checkEq('the same DOM node is kept', rows()[0] === row, true);
+  checkEq('failed save keeps the edited text in the DOM', rows()[0].querySelector('.r-p').value, '改到一半');
+  checkEq('failed save keeps the unsaved chip', chipOf(rows()[0]).style.display, '');
+  checkEq('failed save keeps the global unsaved marker',
+    document.getElementById('rules-dirty').style.display, '');
+  checkEq('failed save leaves the baseline untouched', ruleBaseline[0].rule.pattern, '开灯');
+  check('failed save shows an error alert', __alerts.some(alert => alert.kind === 'err'),
+    JSON.stringify(__alerts));
+});
+
+// --- S5: 规则名称 ---------------------------------------------------------
+test('rule name: title priority, payload and reload', async () => {
+  checkEq('title prefers the name', ruleTitle({ name: '客厅灯组开灯', pattern: '打开客厅灯' }, 0), '客厅灯组开灯');
+  checkEq('title falls back to the pattern', ruleTitle({ name: '   ', pattern: '打开客厅灯' }, 0), '打开客厅灯');
+  checkEq('title falls back to 新规则 #N', ruleTitle({ pattern: '   ' }, 2), '新规则 #3');
+  checkEq('ruleName ignores non strings', ruleName({ name: 42 }), '');
+  const list = makeRulesPage([
+    { name: '客厅灯组开灯', pattern: '打开客厅灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+    { pattern: '关灯', action: { domain: 'light', service: 'turn_off', entity_id: 'light.b', reply: '好的' } },
+    { pattern: '', action: { domain: 'light', service: 'turn_on', entity_id: '', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  checkEq('rendered title uses the name',
+    list[0].querySelector('.rule-title').textContent, '客厅灯组开灯');
+  checkEq('rendered title falls back to the pattern',
+    list[1].querySelector('.rule-title').textContent, '关灯');
+  checkEq('rendered title falls back to 新规则 #N',
+    list[2].querySelector('.rule-title').textContent, '新规则 #3');
+  checkEq('the name field is prefilled', list[0].querySelector('.r-n').value, '客厅灯组开灯');
+  checkEq('rule number badge is rendered', list[0].querySelector('.rule-num').textContent, '#1');
+  list[1].querySelector('.r-n').value = '关灯命令';
+  stubFetch();
+  await saveOneRule(1);
+  checkEq('the name is posted', postedRules()[1].name, '关灯命令');
+  const reloaded = makeRulesPage(cloneJson(cfg.intent_rules), { devices: LIGHT_DEVICES });
+  checkEq('the name survives a reload', reloaded[1].querySelector('.r-n').value, '关灯命令');
+  checkEq('the title survives a reload',
+    reloaded[1].querySelector('.rule-title').textContent, '关灯命令');
+});
+
+// --- S6: 不带 name 的历史 JSON -------------------------------------------
+test('legacy JSON without name still edits, saves and exports', async () => {
+  const list = makeRulesPage([
+    { pattern: '打开客厅灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  checkEq('an empty name field is rendered', list[0].querySelector('.r-n').value, '');
+  checkEq('the draft has no name property', 'name' in ruleDraftFromRow(list[0]), false);
+  checkEq('the pattern is preserved', ruleDraftFromRow(list[0]).pattern, '打开客厅灯');
+  list[0].querySelector('.r-p').value = '打开客厅灯吧';
+  stubFetch();
+  const ok = await saveOneRule(0);
+  checkEq('the legacy rule can still be saved', ok, true);
+  const posted = postedRules()[0];
+  checkEq('the saved rule has no name property', 'name' in posted, false);
+  checkEq('the saved rule keeps the edited pattern', posted.pattern, '打开客厅灯吧');
+  __lastBlob = null;
+  exportRules();
+  check('export produced a blob', !!__lastBlob);
+  const exported = JSON.parse(await __lastBlob.text());
+  checkEq('export contains one rule', exported.length, 1);
+  checkEq('the exported legacy rule has no name property', 'name' in exported[0], false);
+  checkEq('export keeps the pattern', exported[0].pattern, '打开客厅灯吧');
+});
+
+// --- S7: 触发语句仍是匹配键，name 不替代它 -------------------------------
+test('the trigger sentence stays the match key (name never replaces it)', async () => {
+  const list = makeRulesPage([
+    { pattern: '打开客厅灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  list[0].querySelector('.r-n').value = '客厅灯组';
+  list[0].querySelector('.r-p').value = '打开客厅灯';
+  stubFetch();
+  await saveOneRule(0);
+  const posted = postedRules()[0];
+  checkEq('the pattern is still emitted for the matcher', posted.pattern, '打开客厅灯');
+  checkEq('the name is emitted separately', posted.name, '客厅灯组');
+  checkEq('the name did not overwrite the pattern', posted.pattern === posted.name, false);
+  check('the search text still contains the pattern',
+    ruleSearchText(posted).includes('打开客厅灯'), ruleSearchText(posted));
+  checkEq('the DOM keeps the trigger sentence', rows()[0].querySelector('.r-p').value, '打开客厅灯');
+});
+
+// --- S8: 导入 / 导出 ------------------------------------------------------
+test('export/import round-trip keeps names and gates per-rule save', async () => {
+  const list = makeRulesPage([
+    { name: '客厅灯组', pattern: '打开客厅灯', action: { domain: 'light', service: 'turn_on', entity_id: ['light.a', 'light.b'], reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  __lastBlob = null;
+  exportRules();
+  check('export produced a blob', !!__lastBlob);
+  const payload = JSON.parse(await __lastBlob.text());
+  checkEq('export keeps the name', payload[0].name, '客厅灯组');
+  checkEq('export keeps the pattern', payload[0].pattern, '打开客厅灯');
+  checkEq('export keeps the multi entity ids', payload[0].action.entity_id, ['light.a', 'light.b']);
+
+  const imported = cloneJson(payload);
+  imported[0].pattern = '导入后改的';
+  await importFromJson(JSON.stringify(imported));
+  checkEq('imported rows are rendered', rows().length, 1);
+  checkEq('import keeps the name', rows()[0].querySelector('.r-n').value, '客厅灯组');
+  checkEq('import keeps the multi selection', checkedIds(rows()[0]), ['light.a', 'light.b']);
+  checkEq('import marks the page dirty', document.getElementById('rules-dirty').style.display, '');
+  checkEq('import is pending (ruleBulkPending)', ruleBulkPending, true);
+  stubFetch();
+  const refused = await saveOneRule(0);
+  checkEq('per-rule save is refused while an import is pending', refused, false);
+  checkEq('the refusal does not POST', __fetchCalls.length, 0);
+  check('the refusal points at 保存全部',
+    __alerts.some(alert => String(alert.message).includes('保存全部')), JSON.stringify(__alerts));
+  const ok = await saveRules();
+  checkEq('save-all accepts the imported drafts', ok, true);
+  checkEq('save-all clears the pending flag', ruleBulkPending, false);
+  checkEq('save-all posted the imported rule', postedRules()[0].pattern, '导入后改的');
+  checkEq('save-all kept the name', postedRules()[0].name, '客厅灯组');
+  checkEq('fixture started with one row', list.length, 1);
+});
+
+// --- S9: 删除 + 设备类型切换 ---------------------------------------------
+test('delete and domain switch keep other drafts', async () => {
+  const list = makeRulesPage([
+    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+    { pattern: '关灯', action: { domain: 'light', service: 'turn_off', entity_id: 'light.b', reply: '收到' } },
+  ], { devices: LIGHT_DEVICES });
+  rows()[1].querySelector('.r-p').value = '关灯(草稿)';
+  rows()[1].querySelector('.r-n').value = '关灯名';
+  const firstUid = ruleState[0].uid;
+  deleteRule(0);
+  checkEq('the row is removed', rows().length, 1);
+  checkEq('the deleted uid is recorded', ruleDeleted, [firstUid]);
+  checkEq('the remaining row is renumbered', rows()[0].dataset.idx, 0);
+  checkEq('the remaining draft is preserved', rows()[0].querySelector('.r-p').value, '关灯(草稿)');
+  checkEq('the remaining name is preserved', rows()[0].querySelector('.r-n').value, '关灯名');
+  checkEq('delete marks the page dirty',
+    document.getElementById('rules-dirty').style.display, '');
+  stubFetch();
+  const refused = await saveOneRule(0);
+  checkEq('per-rule save is refused after a delete', refused, false);
+  checkEq('the refusal does not POST', __fetchCalls.length, 0);
+
+  const buttons = rows()[0].querySelectorAll('.domain-btn');
+  const switchButton = buttons.find(button => String(button.attrs.onclick || '').includes("'climate'"));
+  switchD(switchButton, 'climate');
+  const row = rows()[0];
+  checkEq('the domain switch updated the hidden field', row.querySelector('.r-d').value, 'climate');
+  checkEq('the candidate list follows the new domain', pickerIds(row).includes('climate.ac'), true);
+  checkEq('the trigger sentence survives the switch', row.querySelector('.r-p').value, '关灯(草稿)');
+  checkEq('the rule name survives the switch', row.querySelector('.r-n').value, '关灯名');
+  checkEq('the reply survives the switch', row.querySelector('.r-r').value, '收到');
+  checkEq('the switch marks the page dirty',
+    document.getElementById('rules-dirty').style.display, '');
+  checkEq('the fixture is still two rows', list.length, 2);
+});
+
+// --- S10: 新增规则可以单独保存 -------------------------------------------
+test('addRule creates a draft that can be saved on its own', async () => {
+  const list = makeRulesPage([
+    { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
+  ], { devices: LIGHT_DEVICES });
+  addRule();
+  checkEq('a second row appears', rows().length, 2);
+  checkEq('the new row starts expanded', rows()[1].classList.contains('collapsed'), false);
+  checkEq('the new row is a draft (base=false)', ruleState[1].base, false);
+  checkEq('the new row marks the page dirty',
+    document.getElementById('rules-dirty').style.display, '');
+  rows()[1].querySelector('.r-p').value = '新语句';
+  stubFetch();
+  const ok = await saveOneRule(1);
+  checkEq('the new draft can be saved on its own', ok, true);
+  const posted = postedRules();
+  checkEq('both rules are posted', posted.length, 2);
+  checkEq('the new draft is appended', posted[1].pattern, '新语句');
+  checkEq('the new draft joined the baseline', ruleBaseline.length, 2);
+  checkEq('the original rule is untouched', posted[0].pattern, '开灯');
+  checkEq('the fixture started with one row', list.length, 1);
 });
 
 // --- unsaved marker wiring --------------------------------------------------
 test('bindRulesDirty shows the marker on input/change and binds once', () => {
   makeRulesPage([
     { pattern: '开灯', action: { domain: 'light', service: 'turn_on', entity_id: 'light.a', reply: '好的' } },
-  ]);
+  ], { devices: LIGHT_DEVICES });
   const indicator = document.getElementById('rules-dirty');
   indicator.style.display = 'none';
   bindRulesDirty();
-  const list = document.getElementById('rule-list');
-  checkEq('input listener bound once', (list.listeners.input || []).length, 1);
-  checkEq('change listener bound once', (list.listeners.change || []).length, 1);
-  list.dispatchEvent_('input');
+  const ruleList = document.getElementById('rule-list');
+  checkEq('input listener bound once', (ruleList.listeners.input || []).length, 1);
+  checkEq('change listener bound once', (ruleList.listeners.change || []).length, 1);
+  rows()[0].querySelector('.r-p').dispatchEvent_('input');
   checkEq('typing in a rule shows the unsaved marker', indicator.style.display, '');
+  checkEq('typing marks that row dirty', ruleState[0].dirty, true);
+  checkEq('typing shows that row chip', chipOf(rows()[0]).style.display, '');
   setRulesDirty(false);
-  list.dispatchEvent_('change');
+  rows()[0].querySelector('.r-s').dispatchEvent_('change');
   checkEq('changing a select shows the unsaved marker again', indicator.style.display, '');
   bindRulesDirty();
-  checkEq('bindRulesDirty is idempotent', (list.listeners.input || []).length, 1);
+  checkEq('bindRulesDirty is idempotent', (ruleList.listeners.input || []).length, 1);
 });
 
 // --- runner -----------------------------------------------------------------
@@ -1005,6 +1578,92 @@ def build_harness(html: str) -> str:
     ])
 
 
+# ──────────────────────────── backend matcher checks ────────────────────────────
+
+def _extract_intent_parser(bridge_path: Path):
+    """AST-extract ``class IntentParser`` so the matcher can be exercised alone."""
+    source = bridge_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(bridge_path))
+    node = None
+    for item in tree.body:
+        if isinstance(item, ast.ClassDef) and item.name == "IntentParser":
+            node = item
+            break
+    if node is None:
+        raise ValueError(f"class IntentParser not found in {bridge_path}")
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace: dict = {"re": re}
+    exec(compile(module, f"<{bridge_path.name}:IntentParser>", "exec"), namespace)
+    return namespace["IntentParser"], node
+
+
+def _name_reads(node: ast.AST) -> list[str]:
+    """Every place the extracted class could read the rule ``name`` field."""
+    hits: list[str] = []
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Constant) and sub.value == "name":
+            hits.append("string literal 'name'")
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "get"
+            and any(isinstance(arg, ast.Constant) and arg.value == "name" for arg in sub.args)
+        ):
+            hits.append(".get('name')")
+    return hits
+
+
+def bridge_checks(bridge_path: Path) -> list[tuple[str, bool, str]]:
+    """Prove the backend matcher ignores the UI-only ``name`` field."""
+    entity = {"entity_id": "light.a"}
+    plain_rule = {"pattern": "打开客厅灯", "action": {"domain": "light", "service": "turn_on", **entity}}
+    named_rule = {
+        "pattern": "打开客厅灯",
+        "name": "客厅灯组开灯",
+        "action": {"domain": "light", "service": "turn_on", **entity},
+    }
+
+    try:
+        parser_cls, node = _extract_intent_parser(bridge_path)
+    except (SyntaxError, ValueError, TypeError, OSError) as exc:
+        return [("IntentParser extracted from bridge.py", False, f"{type(exc).__name__}: {exc}")]
+
+    checks: list[tuple[str, bool, str]] = [("IntentParser extracted from bridge.py", True, "")]
+    named_action = parser_cls([named_rule]).parse("打开客厅灯")
+    plain_action = parser_cls([plain_rule]).parse("打开客厅灯")
+    checks.append((
+        "a rule carrying a name still matches its trigger sentence",
+        named_action is not None,
+        f"parse('打开客厅灯') -> {named_action!r}",
+    ))
+    checks.append((
+        "the name does not change the matched action",
+        named_action == plain_action,
+        f"named={named_action!r} plain={plain_action!r}",
+    ))
+    checks.append((
+        "the named rule keeps the same domain / service",
+        isinstance(named_action, dict)
+        and named_action.get("domain") == "light"
+        and named_action.get("service") == "turn_on",
+        f"parse -> {named_action!r}",
+    ))
+    miss = parser_cls([named_rule]).parse("今天天气不错")
+    checks.append((
+        "a non matching sentence still does not match",
+        miss is None,
+        f"parse('今天天气不错') -> {miss!r}",
+    ))
+    reads = _name_reads(node)
+    checks.append((
+        "the name field is never read by the matcher",
+        not reads,
+        f"name lookups: {reads}",
+    ))
+    return checks
+
+
 # ────────────────────────────────── runner ──────────────────────────────────
 
 def run_patch(src_html: Path, out_html: Path) -> subprocess.CompletedProcess:
@@ -1023,6 +1682,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--html", help="already built (patched) web/index.html to test")
     parser.add_argument("--pristine", help="pinned pristine upstream web/index.html; rebuild via patch_web.py and test that build")
     parser.add_argument("--node", default=None, help="node executable (default: node from PATH)")
+    parser.add_argument(
+        "--bridge",
+        default=None,
+        help=f"built bridge.py used for the IntentParser matcher check (default: {DEFAULT_BRIDGE})",
+    )
     parser.add_argument("--keep", action="store_true", help="keep the temporary build/harness directory")
     args = parser.parse_args(argv)
 
@@ -1110,6 +1774,21 @@ def main(argv: list[str]) -> int:
             print(f"FAIL: node harness exited {proc.returncode}")
             failures += 1
 
+        print("\n[bridge intent matcher]")
+        bridge_path = Path(args.bridge).resolve() if args.bridge else DEFAULT_BRIDGE
+        if not bridge_path.is_file():
+            if args.bridge:
+                print(f"  FAIL bridge file not found: {bridge_path}")
+                failures += 1
+            else:
+                print(f"  SKIP bridge.py not found: {bridge_path}")
+        else:
+            print(f"  using {bridge_path}")
+            for name, ok, detail in bridge_checks(bridge_path):
+                print(f"  {'PASS' if ok else 'FAIL'} {name}" + ("" if ok else f" :: {detail}"))
+                if not ok:
+                    failures += 1
+
         if args.keep:
             print(f"\n[keep] workdir: {workdir}")
             workdir = None  # type: ignore[assignment]
@@ -1117,7 +1796,7 @@ def main(argv: list[str]) -> int:
         if failures:
             print(f"SUMMARY: FAIL ({failures} failing check group(s))")
             return 1
-        print("SUMMARY: PASS (rebuild + source invariants + js harness)")
+        print("SUMMARY: PASS (rebuild + source invariants + js harness + bridge matcher)")
         return 0
     finally:
         if workdir is not None:

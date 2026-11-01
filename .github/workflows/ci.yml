@@ -64,6 +64,7 @@ jobs:
             xiaoai_bridge/test_upgrade_data.py \
             xiaoai_bridge/test_poll_auth.py \
             xiaoai_bridge/test_sms_login.py \
+            xiaoai_bridge/test_xiaomi_login.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
@@ -121,6 +122,11 @@ jobs:
       - name: SMS verification login (password + SMS + STS)
         run: |
           python xiaoai_bridge/test_sms_login.py /tmp/app/bridge.py \
+            --html /tmp/app/web/index.html
+
+      - name: Xiaomi password + verification code login and manual cookie login
+        run: |
+          python xiaoai_bridge/test_xiaomi_login.py /tmp/app/bridge.py \
             --html /tmp/app/web/index.html
 
       - name: HTTP access control
@@ -191,7 +197,7 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="xiaoai-ha-bridge-ci:${{ github.sha }}"
-          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert '<select class=\"r-e\" multiple size=\"6\">' in w; assert '#rule-list .rule-item' in w; assert 'function ruleSummaryHtml(rule)' in w; assert 'id=\"rule-filter\"' in w; assert 'async function loadRuleDevices()' in w; assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'clearXiaomiLogin' in w; assert 'revealDirectToken' in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b; assert 'async def _relogin_and_refresh' in b; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b; assert 'IntentParser(load_config().get(\"intent_rules\", [])).parse(query)' in b"
+          docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert 'type=\"checkbox\" class=\"r-e\"' in w; assert 'multiple size=\"6\"' not in w; assert 'function saveOneRule(' in w; assert '保存全部' in w; assert '#rule-list .rule-item' in w; assert 'function ruleSummaryHtml(rule)' in w; assert 'id=\"rule-filter\"' in w; assert 'async function loadRuleDevices()' in w; assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'clearXiaomiLogin' in w; assert 'revealDirectToken' in w; assert 'id=\"mi-otp-panel\"' in w; assert 'id=\"mi-advanced-card\"' in w; assert 'async function startPasswordLogin()' in w; assert 'async function verifyCookieLogin()' in w; assert '免短信' not in w; assert '链接可能已过期' not in w; assert 'async def _refresh_micoapi_token' in b; assert 'micoapi serviceToken 已保存' in b; assert 'async def _relogin_and_refresh' in b; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'async def xiaomi_otp_start' in b; assert 'async def xiaomi_otp_send' in b; assert 'async def xiaomi_otp_verify' in b; assert 'async def xiaomi_otp_restart' in b; assert 'async def xiaomi_cookie_login' in b; assert '链接可能已过期' not in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b; assert 'IntentParser(load_config().get(\"intent_rules\", [])).parse(query)' in b"
           test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
 
       - name: Run every in-image test suite
@@ -211,6 +217,10 @@ jobs:
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_sms_login.py:/tmp/test_sms_login.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_sms_login.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_xiaomi_login.py:/tmp/test_xiaomi_login.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_xiaomi_login.py \
+              /app/bridge.py --html /app/web/index.html
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \

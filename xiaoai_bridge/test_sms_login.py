@@ -996,7 +996,8 @@ global.fetch=(url,init)=>{
         check("可重试" in payload["status"], f"a retryable failure must keep the retry hint, got {payload['status']}")
     if "expired" in by_label:
         payload = by_label["expired"]
-        check("测试连接" in payload["status"],
+        # 1.0.12 起主入口是「账号密码登录」，失效时提示重新点击「登录」（不再是「测试连接」）。
+        check("登录" in payload["status"],
               f"an expired session must tell the user to restart, got {payload['status']}")
     ok("frontend executes completeSmsVerify(): POST /verify, url body, device refresh, retry hints")
     return "frontend wiring verified"

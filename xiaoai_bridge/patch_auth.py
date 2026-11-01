@@ -1802,7 +1802,10 @@ async def _exchange_sts_service_token(session, sts_url: str) -> str:
                 log.warning("短信验证回调返回 HTTP %s", resp.status)
                 raise SmsVerifyError(
                     "sts_http",
-                    "短信验证地址返回 HTTP " + str(resp.status) + "，链接可能已过期",
+                    "短信验证地址返回 HTTP " + str(resp.status)
+                    + "。粘贴回来的浏览器地址与浏览器会话绑定（验证 Cookie 在浏览器里，"
+                    "插件会话里没有），插件通常无法复用，HTTP 401 属于这一类；"
+                    "请改用「账号密码登录」或扫码登录",
                 )
     except SmsVerifyError:
         raise
@@ -2095,6 +2098,916 @@ async def _finish_cookie_login(cookie_text: str) -> dict:
 """,
 )
 
+
+
+
+# ═══════════════ 第 F 段：账号密码 + 验证码登录（1.0.12） ═══════════════
+# 新增的四个 OTP 端点与手动 Cookie 登录端点。注意：这一段必须在第 E 段之后，
+# 因为它复用 E 段建立的 _probe_devices_with_token / _persist_sms_credentials。
+replace_exact(
+    'xiaomi otp login: password + code in one session, plus manual cookie login',
+    r'''# ──────────────── HA 设备列表 ────────────────
+''',
+    r"""# ──────────────── 账号密码 + 验证码登录（1.0.12） ────────────────
+# 说明：本段代码由 patch_auth.py 插入 bridge.py，docstring 一律用三单引号。
+# 协议来自 miservice 2.4+/3.x 的 _verify_otp（MiIO 抓包注释）：验证必须在
+# 同一个 aiohttp 会话里完成，换会话或换浏览器都会让验证结果失效；这也是
+# 1.0.11「浏览器验证 + 粘贴回调地址」稳定 401 的根因。本段只复用
+# miservice_fork==2.9.3 已有的 _serviceLogin / _securityTokenService，不换库。
+
+OTP_ACCOUNT_BASE = "https://account.xiaomi.com"
+OTP_VERIFY_HOST = "account.xiaomi.com"
+OTP_TTL_SECONDS = 300            # 一次验证会话的有效期（秒）
+OTP_RESEND_COOLDOWN = 60         # 「获取验证码」的冷却时间（秒）
+OTP_MAX_ATTEMPTS = 5             # 一个验证会话最多允许输错几次
+OTP_JSON_PREFIX = "&&&START&&&"  # account.xiaomi.com 的 JSON 前缀
+OTP_FLAG_PHONE = 4
+OTP_FLAG_EMAIL = 8
+OTP_USER_AGENT = (
+    "APP/com.xiaomi.mihome APPV/11.3.203 iosPassportSDK/4.2.50 "
+    "DEV/aVBob25l DEVS/aU9T L/zh_CN"
+)
+# 这些失败意味着协议/安全边界对不上，必须丢弃会话并让用户重新开始；
+# 网络类错误与「验证码输错」都不在此列。
+OTP_STATE_BREAKING_ERRORS = frozenset({
+    "bad_json", "no_location", "unsafe_location", "location_http",
+    "resume_failed", "missing_credentials", "no_service_token",
+    "verify_http", "bad_notification_url", "no_notification_url",
+    "no_context", "no_flag", "auth_start_http", "identity_list_http",
+})
+
+_otp_session = None
+_otp_login: dict = {}
+
+
+class OtpFlowError(Exception):
+    '''Typed OTP failure: stable action/code for the UI, safe message for logs.'''
+
+    def __init__(self, action: str, code: str, message: str):
+        super().__init__(message)
+        self.action = action
+        self.code = code
+        self.message = message
+
+
+def _otp_int(value, default: int = 0) -> int:
+    '''Best effort int conversion for the loosely typed Xiaomi fields.'''
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _otp_field(payload, key: str):
+    '''Read one field from a Xiaomi response, tolerating a nested "data" object.'''
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get(key)
+    if value not in (None, ""):
+        return value
+    nested = payload.get("data")
+    if isinstance(nested, dict):
+        value = nested.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _otp_json(raw) -> dict:
+    '''Parse an account.xiaomi.com JSON body (it may carry a &&&START&&& prefix).'''
+    if isinstance(raw, (bytes, bytearray)):
+        text = bytes(raw).decode("utf-8", "replace")
+    else:
+        text = str(raw or "")
+    text = text.strip()
+    if text.startswith(OTP_JSON_PREFIX):
+        text = text[len(OTP_JSON_PREFIX):].strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except Exception:
+        raise OtpFlowError(
+            "unsupported", "bad_json",
+            "小米返回了无法解析的响应（不是预期的 JSON），无法继续验证；请改用扫码登录",
+        ) from None
+    if not isinstance(payload, dict):
+        raise OtpFlowError(
+            "unsupported", "bad_json",
+            "小米返回了无法解析的响应（不是预期的 JSON），无法继续验证；请改用扫码登录",
+        )
+    return payload
+
+
+def _otp_age_seconds() -> int:
+    '''Age of the pending verification session, -1 when there is none.'''
+    created = _otp_login.get("created_at")
+    if not created:
+        return -1
+    return int(time.time() - float(created))
+
+
+def _otp_is_fresh() -> bool:
+    '''A verification session is open and still inside its TTL.'''
+    session = _otp_session
+    if not _otp_login.get("username") or session is None:
+        return False
+    if getattr(session, "closed", False):
+        return False
+    age = _otp_age_seconds()
+    return 0 <= age < OTP_TTL_SECONDS
+
+
+async def _close_otp_session() -> None:
+    '''Close (and forget) the session that holds the Xiaomi verification state.'''
+    global _otp_session
+    session = _otp_session
+    _otp_session = None
+    if session is not None and not getattr(session, "closed", False):
+        try:
+            await session.close()
+        except Exception as e:
+            log.debug("关闭小米验证会话失败: %s", e)
+
+
+def _clear_otp_login() -> None:
+    '''Drop the pending OTP state; the caller closes the session first.'''
+    global _otp_session
+    _otp_login.clear()
+    _otp_session = None
+
+
+async def _reset_otp_state() -> None:
+    '''Close the pending OTP session and forget everything about it.'''
+    await _close_otp_session()
+    _clear_otp_login()
+
+
+async def _drop_expired_otp() -> bool:
+    '''Drop a stale OTP state (TTL expired). Returns True when it was dropped.'''
+    if not _otp_login:
+        return False
+    age = _otp_age_seconds()
+    if 0 <= age < OTP_TTL_SECONDS and _otp_session is not None:
+        return False
+    await _reset_otp_state()
+    return True
+
+
+def _otp_pending_payload() -> dict:
+    '''Public view of the pending OTP state: never contains secrets.'''
+    now = time.time()
+    cooldown_until = float(_otp_login.get("cooldown_until") or 0.0)
+    remaining = max(0, OTP_TTL_SECONDS - max(0, _otp_age_seconds()))
+    return {
+        "ok": True,
+        "need_otp": True,
+        "method": str(_otp_login.get("method") or ""),
+        "phone_hint": str(_otp_login.get("phone_hint") or ""),
+        "expires_in": remaining,
+        "can_resend_in": int(cooldown_until - now) if cooldown_until > now else 0,
+        "sent": bool(_otp_login.get("sent")),
+        "attempts_left": max(0, OTP_MAX_ATTEMPTS - _otp_int(_otp_login.get("attempts"))),
+        "msg": "需要验证码：请点击「获取验证码」，收到后输入并提交",
+    }
+
+
+def _otp_mask_hint(identity) -> str:
+    '''Mask the phone/email hint from /identity/list (never echo it raw).'''
+    for key in ("maskedPhone", "phone", "mobile", "maskedMobile"):
+        value = _otp_field(identity, key)
+        if not value:
+            continue
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if len(digits) >= 7:
+            return digits[:3] + "****" + digits[-4:]
+    for key in ("maskedEmail", "email"):
+        text = str(_otp_field(identity, key) or "").strip()
+        if "@" in text:
+            local, _, domain = text.partition("@")
+            return (local[:1] or "*") + "***@" + domain
+    return ""
+
+
+def _otp_normalize_notification_url(raw: str) -> str:
+    '''Accept only an https Xiaomi URL as the verification start page.'''
+    from urllib.parse import urlsplit, urlunsplit
+    text = str(raw or "").strip()
+    if not text:
+        raise OtpFlowError(
+            "unsupported", "no_notification_url",
+            "小米要求额外验证但没有返回验证链接，无法在本页面完成；请改用扫码登录",
+        )
+    if text.startswith("//"):
+        text = "https:" + text
+    elif text.startswith("https//"):
+        text = text.replace("https//", "https://", 1)
+    elif text.startswith("/"):
+        text = OTP_ACCOUNT_BASE + text
+    elif not text.lower().startswith(("http://", "https://")):
+        text = OTP_ACCOUNT_BASE + "/" + text
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except Exception:
+        raise OtpFlowError(
+            "unsupported", "bad_notification_url",
+            "小米返回的验证链接无法解析，已拒绝使用；请改用扫码登录",
+        ) from None
+    host = (parts.hostname or "").lower()
+    trusted = (
+        host == OTP_VERIFY_HOST
+        or host.endswith(".xiaomi.com")
+        or host.endswith(".mi.com")
+    )
+    if (parts.scheme.lower() != "https" or parts.username or parts.password
+            or port not in (None, 443) or not trusted):
+        raise OtpFlowError(
+            "unsupported", "bad_notification_url",
+            "小米返回的验证链接不是受信任的 HTTPS 地址，已拒绝使用；请改用扫码登录",
+        )
+    return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+
+
+def _otp_normalize_location(location: str) -> str:
+    '''Return the post-verification URL only when it is https on account.xiaomi.com.'''
+    from urllib.parse import urlsplit, urlunsplit
+    text = str(location or "").strip()
+    if not text:
+        raise OtpFlowError(
+            "unsupported", "no_location",
+            "小米没有返回验证完成后的跳转地址，无法继续登录；请改用扫码登录",
+        )
+    if text.startswith("//"):
+        # scheme-relative: only the exact account host may survive the allowlist below
+        text = "https:" + text
+    elif text.startswith("/"):
+        text = OTP_ACCOUNT_BASE + text
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except Exception:
+        raise OtpFlowError(
+            "unsupported", "unsafe_location",
+            "小米返回的跳转地址无法解析，已拒绝跟随；请改用扫码登录",
+        ) from None
+    host = (parts.hostname or "").lower()
+    if (parts.scheme.lower() != "https" or host != OTP_VERIFY_HOST
+            or parts.username or parts.password or port not in (None, 443)):
+        raise OtpFlowError(
+            "unsupported", "unsafe_location",
+            "小米返回的跳转地址不是 HTTPS 的 " + OTP_VERIFY_HOST
+            + "，已拒绝跟随（避免凭据外泄）；请改用扫码登录",
+        )
+    return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+
+
+async def _otp_request(session, method: str, url: str, **kwargs):
+    '''One request on the OTP session; redirects are never followed.'''
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        if method == "POST":
+            context = session.post(url, timeout=timeout, allow_redirects=False, **kwargs)
+        else:
+            context = session.get(url, timeout=timeout, allow_redirects=False, **kwargs)
+        async with context as resp:
+            status = int(getattr(resp, "status", 0) or 0)
+            raw = await resp.read()
+    except OtpFlowError:
+        raise
+    except Exception as e:
+        log.warning("小米验证请求失败 (%s)", type(e).__name__)
+        raise OtpFlowError(
+            "retry", "network", "访问小米账号服务失败（网络错误），请稍后重试"
+        ) from None
+    return status, raw
+
+
+async def _otp_request_json(session, method: str, url: str, stage: str, **kwargs) -> dict:
+    '''Request + parse, mapping HTTP failures onto an explicit typed error.'''
+    status, raw = await _otp_request(session, method, url, **kwargs)
+    if status >= 400:
+        log.warning("小米验证请求返回 HTTP %s (stage=%s)", status, stage)
+        raise OtpFlowError(
+            "unsupported", stage + "_http",
+            "小米账号服务返回 HTTP " + str(status) + "（" + stage + "），无法继续验证；请改用扫码登录",
+        )
+    return _otp_json(raw)
+
+
+async def _otp_finish_login(account, resp: dict, device_id: str,
+                            username: str, password: str) -> list:
+    '''Exchange the service token, probe the speakers, then persist. Never writes on failure.'''
+    ssecurity = str(resp.get("ssecurity") or "")
+    location = str(resp.get("location") or "")
+    nonce = str(resp.get("nonce") or "")
+    if not ssecurity or not location or not nonce:
+        raise OtpFlowError(
+            "unsupported", "resume_failed",
+            "登录响应缺少必要字段（ssecurity/location/nonce），无法完成登录；请改用扫码登录",
+        )
+    service_token = str(await account._securityTokenService(location, nonce, ssecurity) or "").strip()
+    if not service_token:
+        raise OtpFlowError(
+            "unsupported", "no_service_token",
+            "小米没有返回 serviceToken，登录未完成；请改用扫码登录",
+        )
+    creds = {
+        "userId": str(resp.get("userId") or ""),
+        "passToken": str(resp.get("passToken") or ""),
+        "deviceId": str(resp.get("deviceId") or device_id or ""),
+        "ssecurity": ssecurity,
+        "serviceToken": service_token,
+    }
+    missing = _missing_credentials(creds)
+    if missing:
+        raise OtpFlowError(
+            "unsupported", "missing_credentials",
+            "登录响应缺少 " + "、".join(missing) + "，未保存任何凭据",
+        )
+    devices = await _probe_devices_with_token(username, password, creds)
+    _persist_sms_credentials(creds)
+    return list(devices or [])
+
+
+async def _otp_open_verification(session, account, device_id: str, resp: dict,
+                                 username: str, password: str) -> dict:
+    '''Steps 1-2 of the OTP protocol: open the session, discover the method.'''
+    global _otp_session
+    from urllib.parse import urlsplit, parse_qs, urlencode
+    notification = str(resp.get("notificationUrl") or "").strip()
+    if not notification:
+        raise OtpFlowError(
+            "unsupported", "no_notification_url",
+            "小米要求额外验证但没有返回验证链接，无法在本页面完成；请改用扫码登录",
+        )
+    ntf_url = _otp_normalize_notification_url(notification)
+    query = parse_qs(urlsplit(ntf_url).query)
+    context = str((query.get("context") or [""])[0] or "").strip()
+    sid = str((query.get("sid") or ["micoapi"])[0] or "micoapi").strip() or "micoapi"
+    if not context:
+        raise OtpFlowError(
+            "unsupported", "no_context",
+            "小米返回的验证链接缺少 context 参数，无法启动验证码验证；请改用扫码登录",
+        )
+    headers = {"User-Agent": OTP_USER_AGENT}
+    # 每次请求都显式带上 deviceId：验证状态只认这个会话，cookie 值必须是字符串
+    cookies = {"deviceId": str(device_id)}
+    log.info("OTP 登录：打开小米验证会话（stage=auth_start）")
+    status, _raw = await _otp_request(session, "GET", ntf_url, headers=headers, cookies=cookies)
+    if status >= 400:
+        log.warning("打开小米验证页面返回 HTTP %s", status)
+        raise OtpFlowError(
+            "unsupported", "auth_start_http",
+            "打开小米验证页面失败（HTTP " + str(status) + "）；请改用扫码登录",
+        )
+    list_url = OTP_ACCOUNT_BASE + "/identity/list?" + urlencode({
+        "sid": sid,
+        "supportedMask": 0,
+        "_locale": "zh_CN",
+        "context": context,
+    })
+    identity = await _otp_request_json(
+        session, "GET", list_url, "identity_list", headers=headers, cookies=cookies
+    )
+    flag = _otp_int(_otp_field(identity, "flag"), 0)
+    if flag not in (OTP_FLAG_PHONE, OTP_FLAG_EMAIL):
+        log.warning("OTP 登录：小米没有返回可用的验证方式 (flag=%s)", flag)
+        raise OtpFlowError(
+            "unsupported", "no_flag",
+            "小米没有返回可用的验证方式（flag），无法发送验证码；请改用扫码登录",
+        )
+    method = "Phone" if flag == OTP_FLAG_PHONE else "Email"
+    _otp_login.update({
+        "username": username,
+        "password": password,
+        "session": session,
+        "context": context,
+        "sid": sid,
+        "flag": flag,
+        "method": method,
+        "device_id": device_id,
+        "phone_hint": _otp_mask_hint(identity),
+        "created_at": time.time(),
+        "attempts": 0,
+        "sent": False,
+        "cooldown_until": 0.0,
+    })
+    _otp_session = session
+    has_hint = bool(_otp_login.get("phone_hint"))
+    log.info("OTP 登录：已建立验证会话 (method=%s, hint=%s)", method,
+             "yes" if has_hint else "no")
+    return {
+        "ok": True,
+        "need_otp": True,
+        "method": method,
+        "phone_hint": str(_otp_login.get("phone_hint") or ""),
+        "expires_in": OTP_TTL_SECONDS,
+        "can_resend_in": 0,
+        "sent": False,
+        "attempts_left": OTP_MAX_ATTEMPTS,
+        "msg": ("需要短信验证码：请点击「获取验证码」" if method == "Phone"
+                else "该账号要求邮箱验证码，本版本暂不支持，请改用扫码登录"),
+    }
+
+
+async def _otp_password_login(username: str, password: str) -> dict:
+    '''One password login attempt (never sends a code by itself).'''
+    from miservice import MiAccount
+    from miservice.miaccount import get_random
+    import hashlib
+    session = aiohttp.ClientSession()
+    keep_session = False
+    try:
+        account = MiAccount(session, username, password, None)
+        token = getattr(account, "token", None)
+        if not isinstance(token, dict):
+            token = {}
+        account.token = token
+        device_id = str(token.get("deviceId") or "").strip() or get_random(16).upper()
+        token["deviceId"] = device_id
+        log.info("OTP 登录：提交密码登录（stage=service_login）")
+        resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+        if _otp_int(resp.get("code"), 0) != 0:
+            payload = {
+                "_json": "true",
+                "qs": resp.get("qs", ""),
+                "sid": resp.get("sid", ""),
+                "_sign": resp.get("_sign", ""),
+                "callback": resp.get("callback", ""),
+                "user": username,
+                "hash": hashlib.md5(password.encode("utf-8")).hexdigest().upper(),
+            }
+            log.info("OTP 登录：提交密码校验（stage=service_login_auth2）")
+            resp = await account._serviceLogin("serviceLoginAuth2", payload)
+        code = _otp_int(resp.get("code"), -1)
+        if code != 0:
+            desc = str(resp.get("description") or resp.get("desc") or "小米拒绝了本次登录")
+            message = desc + " (code:" + str(code) + ")"
+            hint = _ERROR_HINTS.get(code, "")
+            if hint:
+                message += "\n" + hint
+            log.info("OTP 登录：密码登录失败 (code=%s)", code)
+            return {"ok": False, "action": "login_failed", "msg": message}
+        if (str(resp.get("notificationUrl") or "").strip()
+                or (_otp_int(resp.get("securityStatus"), 0) & 16)):
+            result = await _otp_open_verification(
+                session, account, device_id, resp, username, password
+            )
+            keep_session = True
+            return result
+        log.info("OTP 登录：账号无需二次验证，直接完成登录")
+        devices = await _otp_finish_login(account, resp, device_id, username, password)
+        return {
+            "ok": True,
+            "verified": True,
+            "devices": devices,
+            "msg": "登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                               else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+        }
+    except OtpFlowError as e:
+        log.warning("OTP 登录失败 (code=%s)", e.code)
+        return {"ok": False, "action": e.action, "msg": e.message}
+    except SmsVerifyError as e:
+        log.warning("OTP 登录：设备校验失败 (code=%s)", e.code)
+        return {"ok": False, "action": "verify_failed", "msg": e.message}
+    except Exception as e:
+        log.warning("OTP 登录异常 (%s)", type(e).__name__)
+        return {"ok": False, "action": "failed", "msg": "登录请求失败（未预期的响应），请稍后重试或改用扫码登录"}
+    finally:
+        if not keep_session:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+
+async def _otp_start(req) -> dict:
+    '''Resolve the credentials (form or saved), then run one password login.'''
+    try:
+        from miservice import MiAccount  # noqa: F401  依赖检查
+    except ImportError:
+        return {"ok": False, "action": "failed", "msg": "缺少依赖: pip install miservice"}
+    username = str(getattr(req, "username", "") or "").strip()
+    password = str(getattr(req, "password", "") or "")
+    use_saved = bool(getattr(req, "use_saved", False))
+    mi = (load_config() or {}).get("xiaomi") or {}
+    if use_saved or not username or not password or password == "••••••••":
+        if not username:
+            username = str(mi.get("username") or "").strip()
+        if not password or password == "••••••••":
+            password = str(mi.get("password") or "")
+    if not username or not password:
+        return {
+            "ok": False,
+            "action": "missing_credentials",
+            "msg": "请先填写小米账号和密码（或使用扫码登录）",
+        }
+    if await _drop_expired_otp():
+        log.info("OTP 登录：上一次验证会话已过期并已清理")
+    if _otp_is_fresh():
+        return _otp_pending_payload()
+    await _reset_otp_state()
+    return await _otp_password_login(username, password)
+
+
+async def _otp_wrong_code(desc: str) -> dict:
+    '''Count one rejected code; drop the session when the budget is exhausted.'''
+    attempts = _otp_int(_otp_login.get("attempts"), 0) + 1
+    _otp_login["attempts"] = attempts
+    left = max(0, OTP_MAX_ATTEMPTS - attempts)
+    log.info("OTP 登录：验证码被拒绝 (attempt=%s)", attempts)
+    if left <= 0:
+        await _reset_otp_state()
+        return {
+            "ok": False,
+            "action": "restart",
+            "attempts_left": 0,
+            "msg": "验证码连续错误 " + str(attempts) + " 次，已结束本次验证，请重新点击「登录」",
+        }
+    detail = ("：" + desc) if desc else ""
+    return {
+        "ok": False,
+        "action": "retry_code",
+        "attempts_left": left,
+        "msg": "验证码不正确" + detail + "，还可尝试 " + str(left) + " 次",
+    }
+
+
+async def _otp_verify_code(code: str) -> dict:
+    '''Steps 6-9: submit the code, resume in the same session, validate, persist.'''
+    code = str(code or "").strip()
+    if await _drop_expired_otp() or not _otp_login:
+        return {
+            "ok": False,
+            "action": "restart",
+            "msg": "验证会话已失效（有效期 " + str(OTP_TTL_SECONDS // 60) + " 分钟），请重新点击「登录」",
+        }
+    if not _otp_is_fresh():
+        await _reset_otp_state()
+        return {
+            "ok": False,
+            "action": "restart",
+            "msg": "验证会话已失效（有效期 " + str(OTP_TTL_SECONDS // 60) + " 分钟），请重新点击「登录」",
+        }
+    method = str(_otp_login.get("method") or "")
+    flag = _otp_int(_otp_login.get("flag"), 0)
+    if method not in ("Phone", "Email"):
+        await _reset_otp_state()
+        return {"ok": False, "action": "restart", "msg": "验证会话状态异常，请重新点击「登录」"}
+    if not code.isdigit() or not (4 <= len(code) <= 8):
+        return {
+            "ok": False,
+            "action": "retry_code",
+            "attempts_left": max(0, OTP_MAX_ATTEMPTS - _otp_int(_otp_login.get("attempts"))),
+            "msg": "验证码应为 4-8 位数字",
+        }
+    session = _otp_session
+    if session is None or getattr(session, "closed", False):
+        await _reset_otp_state()
+        return {"ok": False, "action": "restart", "msg": "验证会话已关闭，请重新点击「登录」"}
+    headers = {"User-Agent": OTP_USER_AGENT}
+    cookies = {"deviceId": str(_otp_login.get("device_id") or "")}
+    verify_url = (OTP_ACCOUNT_BASE + "/identity/auth/verify" + method
+                  + "?_dc=" + str(int(time.time() * 1000)))
+    log.info("OTP 登录：提交验证码（stage=verify_code）")
+    status, raw = await _otp_request(
+        session, "POST", verify_url, headers=headers, cookies=cookies,
+        data={"_flag": str(flag), "ticket": code, "trust": "false", "_json": "true"},
+    )
+    if status >= 400:
+        log.warning("提交验证码返回 HTTP %s", status)
+        raise OtpFlowError(
+            "unsupported", "verify_http",
+            "小米拒绝了验证码提交（HTTP " + str(status) + "），请重新点击「登录」",
+        )
+    payload = _otp_json(raw) if raw else {}
+    location = str(_otp_field(payload, "location") or "").strip()
+    description = str(payload.get("description") or payload.get("desc") or "").strip()
+    if not location:
+        rejection = _otp_int(payload.get("code"), 0)
+        if rejection != 0 or description:
+            return await _otp_wrong_code(description)
+        raise OtpFlowError(
+            "unsupported", "no_location",
+            "小米未返回验证完成后的跳转地址（响应格式不符合预期），无法继续登录；请改用扫码登录",
+        )
+    target = _otp_normalize_location(location)
+    log.info("OTP 登录：验证通过，打开跳转地址（stage=follow_location）")
+    status, _raw = await _otp_request(session, "GET", target, headers=headers, cookies=cookies)
+    if status >= 400:
+        log.warning("打开验证跳转地址返回 HTTP %s", status)
+        raise OtpFlowError(
+            "unsupported", "location_http",
+            "验证通过后打开小米跳转地址失败（HTTP " + str(status) + "），请重新点击「登录」",
+        )
+    from miservice import MiAccount
+    username = str(_otp_login.get("username") or "")
+    password = str(_otp_login.get("password") or "")
+    device_id = str(_otp_login.get("device_id") or "")
+    account = MiAccount(session, username, password, None)
+    token = getattr(account, "token", None)
+    if not isinstance(token, dict):
+        token = {}
+    account.token = token
+    token["deviceId"] = device_id or str(token.get("deviceId") or "")
+    log.info("OTP 登录：在同一会话内恢复登录（stage=resume_login）")
+    resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+    if _otp_int(resp.get("code"), -1) != 0:
+        raise OtpFlowError(
+            "unsupported", "resume_failed",
+            "验证码已通过，但恢复登录失败（小米未返回成功响应），请重新点击「登录」",
+        )
+    devices = await _otp_finish_login(account, resp, device_id, username, password)
+    await _reset_otp_state()
+    log.info("OTP 登录成功，发现 %d 台设备", len(devices))
+    return {
+        "ok": True,
+        "verified": True,
+        "devices": devices,
+        "msg": "登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                           else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+    }
+
+
+async def _otp_send_code() -> dict:
+    '''Steps 3-4: send the code on explicit request, with the resend cooldown.'''
+    if await _drop_expired_otp() or not _otp_login:
+        return {
+            "ok": False,
+            "action": "restart",
+            "msg": "验证会话已失效（有效期 " + str(OTP_TTL_SECONDS // 60) + " 分钟），请重新点击「登录」",
+        }
+    if not _otp_is_fresh():
+        await _reset_otp_state()
+        return {
+            "ok": False,
+            "action": "restart",
+            "msg": "验证会话已失效（有效期 " + str(OTP_TTL_SECONDS // 60) + " 分钟），请重新点击「登录」",
+        }
+    now = time.time()
+    cooldown_until = float(_otp_login.get("cooldown_until") or 0.0)
+    if now < cooldown_until:
+        retry_after = int(cooldown_until - now)
+        if retry_after < 1:
+            retry_after = 1
+        return {
+            "ok": False,
+            "action": "wait",
+            "retry_after": retry_after,
+            "msg": "验证码刚发送过，请 " + str(retry_after) + " 秒后再试",
+        }
+    method = str(_otp_login.get("method") or "")
+    flag = _otp_int(_otp_login.get("flag"), 0)
+    if method != "Phone":
+        return {
+            "ok": False,
+            "action": "unsupported",
+            "msg": "该账号要求邮箱验证码，本版本暂不支持；请改用扫码登录或手动 Cookie 登录",
+        }
+    session = _otp_session
+    if session is None or getattr(session, "closed", False):
+        await _reset_otp_state()
+        return {"ok": False, "action": "restart", "msg": "验证会话已关闭，请重新点击「登录」"}
+    headers = {"User-Agent": OTP_USER_AGENT}
+    cookies = {"deviceId": str(_otp_login.get("device_id") or "")}
+    log.info("OTP 登录：触发手机验证码（stage=verify_phone）")
+    await _otp_request_json(
+        session, "GET",
+        OTP_ACCOUNT_BASE + "/identity/auth/verifyPhone?_flag=" + str(flag) + "&_json=true",
+        "verify_phone", headers=headers, cookies=cookies,
+    )
+    log.info("OTP 登录：请求发送验证码（stage=send_phone_ticket）")
+    status, raw = await _otp_request(
+        session, "POST", OTP_ACCOUNT_BASE + "/identity/auth/sendPhoneTicket",
+        headers=headers, cookies=cookies,
+        data={"retry": "0", "icode": "", "_json": "true"},
+    )
+    if status >= 400:
+        log.warning("发送验证码返回 HTTP %s", status)
+        raise OtpFlowError(
+            "unsupported", "send_ticket_http",
+            "小米拒绝了验证码发送请求（HTTP " + str(status) + "），请稍后重试或改用扫码登录",
+        )
+    payload = _otp_json(raw) if raw else {}
+    code = payload.get("code")
+    if code not in (0, None, "", "0"):
+        desc = str(payload.get("description") or payload.get("desc") or "").strip()
+        log.warning("发送验证码被拒绝 (code=%s)", code)
+        raise OtpFlowError(
+            "unsupported", "send_ticket_rejected",
+            "小米拒绝了验证码发送" + ("（" + desc + "）" if desc else "")
+            + "，请稍后重试或改用扫码登录",
+        )
+    _otp_login["sent"] = True
+    _otp_login["cooldown_until"] = time.time() + OTP_RESEND_COOLDOWN
+    hint = str(_otp_login.get("phone_hint") or "")
+    log.info("OTP 登录：验证码已请求发送 (cooldown=%ss)", OTP_RESEND_COOLDOWN)
+    return {
+        "ok": True,
+        "sent": True,
+        "can_resend_in": OTP_RESEND_COOLDOWN,
+        "msg": "验证码已发送" + ("到 " + hint if hint else "")
+               + "，有效期 " + str(OTP_TTL_SECONDS // 60) + " 分钟",
+    }
+
+
+class OtpStartRequest(BaseModel):
+    username: str = ""
+    password: str = ""
+    use_saved: bool = False
+
+
+class OtpVerifyRequest(BaseModel):
+    code: str = ""
+
+
+class CookieLoginRequest(BaseModel):
+    cookie_text: str = ""
+
+
+@app.post("/api/test/xiaomi/otp/start")
+async def xiaomi_otp_start(req: OtpStartRequest):
+    '''Password login; when Xiaomi asks for a second factor, open an OTP session.'''
+    lock = _sms_lock_obj()
+    if lock.locked():
+        return {"ok": False, "action": "busy", "msg": "上一次验证仍在处理中，请稍候再试"}
+    async with lock:
+        try:
+            return await _otp_start(req)
+        except OtpFlowError as e:
+            log.warning("OTP 启动失败 (code=%s)", e.code)
+            await _reset_otp_state()
+            return {"ok": False, "action": e.action, "msg": e.message}
+        except Exception as e:
+            log.warning("OTP 启动异常 (%s)", type(e).__name__)
+            await _reset_otp_state()
+            return {"ok": False, "action": "failed", "msg": "登录请求失败（未预期的响应），请稍后重试或改用扫码登录"}
+
+
+@app.post("/api/test/xiaomi/otp/send")
+async def xiaomi_otp_send():
+    '''Send the code only when the user explicitly asks for it (with a cooldown).'''
+    lock = _sms_lock_obj()
+    if lock.locked():
+        return {"ok": False, "action": "busy", "msg": "上一次验证仍在处理中，请稍候再试"}
+    async with lock:
+        try:
+            return await _otp_send_code()
+        except OtpFlowError as e:
+            log.warning("发送验证码失败 (code=%s)", e.code)
+            return {"ok": False, "action": e.action, "msg": e.message}
+        except Exception as e:
+            log.warning("发送验证码异常 (%s)", type(e).__name__)
+            return {"ok": False, "action": "failed", "msg": "发送验证码失败（未预期的响应），请稍后重试"}
+
+
+@app.post("/api/test/xiaomi/otp/verify")
+async def xiaomi_otp_verify(req: OtpVerifyRequest):
+    '''Submit the code, resume the login in the same session, then persist.'''
+    lock = _sms_lock_obj()
+    if lock.locked():
+        return {"ok": False, "action": "busy", "msg": "上一次验证仍在处理中，请稍候再试"}
+    async with lock:
+        try:
+            return await _otp_verify_code(str(getattr(req, "code", "") or ""))
+        except OtpFlowError as e:
+            log.warning("OTP 验证失败 (code=%s)", e.code)
+            if e.code in OTP_STATE_BREAKING_ERRORS:
+                await _reset_otp_state()
+            return {"ok": False, "action": e.action, "msg": e.message}
+        except SmsVerifyError as e:
+            log.warning("OTP 验证：设备校验失败 (code=%s)", e.code)
+            return {"ok": False, "action": "verify_failed", "msg": e.message}
+        except Exception as e:
+            log.warning("OTP 验证异常 (%s)", type(e).__name__)
+            return {"ok": False, "action": "unsupported", "msg": "验证码提交失败（未预期的响应），请重新点击「登录」或改用扫码登录"}
+
+
+@app.post("/api/test/xiaomi/otp/restart")
+async def xiaomi_otp_restart():
+    '''Drop the pending verification session; restarting is always a user action.'''
+    await _reset_otp_state()
+    log.info("OTP 登录：已按用户请求重新开始")
+    return {"ok": True, "restarted": True, "msg": "已清除本次验证会话，请重新点击「登录」"}
+
+
+@app.post("/api/test/xiaomi/cookie-login")
+async def xiaomi_cookie_login(req: CookieLoginRequest):
+    '''Use a pasted browser Cookie only after the speaker API confirms it.'''
+    raw = str(getattr(req, "cookie_text", "") or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "action": "fix_cookie",
+            "msg": "请粘贴完整的浏览器 Cookie（形如 userId=...; passToken=...）",
+        }
+    from http.cookies import SimpleCookie
+    sc = SimpleCookie()
+    try:
+        sc.load(raw)
+    except Exception:
+        return {
+            "ok": False,
+            "action": "fix_cookie",
+            "msg": "Cookie 格式无法解析，请重新复制（应形如 userId=...; passToken=...）",
+        }
+    cookies = {key: morsel.value for key, morsel in sc.items()}
+    if not cookies:
+        return {
+            "ok": False,
+            "action": "fix_cookie",
+            "msg": "没有从粘贴内容里解析出任何 Cookie，请确认复制的是完整 Cookie 文本",
+        }
+    missing = [key for key in ("userId", "passToken")
+               if not str(cookies.get(key) or "").strip()]
+    if missing:
+        return {
+            "ok": False,
+            "action": "fix_cookie",
+            "msg": "Cookie 缺少 " + "、".join(missing)
+                   + "：userId 与 passToken 都是必需的（只复制到其中一个说明复制不完整）",
+        }
+    user_id = str(cookies.get("userId") or "").strip()
+    pass_token = str(cookies.get("passToken") or "").strip()
+    device_id = str(cookies.get("deviceId") or "").strip()
+    service_token = str(cookies.get("serviceToken") or "").strip()
+    ssecurity = str(cookies.get("ssecurity") or "").strip()
+    log.info("Cookie 登录：收到 Cookie (serviceToken=%s)", "yes" if service_token else "no")
+    try:
+        from miservice import MiAccount
+    except ImportError:
+        return {"ok": False, "action": "failed", "msg": "缺少依赖: pip install miservice"}
+    session = None
+    try:
+        if not service_token:
+            from miservice.miaccount import get_random
+            if not device_id:
+                device_id = get_random(16).upper()
+            # 只有需要换取 serviceToken 时才建立会话；直接带 serviceToken 时不发任何请求
+            session = aiohttp.ClientSession()
+            account = MiAccount(session, "", "", None)
+            account.token = {
+                "userId": user_id,
+                "passToken": pass_token,
+                "deviceId": device_id,
+            }
+            log.info("Cookie 登录：用 userId/passToken 换取 micoapi serviceToken")
+            exchanged = False
+            try:
+                exchanged = bool(await account.login("micoapi"))
+            except Exception as e:
+                log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
+                exchanged = False
+            token = getattr(account, "token", None) or {}
+            pair = token.get("micoapi") if isinstance(token, dict) else None
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[1]:
+                ssecurity = str(ssecurity or pair[0] or "")
+                service_token = str(pair[1])
+            elif isinstance(pair, str) and pair:
+                service_token = pair
+            if not exchanged or not service_token:
+                return {
+                    "ok": False,
+                    "action": "exchange_failed",
+                    "msg": "用该 Cookie 换取 serviceToken 失败（Cookie 可能已过期或不完整），请重新登录小米账号后复制新 Cookie",
+                }
+        creds = {
+            "userId": user_id,
+            "passToken": pass_token,
+            "deviceId": device_id,
+            "ssecurity": ssecurity,
+            "serviceToken": service_token,
+        }
+        try:
+            devices = await _probe_devices_with_token("", "", creds)
+        except SmsVerifyError as e:
+            log.warning("Cookie 登录：设备校验失败 (code=%s)", e.code)
+            return {"ok": False, "action": e.code, "msg": e.message}
+        try:
+            _persist_sms_credentials(creds)
+        except Exception as e:
+            log.warning("Cookie 登录：保存凭据失败 (%s)", type(e).__name__)
+            return {"ok": False, "action": "persist_failed", "msg": "Cookie 校验通过，但保存凭据失败，请重试"}
+        await _reset_otp_state()
+        devices = list(devices or [])
+        log.info("Cookie 登录成功，发现 %d 台设备", len(devices))
+        return {
+            "ok": True,
+            "verified": True,
+            "devices": devices,
+            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+        }
+    finally:
+        if session is not None:
+            try:
+                await session.close()
+            except Exception:
+                pass
+# ──────────────── HA 设备列表 ────────────────
+""",
+)
 
 path.write_text(source, encoding="utf-8")
 print(f"Patched {path} with validated micoapi token exchange")

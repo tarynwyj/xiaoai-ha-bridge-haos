@@ -1,5 +1,63 @@
 # Changelog
 
+## 1.0.12
+
+### 登录（账号密码 + 验证码、手动 Cookie、界面重构）
+- 新增「账号密码登录」：`POST /api/test/xiaomi/otp/start` 用填写的账号密码做**一次**密码登录
+  （`serviceLogin?sid=micoapi` → `serviceLoginAuth2`，`qs/sid/_sign/callback/user/md5(password)`
+  与 MiService 一致）。小米不要求二次验证时直接换 serviceToken → 校验设备列表 → 原子保存凭据，
+  返回 `{ok:true, verified:true, devices:[...]}`。
+- 需要二次验证时，按 MiService 2.4+/3.x 的 8 步协议在**同一个 aiohttp 会话**内完成：
+  打开 `notificationUrl`（authStart）→ `/identity/list` 取 `flag`（4=手机 / 8=邮箱）→
+  用户点「获取验证码」后 `verify<Method>?_flag=` → `sendPhoneTicket`（**只有用户点击才发短信**）→
+  `verify<Method>?_dc=` 提交验证码 → 跟随响应里的 `location` → 同一会话内重跑 `serviceLogin` →
+  `_securityTokenService`（带 clientSign）→ 设备列表校验 → 复用 1.0.11 的原子保存
+  （临时文件 0600 创建、两次替换间失败回滚、`cookie_text` 兜底）。
+  新增端点：`POST /api/test/xiaomi/otp/{start,send,verify,restart}`。
+- 验证码与风控：单次验证会话 300 秒有效、发送后 60 秒冷却、最多 5 次错误；冷却内的发送请求
+  直接返回 `{ok:false, action:"wait", retry_after}`，**不产生任何小米请求**；失败、重试、
+  页面刷新都不会自动重发短信，也不会自动重新登录。
+- 只跟随 **HTTPS 且主机为 `account.xiaomi.com`** 的 `location`（相对路径补全到该主机），
+  其它协议/主机/userinfo/非 443 端口一律拒绝并关闭会话，避免把认证 Cookie 发往第三方主机；
+  所有验证请求都不跟随重定向。
+- 新增「手动 Cookie 登录」：`POST /api/test/xiaomi/cookie-login`，用 `http.cookies.SimpleCookie`
+  解析 `name=value; name=value`。空/无法解析/缺 `userId`/缺 `passToken` 分别返回
+  `action:"fix_cookie"` 与具体原因（`userId` 与 `passToken` 都是必需的）；没有 `serviceToken` 时
+  用 `MiAccount(session,"","",None)` + `account.login("micoapi")` 换取（失败 →
+  `action:"exchange_failed"`）；拿到 serviceToken 后**必须**先通过设备列表校验才写盘，
+  失败 → `action:"device_list"` 且不写任何文件。Cookie 登录在验证码会话进行中也可以使用，
+  成功后清空验证码状态。
+- 旧 `/api/test/xiaomi/verify`（粘贴浏览器跳转地址）保留为**高级兼容路径**，并修正归因：
+  原来把 HTTP 401 说成「链接可能已过期」，现在如实说明粘贴回来的地址与浏览器会话绑定
+  （验证 Cookie 在浏览器里，插件会话里没有），插件通常无法复用，HTTP 401 属于这一类；
+  建议改用账号密码或扫码登录。
+- 界面重构为三个入口：**扫码登录（推荐）**（原二维码 + 扫码按钮 + 清除登录凭据）、
+  **账号密码登录**（登录按钮 + 卡片内可折叠的验证码面板：获取验证码 / 60 秒倒计时 /
+  数字验证码输入 / 提交 / 重新开始 / 状态文本，会显示剩余尝试次数并要求重新开始）、
+  **高级选项：手动 Cookie 登录**（默认折叠的 `<details>`，含「验证 Cookie」按钮与
+  「兼容：粘贴浏览器跳转地址（可能因会话绑定返回 401，不推荐）」子块）。
+  移除「免短信」营销标签与「测试」按钮；扫码登录协议、Token 刷新、对话轮询、规则页与
+  HAOS Ingress/鉴权均未改动。
+- 新端点全部挂在现有 app 对象上、走同一套鉴权中间件；验证码流程在设备列表校验通过前
+  **不写任何文件**；进行中的验证码会话不会阻塞扫码登录，也不会阻塞 Cookie 登录。
+
+### 构建与测试
+- 新增 `test_xiaomi_login.py`（309 项检查 / 31 个场景）：密码登录直接成功、触发验证码、
+  发送冷却与「只在显式点击时发送」、同会话 8 步换 Token（含断言所有 identity/verify 请求
+  用的是同一个会话对象）、错误验证码计数与耗尽、TTL 过期、重新开始、unsupported 响应、
+  `location` 白名单（6 种恶意形式）、Cookie 登录（换取 / 直连 / 过期 / 缺字段 / 探测失败）、
+  Cookie 登录与验证码状态互不影响、日志与 JSON 响应不泄露密码/验证码/passToken/serviceToken、
+  失败不写 `/data`、前端三个入口与每个按钮实际调用的相对端点（Node + DOM stub）。
+- 该套件已纳入镜像构建期测试与 CI（host job + 镜像内 `docker run`），并加了 6 个变异体检查
+  （忽略冷却、绕过 location 白名单、先写凭据后探测设备、容忍缺失 context、Cookie 登录跳过
+  设备探测、验证时换新会话），全部被测试杀死。
+
+> ⚠️ **真实小米账号的验证码流程仍未经实机验证**：以上均为隔离环境（假 aiohttp / 假 MiService）
+> 下的回归结论。协议本身取自 MiService 2.4+/3.x 源码与 MiIO 抓包注释，但小米线上是否仍按此
+> 返回 `flag` / `location` 需要在一台真实 HAOS 上用隔离账号走一遍。失败时界面会给出明确错误
+> （`unsupported` / `retry_code` / `restart`），不会假装登录成功；扫码登录始终可用。
+> 邮箱验证码（`flag=8`）本版本只做识别，发送接口未实现，会明确返回「暂不支持」。
+
 ## 1.0.11
 
 ### 登录（短信验证闭环）

@@ -309,22 +309,299 @@ replace_exact(
 function toggleAISettings(){""",
 )
 
-# ════════════════ 短信验证登录闭环（1.0.11） ════════════════
+# ════════════════ Xiaomi 页面重构（1.0.12）：扫码 / 账号密码+验证码 / 高级 Cookie ════════════════
 replace_exact(
-    "sms verify card: callback url input and finish button",
-    '<div id="mi-sts-card" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#128241;</span>短信验证</div></div><div style="font-size:12px;color:var(--txt-muted);line-height:1.8">① 点击上方链接验证<br>② 成功后复制 Cookie 到上方输入框 &rarr; 测试</div></div>',
-    '<div id="mi-sts-card" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#128241;</span>短信验证</div></div>'
-    '<div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:10px">'
-    '① 点击上方链接，在小米页面完成短信验证<br>'
-    '② 把跳转后的完整地址粘贴到下面输入框 &rarr; 点「完成验证」<br>'
-    '（也可以直接把完整浏览器 Cookie 粘贴到上方 Cookie 输入框后点「测试」）</div>'
-    '<div class="field"><label>验证完成后的跳转地址</label>'
-    '<input id="mi-sts-url" placeholder="https://api2.mina.mi.com/sts?..."></div>'
-    '<div class="input-row" style="margin-top:8px">'
-    '<button class="btn btn-primary" id="mi-sts-submit" onclick="completeSmsVerify()">&#10003;完成验证</button>'
-    '<span id="mi-sts-status" style="font-size:11px;color:var(--txt-muted)"></span></div></div>',
+    "xiaomi login: three entries (QR / password + code / advanced cookie)",
+    r'''      <div class="card">
+        <div class="card-head"><div class="card-title"><span>&#9673;</span>登录信息</div></div>
+        <div class="form-grid">
+          <div class="field"><label>账号（手机号/邮箱）</label><input type="text" id="mi-username" placeholder="your@email.com"></div>
+          <div class="field"><label>密码</label><div class="input-row"><input type="password" id="mi-password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;"><button class="btn" onclick="testXiaomi()">&#9889;测试</button><button class="btn btn-primary" onclick="qrLogin()">&#128247;扫码</button></div></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span>&#9673;</span>Cookie登录 <span style="color:var(--green);text-transform:none;font-weight:400;font-size:10px;letter-spacing:0">免短信</span></div></div>
+        <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:10px">
+          浏览器已登录小米时直接复制 Cookie 跳过短信。<br>
+          ① 打开 <a href="https://account.xiaomi.com" target="_blank" style="color:var(--accent)">account.xiaomi.com</a><br>
+          ② <b style="color:var(--txt-secondary)">F12</b> &rarr; <b style="color:var(--txt-secondary)">Application</b> &rarr; <b style="color:var(--txt-secondary)">Cookies</b><br>
+          ③ 复制所有 Cookie（含 userId / passToken / serviceToken）<br>
+          ④ 粘贴下方 &rarr; 点「测试」
+        </div>
+        <div class="field"><label>Cookie 文本</label><textarea id="mi-cookie-text" rows="2" placeholder="userId=xxx; passToken=xxx; serviceToken=xxx; ..."></textarea></div>
+      </div>
+      <div id="mi-sts-card" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#128241;</span>短信验证</div></div><div style="font-size:12px;color:var(--txt-muted);line-height:1.8">① 点击上方链接验证<br>② 成功后复制 Cookie 到上方输入框 &rarr; 测试</div></div>
+''',
+    r"""      <div class="card" id="mi-qr-card">
+        <div class="card-head"><div class="card-title"><span>&#128247;</span>扫码登录（推荐）</div></div>
+        <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:10px">
+          用米家 App 扫码，不需要密码、也不涉及短信验证码，是最稳妥的登录方式。
+        </div>
+        <div class="input-row">
+          <button class="btn btn-primary" id="mi-qr-start" onclick="qrLogin()">&#128247; 扫码登录</button>
+          <button class="btn" onclick="clearXiaomiLogin()">&#128465; 清除登录凭据</button>
+        </div>
+        <div class="qr-box" id="qr-area" style="display:none;margin-top:12px">
+          <div style="font-size:12px;color:var(--txt-muted);margin-bottom:8px" id="qr-msg">用米家App扫码</div>
+          <img id="qr-img" src="" style="width:170px;height:170px;border:2px solid var(--border-default);border-radius:var(--r-lg);background:#fff" alt="QR">
+          <div style="margin-top:6px;font-size:11px;color:var(--txt-dim)" id="qr-status"></div>
+        </div>
+      </div>
+      <div class="card" id="mi-password-card">
+        <div class="card-head"><div class="card-title"><span>&#9673;</span>账号密码登录</div></div>
+        <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:10px">
+          小米要求二次验证时，验证码直接在这里提交，不需要打开浏览器。
+        </div>
+        <div class="form-grid">
+          <div class="field"><label>账号（手机号/邮箱）</label><input type="text" id="mi-username" placeholder="your@email.com" autocomplete="username"></div>
+          <div class="field"><label>密码</label><input type="password" id="mi-password" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="current-password"></div>
+        </div>
+        <div class="input-row" style="margin-top:10px">
+          <button class="btn btn-primary" id="mi-login-submit" onclick="startPasswordLogin()">&#128273; 登录</button>
+          <span id="mi-login-status" style="font-size:11px;color:var(--txt-muted)"></span>
+        </div>
+        <div id="mi-otp-panel" style="display:none;margin-top:12px;padding:12px;background:var(--page-bg);border:1px solid var(--border-default);border-radius:var(--r-md)">
+          <div style="font-size:12px;color:var(--txt-secondary);line-height:1.8" id="mi-otp-method"></div>
+          <div class="input-row" style="margin-top:8px">
+            <button class="btn" id="mi-otp-send" onclick="sendOtp()">获取验证码</button>
+            <span id="mi-otp-cooldown" style="font-size:11px;color:var(--txt-muted)"></span>
+          </div>
+          <div class="field" style="margin-top:8px"><label>验证码</label><input id="mi-otp-code" type="text" inputmode="numeric" maxlength="8" autocomplete="one-time-code" placeholder="4-8 位数字"></div>
+          <div class="input-row" style="margin-top:8px">
+            <button class="btn btn-primary" id="mi-otp-verify" onclick="verifyOtp()">提交验证码</button>
+            <button class="btn" id="mi-otp-restart" onclick="restartOtp()">重新开始</button>
+          </div>
+          <div id="mi-otp-status" style="font-size:12px;color:var(--txt-muted);margin-top:8px"></div>
+        </div>
+      </div>
+      <details class="card" id="mi-advanced-card">
+        <summary class="card-title"><span>&#9881;</span>高级选项：手动 Cookie 登录</summary>
+        <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin:10px 0">
+          仅在扫码与账号密码都不可用时使用：浏览器已登录小米时，可以复制 Cookie 手动登录。<br>
+          ① 打开 <a href="https://account.xiaomi.com" target="_blank" style="color:var(--accent)">account.xiaomi.com</a> 并登录<br>
+          ② <b style="color:var(--txt-secondary)">F12</b> &rarr; <b style="color:var(--txt-secondary)">Application</b> &rarr; <b style="color:var(--txt-secondary)">Cookies</b><br>
+          ③ 复制 userId 与 passToken（有 serviceToken 也可以一起复制）<br>
+          ④ 粘贴到下面 &rarr; 点「验证 Cookie」
+        </div>
+        <div class="field"><label>Cookie 文本</label><textarea id="mi-cookie-text" rows="3" placeholder="userId=xxx; passToken=xxx; serviceToken=xxx; ..."></textarea></div>
+        <div class="input-row" style="margin-top:8px">
+          <button class="btn btn-primary" id="mi-cookie-submit" onclick="verifyCookieLogin()">&#10003; 验证 Cookie</button>
+          <span id="mi-cookie-status" style="font-size:11px;color:var(--txt-muted)"></span>
+        </div>
+        <div id="mi-sts-card" style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-default)">
+          <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:8px">
+            兼容：粘贴浏览器跳转地址（可能因会话绑定返回 401，不推荐）
+          </div>
+          <div class="field"><label>验证完成后的跳转地址</label><input id="mi-sts-url" placeholder="https://api2.mina.mi.com/sts?..."></div>
+          <div class="input-row" style="margin-top:8px">
+            <button class="btn" id="mi-sts-submit" onclick="completeSmsVerify()">&#10003;完成验证</button>
+            <span id="mi-sts-status" style="font-size:11px;color:var(--txt-muted)"></span>
+          </div>
+        </div>
+      </details>
+""",
 )
 
+replace_exact(
+    "xiaomi login: drop the standalone QR card (now inside the recommended entry)",
+    r'''      <div class="card" id="qr-area" style="display:none"><div class="card-head"><div class="card-title"><span>&#128247;</span>扫码登录</div></div><div class="qr-box"><div style="font-size:12px;color:var(--txt-muted);margin-bottom:8px" id="qr-msg">用米家App扫码</div><img id="qr-img" src="" style="width:170px;height:170px;border:2px solid var(--border-default);border-radius:var(--r-lg);background:#fff" alt="QR"><div style="margin-top:6px;font-size:11px;color:var(--txt-dim)" id="qr-status"></div></div></div>
+''',
+    "",
+)
+
+replace_exact(
+    "xiaomi login: collapsed advanced card styling",
+    '.qr-box{text-align:center;padding:16px;background:var(--page-bg);border-radius:var(--r-lg);border:1px dashed var(--border-default)}',
+    """.qr-box{text-align:center;padding:16px;background:var(--page-bg);border-radius:var(--r-lg);border:1px dashed var(--border-default)}
+/* Xiaomi login (1.0.12): advanced entry stays collapsed, OTP code is spaced out */
+#mi-advanced-card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:8px}
+#mi-advanced-card>summary::-webkit-details-marker{display:none}
+#mi-otp-panel input{letter-spacing:2px;font-variant-numeric:tabular-nums}
+""",
+)
+
+# ════════════════ Xiaomi 登录脚本（1.0.12） ════════════════
+replace_exact(
+    "xiaomi login: OTP + cookie handlers",
+    "async function qrLogin(){",
+    r"""// ═══════════ Xiaomi account/password + verification code (1.0.12) ═══════════
+/* One shared state object: the panel only ever reflects what the backend said. */
+let _otp={state:'idle',sent:false,cooldown:0,timer:null};
+function otpEl(id){return document.getElementById(id);}
+function otpText(id,text){const el=otpEl(id);if(el)el.textContent=text==null?'':String(text);}
+function otpShow(show){const panel=otpEl('mi-otp-panel');if(panel)panel.style.display=show?'':'none';}
+function otpReset(){
+  if(_otp.timer){clearInterval(_otp.timer);_otp.timer=null;}
+  _otp.state='idle';_otp.sent=false;_otp.cooldown=0;
+  const code=otpEl('mi-otp-code');if(code)code.value='';
+  otpText('mi-otp-method','');otpText('mi-otp-cooldown','');otpText('mi-otp-status','');
+  const send=otpEl('mi-otp-send');if(send){send.disabled=false;send.textContent='获取验证码';}
+  otpShow(false);
+}
+function otpSetCooldown(seconds){
+  if(_otp.timer){clearInterval(_otp.timer);_otp.timer=null;}
+  _otp.cooldown=Math.max(0,Math.round(Number(seconds)||0));
+  const paint=function(){
+    const send=otpEl('mi-otp-send');
+    if(_otp.cooldown>0){
+      if(send){send.disabled=true;send.textContent='获取验证码（'+_otp.cooldown+'s）';}
+      otpText('mi-otp-cooldown','请 '+_otp.cooldown+' 秒后再获取');
+    }else{
+      if(send){send.disabled=false;send.textContent=_otp.sent?'重新获取验证码':'获取验证码';}
+      otpText('mi-otp-cooldown','');
+    }
+  };
+  paint();
+  if(_otp.cooldown>0){
+    _otp.timer=setInterval(function(){
+      _otp.cooldown=Math.max(0,_otp.cooldown-1);
+      if(_otp.cooldown<=0){clearInterval(_otp.timer);_otp.timer=null;}
+      paint();
+    },1000);
+  }
+}
+async function startPasswordLogin(){
+  const alertBox=otpEl('xiaomi-alert');
+  const username=String((otpEl('mi-username')||{}).value||'').trim();
+  const password=String((otpEl('mi-password')||{}).value||'');
+  if(!username||!password){showAlert(alertBox,'err','✗ 先填写小米账号和密码');return;}
+  otpReset();
+  otpText('mi-login-status','⟳ 正在登录小米账号...');
+  showAlert(alertBox,'warn','⟳ 正在登录小米账号...');
+  const btn=otpEl('mi-login-submit');if(btn)btn.disabled=true;
+  try{
+    const r=await fetch('/api/test/xiaomi/otp/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:username,password:password,use_saved:false})});
+    const d=await r.json();
+    if(d&&d.ok&&d.need_otp){
+      _otp.state='pending';_otp.sent=false;
+      otpShow(true);
+      const method=d.method==='Email'?'邮箱':'手机短信';
+      otpText('mi-otp-method','验证方式：'+method+(d.phone_hint?'（'+d.phone_hint+'）':''));
+      otpText('mi-otp-status','');
+      otpText('mi-login-status','');
+      otpSetCooldown(d.can_resend_in||0);
+      showAlert(alertBox,'warn','📱 '+(d.msg||'需要验证码'));
+      return;
+    }
+    if(d&&d.ok){
+      otpReset();
+      otpText('mi-login-status','');
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));
+      if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
+      return;
+    }
+    otpText('mi-login-status','');
+    showAlert(alertBox,'err','✗ '+((d&&d.msg)||'登录失败'));
+  }catch(e){
+    otpText('mi-login-status','');
+    showAlert(alertBox,'err','✗ '+e.message);
+  }finally{
+    if(btn)btn.disabled=false;
+  }
+}
+async function sendOtp(){
+  const alertBox=otpEl('xiaomi-alert');
+  if(_otp.state!=='pending'){showAlert(alertBox,'err','✗ 请先点击「登录」');return;}
+  if(_otp.cooldown>0){otpText('mi-otp-cooldown','请 '+_otp.cooldown+' 秒后再获取');return;}
+  otpText('mi-otp-status','⟳ 正在发送验证码...');
+  try{
+    const r=await fetch('/api/test/xiaomi/otp/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+    const d=await r.json();
+    if(d&&d.ok&&d.sent){
+      _otp.sent=true;
+      otpText('mi-otp-status',d.msg||'验证码已发送');
+      otpSetCooldown(d.can_resend_in||60);
+      return;
+    }
+    if(d&&d.action==='wait'){
+      otpSetCooldown(d.retry_after||60);
+      otpText('mi-otp-status',d.msg||'请稍后再试');
+      return;
+    }
+    if(d&&d.action==='restart'){
+      otpReset();
+      showAlert(alertBox,'err','✗ '+((d&&d.msg)||'验证会话已失效，请重新点击「登录」'));
+      return;
+    }
+    otpText('mi-otp-status','✗ '+((d&&d.msg)||'发送失败'));
+  }catch(e){
+    otpText('mi-otp-status','✗ '+e.message);
+  }
+}
+async function verifyOtp(){
+  const alertBox=otpEl('xiaomi-alert');
+  const codeInput=otpEl('mi-otp-code');
+  const code=String((codeInput&&codeInput.value)||'').replace(/\s+/g,'');
+  if(!/^\d{4,8}$/.test(code)){otpText('mi-otp-status','✗ 请输入 4-8 位数字验证码');return;}
+  otpText('mi-otp-status','⟳ 正在提交验证码...');
+  const btn=otpEl('mi-otp-verify');if(btn)btn.disabled=true;
+  try{
+    const r=await fetch('/api/test/xiaomi/otp/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:code})});
+    const d=await r.json();
+    if(d&&d.ok){
+      otpReset();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));
+      if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
+      return;
+    }
+    if(d&&d.action==='retry_code'){
+      const left=(typeof d.attempts_left==='number')?d.attempts_left:null;
+      otpText('mi-otp-status','✗ '+((d.msg)||'验证码不正确')+(left===null?'':'（还可尝试 '+left+' 次）'));
+      return;
+    }
+    if(d&&d.action==='restart'){
+      otpReset();
+      showAlert(alertBox,'err','✗ '+((d&&d.msg)||'验证会话已失效，请重新点击「登录」'));
+      return;
+    }
+    otpText('mi-otp-status','✗ '+((d&&d.msg)||'验证失败'));
+    if(d&&d.action==='unsupported'){showAlert(alertBox,'err','✗ '+(d.msg||'当前流程暂不支持'));}
+  }catch(e){
+    otpText('mi-otp-status','✗ '+e.message);
+  }finally{
+    if(btn)btn.disabled=false;
+  }
+}
+async function restartOtp(){
+  const alertBox=otpEl('xiaomi-alert');
+  try{
+    await fetch('/api/test/xiaomi/otp/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  }catch(e){}
+  otpReset();
+  const password=otpEl('mi-password');if(password)password.value='';
+  showAlert(alertBox,'warn','已重新开始，请重新点击「登录」获取新的验证码');
+}
+async function verifyCookieLogin(){
+  const alertBox=otpEl('xiaomi-alert');
+  const box=otpEl('mi-cookie-text');
+  const text=String((box&&box.value)||'').trim();
+  if(!text){showAlert(alertBox,'err','✗ 先粘贴小米 Cookie（至少包含 userId 与 passToken）');return;}
+  otpText('mi-cookie-status','⟳ 正在校验 Cookie...');
+  const btn=otpEl('mi-cookie-submit');if(btn)btn.disabled=true;
+  try{
+    const r=await fetch('/api/test/xiaomi/cookie-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_text:text})});
+    const d=await r.json();
+    if(d&&d.ok){
+      otpReset();
+      if(box)box.value='';
+      otpText('mi-cookie-status','');
+      showAlert(alertBox,'ok','✓ '+(d.msg||'Cookie 登录成功'));
+      if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
+      return;
+    }
+    otpText('mi-cookie-status','✗ '+((d&&d.action==='fix_cookie')?'请检查 Cookie 文本':'Cookie 可能已过期，可重试'));
+    showAlert(alertBox,'err','✗ '+((d&&d.msg)||'Cookie 登录失败'));
+  }catch(e){
+    otpText('mi-cookie-status','✗ '+e.message);
+    showAlert(alertBox,'err','✗ '+e.message);
+  }finally{
+    if(btn)btn.disabled=false;
+  }
+}
+async function qrLogin(){""",
+)
+
+# ════════════════ 兼容：旧的「粘贴浏览器跳转地址」处理函数 ════════════════
 replace_exact(
     "sms verify: finish-verification request handler",
     "async function qrLogin(){",
@@ -337,7 +614,7 @@ replace_exact(
   if(!url){showAlert(a,'err','✗ 先粘贴短信验证完成后的跳转地址');return;}
   if(st)st.textContent='⟳ 验证中，请稍候...';
   if(btn)btn.disabled=true;
-  showAlert(a,'warn','⟳ 正在完成短信验证...');
+  showAlert(a,'warn','⟳ 正在完成短信验证（兼容路径，可能失败）...');
   try{
     const r=await fetch('/api/test/xiaomi/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookie_text:url})});
     const d=await r.json();
@@ -350,7 +627,7 @@ replace_exact(
       if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
     }else{
       showAlert(a,'err','✗ '+(d.msg||'验证失败'));
-      if(st)st.textContent=(d.retry===false?'请重新点击「测试连接」':'可重试');
+      if(st)st.textContent=(d.retry===false?'请重新点击「登录」':'可重试');
     }
   }catch(e){
     showAlert(a,'err','✗ '+e.message);

@@ -716,6 +716,29 @@ def scenario_background_otp_must_not_count_as_login(root: Path):
     return "background startup requiring OTP refuses false success and closes its session"
 
 
+def scenario_atomic_timestamp_and_corruption(root: Path):
+    harness = Harness(root)
+    path = harness.cfg_path.parent / "last_timestamp.json"
+    writer = harness.namespace["_write_last_timestamp_atomic"]
+    writer(path, {"speaker-1": 123456})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"speaker-1": 123456}
+    writer(path, {"speaker-1": 123457, "speaker-2": 42})
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "speaker-1": 123457, "speaker-2": 42
+    }
+    assert not list(path.parent.glob(".last-timestamp-*")), "atomic writer left temporary files"
+    if __import__("os").name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+    path.write_text("{BROKEN", encoding="utf-8")
+    harness.run()
+    assert harness.bridge_state["running"] is False
+    assert "损坏" in str(harness.bridge_state["error"])
+    assert path.read_text(encoding="utf-8") == "{BROKEN", (
+        "corrupted timestamps may not be silently reset, or old commands could replay"
+    )
+    return "timestamps use atomic private writes and fail closed on corruption"
+
+
 def scenario_multi_entity_rules():
     intent_node = next(
         node for node in tree.body
@@ -753,6 +776,7 @@ def main():
         scenario_save_credentials_never_blank,
         scenario_post_config_credentials,
         scenario_background_otp_must_not_count_as_login,
+        scenario_atomic_timestamp_and_corruption,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

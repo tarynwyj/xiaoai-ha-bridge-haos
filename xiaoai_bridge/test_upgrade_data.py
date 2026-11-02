@@ -346,7 +346,15 @@ class FakeStack:
 
     def create_task(self, coro):
         coro.close()
-        return SimpleNamespace(done=lambda: True, cancel=lambda: None)
+
+        class FinishedTask:
+            def done(self):
+                return True
+            def cancel(self):
+                return None
+            def add_done_callback(self, callback):
+                callback(self)
+        return FinishedTask()
 
     async def poll(self, session, device_id, hardware, last_ts):
         records = self.poll_script.pop(0) if self.poll_script else []
@@ -462,7 +470,11 @@ class PatchedApp:
                 "passToken": state.get("passToken") or "pass-token-rotated",
             }
 
+        async def immediate_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
         namespace = {
+            "_delayed_tasks": set(),
             "_mi_service_login_verified": verified_service_login,
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
@@ -494,6 +506,7 @@ class PatchedApp:
             "asyncio": SimpleNamespace(
                 sleep=stack.sleep,
                 create_task=stack.create_task,
+                to_thread=immediate_thread,
                 CancelledError=real_asyncio.CancelledError,
                 TimeoutError=real_asyncio.TimeoutError,
             ),

@@ -195,6 +195,17 @@ def main() -> int:
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
+                    elif path.startswith("/api/qr/poll"):
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "done": True,
+                                                       "msg": "扫码已完成"}))
+                    elif path == "/api/test/xiaomi":
+                        state["counter"] += 1
+                        state["revisions"]["xiaomi"] = "fixture-probed-" + str(state["counter"])
+                        state["config"].setdefault("xiaomi", {})["cookie_text"] = "••••••••"
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "verified": True, "devices": [],
+                                                       "msg": "设备连接测试成功"}))
                     elif path.startswith("/api/test/xiaomi/cookie-login"):
                         state["counter"] += 1
                         state["revisions"]["xiaomi"] = "fixture-xiaomi-login-" + str(state["counter"])
@@ -597,6 +608,30 @@ def main() -> int:
                 result.check("post-login config save succeeds without 409",
                              page.evaluate("sectionRevisions.xiaomi") == state["revisions"]["xiaomi"]
                              and page.evaluate("sectionRevisions.xiaomi") != rev_after_login)
+
+                # ---------- CAS: both legacy connection test and QR follow-up rotate cookies ----------
+                for flow_name, action in (
+                    ("manual-test", "testXiaomi()"),
+                    ("qr-follow-up", "pollQrLogin()"),
+                ):
+                    reload_rules()
+                    page.click('[data-page="xiaomi"]')
+                    page.locator("#mi-username").fill("test-account")
+                    page.locator("#mi-password").fill("test-password")
+                    before = page.evaluate("sectionRevisions.xiaomi")
+                    page.evaluate(action)
+                    after = page.evaluate("sectionRevisions.xiaomi")
+                    result.check(flow_name + " refreshes the last server-side Xiaomi revision",
+                                 before != after and after == state["revisions"]["xiaomi"],
+                                 repr((before, after, state["revisions"]["xiaomi"])))
+                    page.evaluate("saveXiaomi()")
+                    last = next((p for p in reversed(posted) if p.get("section") == "xiaomi"), {})
+                    result.eq(flow_name + " sends the fresh revision on immediate save",
+                              last.get("revision"), after)
+                    result.check(flow_name + " immediate save has no 409",
+                                 page.evaluate("sectionRevisions.xiaomi")
+                                 == state["revisions"]["xiaomi"]
+                                 and state["revisions"]["xiaomi"] != after)
 
                 result.check("the test result contains no undefined", "undefined" not in test_text)
 

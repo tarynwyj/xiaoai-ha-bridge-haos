@@ -136,7 +136,12 @@ def main() -> int:
         errors: list[str] = []
         posted: list[dict] = []
         seen: dict[str, list] = {"tests": []}
-        state = {"config": json.loads(json.dumps(CONFIG))}
+        state = {
+            "config": json.loads(json.dumps(CONFIG)),
+            "revisions": {key: "fixture-" + key + "-0"
+                          for key in ("xiaomi", "ha", "rules", "adv")},
+            "counter": 0,
+        }
 
         try:
             with sync_playwright() as pw:
@@ -159,12 +164,23 @@ def main() -> int:
                         if route.request.method == "POST":
                             data = json.loads(body or "{}")
                             posted.append(data)
-                            state["config"] = data.get("config", {})
-                            route.fulfill(status=200, content_type="application/json",
-                                          body=json.dumps({"ok": True}))
+                            section = data.get("section")
+                            if data.get("revision") != state["revisions"].get(section):
+                                route.fulfill(status=409, content_type="application/json",
+                                              body=json.dumps({"ok": False,
+                                                               "code": "config_conflict"}))
+                            else:
+                                state["config"] = data.get("config", {})
+                                state["counter"] += 1
+                                state["revisions"][section] = (
+                                    "fixture-" + section + "-" + str(state["counter"]))
+                                route.fulfill(status=200, content_type="application/json",
+                                              body=json.dumps({"ok": True,
+                                                               "revision": state["revisions"][section]}))
                         else:
                             route.fulfill(status=200, content_type="application/json",
-                                          body=json.dumps(state["config"]))
+                                          body=json.dumps({**state["config"],
+                                              "_section_revisions": state["revisions"]}))
                     elif path.startswith("/api/devices"):
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
@@ -213,6 +229,9 @@ def main() -> int:
                 def reload_rules():
                     """Reload with the fixture config so a section starts from a known state."""
                     state["config"] = json.loads(json.dumps(CONFIG))
+                    state["revisions"] = {key: "fixture-" + key + "-0"
+                                          for key in ("xiaomi", "ha", "rules", "adv")}
+                    state["counter"] = 0
                     page.goto(url, wait_until="load")
                     page.click('[data-page="rules"]')
                     page.wait_for_selector("#page-rules.active")
@@ -512,6 +531,33 @@ def main() -> int:
                 result.check("rule-save posts include their scope",
                              all(p.get("section") == "rules" for p in posted),
                              repr([p.get("section") for p in posted]))
+
+                result.check("every browser rules save sends the last received CAS revision",
+                             all(bool(p.get("revision")) for p in posted),
+                             repr([p.get("revision") for p in posted]))
+
+                # ---------- CAS: two-tab stale edits never silently overwrite ----------
+                reload_rules()
+                expand(0)
+                stale_revision = page.evaluate("sectionRevisions.rules")
+                page.evaluate("() => { document.querySelector('#rule-list .rule-item .r-p').value='本地未保存修改'; }")
+                page.evaluate("() => { markRulesDirty(); }")
+                state["revisions"]["rules"] = "fixture-external-change"
+                before_post_count = len(posted)
+                click_save(rows().nth(0).locator(".rule-save"))
+                result.eq("stale browser save posts once", len(posted), before_post_count + 1)
+                result.eq("stale browser save sends original revision",
+                          posted[-1].get("revision"), stale_revision)
+                result.check("server 409 conflict displayed",
+                             "其他窗口" in page.locator("#rules-alert").inner_text(),
+                             page.locator("#rules-alert").inner_text())
+                result.check("stale browser edit stays in DOM",
+                             "本地未保存修改" in rows().nth(0).locator(".r-p").input_value())
+                result.check("rule draft stays marked as unsaved",
+                             page.locator("#rules-dirty").is_visible())
+                result.eq("409 keeps local revision unchanged",
+                          page.evaluate("sectionRevisions.rules"), stale_revision)
+
                 result.check("the test result contains no undefined", "undefined" not in test_text)
 
                 # ---------- 18. browser errors -----------

@@ -373,6 +373,36 @@ def main():
         assert cfg_scoped["intent_rules"][0]["pattern"] == "开灯"
         ok("scoped rules save preserves device aliases and Xiaomi credentials")
 
+        # A scoped Xiaomi edit must not drop hidden legacy settings that the
+        # modern UI does not render; HA edits must likewise retain extra keys.
+        cfg_before = read_config(root)
+        cfg_before["xiaomi"]["device_id"] = "legacy-speaker-id"
+        cfg_before["homeassistant"]["verify_ssl"] = True
+        bridge.save_config(cfg_before)
+        scoped_xiaomi = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "config": {
+                "xiaomi": {"username": FAKE_USER, "password": bridge.MASKED_VALUE,
+                           "cookie_text": bridge.MASKED_VALUE,
+                           "hardware": "NEW-HARDWARE"}}},
+        )
+        assert scoped_xiaomi.status_code == 200 and scoped_xiaomi.json()["ok"] is True
+        saved_xiaomi = read_config(root)
+        assert saved_xiaomi["xiaomi"]["device_id"] == "legacy-speaker-id"
+        assert saved_xiaomi["xiaomi"]["hardware"] == "NEW-HARDWARE"
+        assert saved_xiaomi["homeassistant"]["verify_ssl"] is True
+        scoped_ha = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "config": {
+                "homeassistant": {"url": "http://homeassistant:80",
+                                  "token": bridge.MASKED_VALUE}}},
+        )
+        assert scoped_ha.status_code == 200 and scoped_ha.json()["ok"] is True
+        assert read_config(root)["homeassistant"]["verify_ssl"] is True
+        assert read_config(root)["homeassistant"]["token"] == FAKE_HA_TOKEN
+        assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
+        ok("scoped Xiaomi/HA saves retain hidden settings and config stays mode 0600")
+
         # ── test rules default to pure preview; never trigger HA services ──
         preview = client.post(
             "/api/test/rule", headers=UI_HEADER,

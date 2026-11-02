@@ -195,6 +195,13 @@ def main() -> int:
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
+                    elif path.startswith("/api/test/xiaomi/cookie-login"):
+                        state["counter"] += 1
+                        state["revisions"]["xiaomi"] = "fixture-xiaomi-login-" + str(state["counter"])
+                        state["config"].setdefault("xiaomi", {})["cookie_text"] = "••••••••"
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "verified": True, "devices": [],
+                                                       "msg": "Cookie 登录成功"}))
                     elif path.startswith("/api/test/rule"):
                         request_data = json.loads(body or "{}")
                         seen["tests"].append(request_data)
@@ -570,6 +577,26 @@ def main() -> int:
                 result.check("only the expected 409 is tolerated as console noise",
                              len(expected_conflict_console) <= 1,
                              repr(expected_conflict_console))
+
+                # ---------- CAS: login refreshes its own revision, then save succeeds ----------
+                reload_rules()
+                page.click('[data-page="xiaomi"]')
+                rev_before_login = page.evaluate("sectionRevisions.xiaomi")
+                page.evaluate("document.getElementById('mi-cookie-text').value='userId=u; passToken=p'")
+                page.evaluate("verifyCookieLogin()")
+                rev_after_login = page.evaluate("sectionRevisions.xiaomi")
+                result.check("login obtains latest Xiaomi revision without refreshing all drafts",
+                             rev_before_login != rev_after_login
+                             and rev_after_login == state["revisions"]["xiaomi"])
+                page.evaluate("saveXiaomi()")
+                page.wait_for_timeout(250)
+                last_xiaomi = next((p for p in reversed(posted) if p.get("section") == "xiaomi"), {})
+                result.check("saving immediately after login uses refreshed CAS",
+                             last_xiaomi.get("revision") == rev_after_login,
+                             repr(last_xiaomi.get("revision")))
+                result.check("post-login config save succeeds without 409",
+                             page.evaluate("sectionRevisions.xiaomi") == state["revisions"]["xiaomi"]
+                             and page.evaluate("sectionRevisions.xiaomi") != rev_after_login)
 
                 result.check("the test result contains no undefined", "undefined" not in test_text)
 

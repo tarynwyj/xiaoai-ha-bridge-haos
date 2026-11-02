@@ -3598,6 +3598,51 @@ replace_exact(
 # guard is checked immediately before credential persistence (no await between
 # the check and the atomic write), so clearing invalidates old in-flight requests.
 
+# ──────────────── Crash-safe private configuration write ────────────────
+replace_exact(
+    "atomic config.yaml save",
+    '''def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+''',
+    '''def save_config(cfg: dict):
+    """Write the entire YAML atomically with private permissions.
+
+    Calls are synchronous and contain no await; in this single-worker ASGI app,
+    ordinary API config updates cannot interleave between read and replace.
+    """
+    import tempfile
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".config-", suffix=".yaml.tmp",
+                                     dir=str(CONFIG_PATH.parent))
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            yaml.safe_dump(cfg, out, allow_unicode=True,
+                           default_flow_style=False, sort_keys=False)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_name, CONFIG_PATH)
+        try:
+            directory_fd = os.open(str(CONFIG_PATH.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

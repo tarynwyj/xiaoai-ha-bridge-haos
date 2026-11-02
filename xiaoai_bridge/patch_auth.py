@@ -3806,6 +3806,84 @@ replace_exact(
                             save_config(latest)''',
 )
 
+# ──────────────── Revocable, expiring direct-access sessions ────────────────
+replace_exact(
+    "replace fixed replayable session with random server-side sessions",
+    '''ACCESS_TOKEN = _load_or_create_access_token()
+SESSION_VALUE = hmac.new(
+    ACCESS_TOKEN.encode("utf-8"), b"xiaoai-bridge-session-v1", hashlib.sha256
+).hexdigest()
+''',
+    '''ACCESS_TOKEN = _load_or_create_access_token()
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+# Memory-only session registry: process restart invalidates direct browser
+# cookies, while the independent Bearer access token remains unchanged.
+_active_sessions: dict[str, float] = {}
+
+
+def _session_key(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _new_direct_session() -> str:
+    now = time.time()
+    for key, expires in list(_active_sessions.items()):
+        if expires <= now:
+            _active_sessions.pop(key, None)
+    # Avoid unlimited growth if someone repeatedly logs in with a valid token.
+    while len(_active_sessions) >= 128:
+        _active_sessions.pop(next(iter(_active_sessions)))
+    cookie = secrets.token_urlsafe(32)
+    _active_sessions[_session_key(cookie)] = now + SESSION_TTL_SECONDS
+    return cookie
+''',
+)
+replace_exact(
+    "constant session check now validates server registry and TTL",
+    '''def _session_value_match(candidate) -> bool:
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    try:
+        return hmac.compare_digest(candidate.encode("utf-8"), SESSION_VALUE.encode("utf-8"))
+    except (UnicodeError, AttributeError, TypeError):
+        return False
+''',
+    '''def _session_value_match(candidate) -> bool:
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    expires = _active_sessions.get(_session_key(candidate))
+    if expires is None:
+        return False
+    if expires <= time.time():
+        _active_sessions.pop(_session_key(candidate), None)
+        return False
+    return True
+''',
+)
+replace_exact(
+    "generate a fresh opaque session on each login",
+    '''    response.set_cookie(SESSION_COOKIE, SESSION_VALUE, httponly=True,
+                        samesite="strict", max_age=7 * 24 * 3600, path="/")''',
+    '''    response.set_cookie(SESSION_COOKIE, _new_direct_session(), httponly=True,
+                        samesite="strict", max_age=SESSION_TTL_SECONDS, path="/")''',
+)
+replace_exact(
+    "logout revokes the specific submitted cookie on the server",
+    '''@app.post("/api/logout")
+async def destroy_session():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response''',
+    '''@app.post("/api/logout")
+async def destroy_session(request: Request):
+    cookie = (request.cookies.get(SESSION_COOKIE) or "").strip()
+    if cookie:
+        _active_sessions.pop(_session_key(cookie), None)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

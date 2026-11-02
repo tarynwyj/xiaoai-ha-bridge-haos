@@ -3453,9 +3453,11 @@ replace_exact(
         incoming = cfg
         cfg = dict(existing)
         if section == "xiaomi":
-            cfg["xiaomi"] = dict(incoming.get("xiaomi") or {})
+            cfg["xiaomi"] = {**dict(existing.get("xiaomi") or {}),
+                             **dict(incoming.get("xiaomi") or {})}
         elif section == "ha":
-            cfg["homeassistant"] = dict(incoming.get("homeassistant") or {})
+            cfg["homeassistant"] = {**dict(existing.get("homeassistant") or {}),
+                                    **dict(incoming.get("homeassistant") or {})}
         elif section == "rules":
             if "intent_rules" not in incoming or not isinstance(incoming["intent_rules"], list):
                 return {"ok": False, "msg": "规则保存必须明确提供 intent_rules 数组"}

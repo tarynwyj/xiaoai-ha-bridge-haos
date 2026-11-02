@@ -94,6 +94,7 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
     token_path = root / "config" / ".mi.token"
     auth_path = root / "config" / "auth.json"
     names = (
+        "_valid_saved_cookie_text",
         "_get_cookie",
         "_poll_auth_cookies",
         "_apply_cookie_to_session",

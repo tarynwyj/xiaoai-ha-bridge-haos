@@ -831,6 +831,31 @@ replace_exact(
 async function qrLogin(){""",
 )
 
+# ──────────────── Section-scoped saves and safe rule testing ────────────────
+replace_exact(
+    "send the active config section, not a stale whole-config overwrite",
+    "body:JSON.stringify({config:cfg})",
+    "body:JSON.stringify({config:cfg,section:sec})",
+)
+
+replace_exact(
+    "show rule-test execution choice",
+    '<div class="test-result" id="test-result">点击测试查看匹配</div>',
+    '<label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:8px 0"><input type="checkbox" id="test-execute"> 实际执行此规则（可能操作真实设备或创建自动化）</label><div class="test-result" id="test-result">默认只预览匹配，不执行设备操作</div>',
+)
+
+replace_exact(
+    "require confirmation for live test execution",
+    "const r=await fetch('/api/test/rule',{method:'POST'",
+    "const execute=!!((document.getElementById('test-execute')||{}).checked);if(execute&&!confirm('将实际调用 Home Assistant，可能开关设备或创建自动化。确定继续？'))return;const r=await fetch('/api/test/rule',{method:'POST'",
+)
+
+replace_exact(
+    "pass explicit execute flag to the rule-test endpoint",
+    "body:JSON.stringify({text:t,rules:cfg.intent_rules||[]})",
+    "body:JSON.stringify({text:t,rules:cfg.intent_rules||[],execute:execute})",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

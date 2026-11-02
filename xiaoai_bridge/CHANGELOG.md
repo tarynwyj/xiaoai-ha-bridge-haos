@@ -62,7 +62,7 @@
   没有 `name` 字段也能正常编辑、保存、导入导出（后端只读 `pattern` 与 `action`，未知字段原样保留）。
 
 ### 构建与测试
-- 新增 `test_rules_browser.py`（42 项检查，真实 Chromium）：用 Playwright 从固定上游重建页面、
+- 新增 `test_rules_browser.py`（70 项检查，真实 Chromium）：用 Playwright 从固定上游重建页面、
   起本地 HTTP 服务加载真实 HTML、`page.route` 模拟 `/api/config` 与 `/api/devices`，真实点击新增/
   编辑收起/勾选设备/全选/清空/搜索/单条保存/保存全部/删除，并断言 API 载荷（单条保存不夹带其他
   草稿、`entity_id` 单/多/空三种形状）与页面显示；`pageerror`、未处理 Promise、`console.error`

@@ -135,6 +135,7 @@ def main() -> int:
         result = Result()
         errors: list[str] = []
         posted: list[dict] = []
+        seen: dict[str, list] = {"tests": []}
         state = {"config": json.loads(json.dumps(CONFIG))}
 
         try:
@@ -168,6 +169,14 @@ def main() -> int:
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
+                    elif path.startswith("/api/test/rule"):
+                        seen["tests"].append(json.loads(body or "{}"))
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "matched": True,
+                                                       "executed": True, "msg": "已执行",
+                                                       "action": {"domain": "light",
+                                                                  "service": "turn_on",
+                                                                  "entity_id": "light.a"}}))
                     elif path.startswith("/api/aliases"):
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"aliases": {"light.a": "客厅主灯"}}))
@@ -196,6 +205,15 @@ def main() -> int:
 
                 def clear_alert():
                     page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+
+                def reload_rules():
+                    """Reload with the fixture config so a section starts from a known state."""
+                    state["config"] = json.loads(json.dumps(CONFIG))
+                    page.goto(url, wait_until="load")
+                    page.click('[data-page="rules"]')
+                    page.wait_for_selector("#page-rules.active")
+                    page.wait_for_selector("#rule-list .rule-item", state="attached")
+                    page.wait_for_timeout(150)
 
                 def click_save(locator):
                     """Click a save button and wait for the alert the save always shows."""
@@ -343,7 +361,143 @@ def main() -> int:
                           [r["pattern"] for r in final_rules],
                           ["临时草稿-不该被单条保存提交", "睡觉模式"])
 
-                # ---------- 10. browser errors ----------
+                # ---------- 10. one picker layer per rule ----------
+                reload_rules()
+                page.evaluate("renderRules()")
+                page.wait_for_timeout(100)
+                result.eq("renderRules emits exactly one .entity-picker per row",
+                          page.evaluate("document.querySelectorAll('#rule-list .entity-picker').length"),
+                          page.evaluate("document.querySelectorAll('#rule-list .rule-item').length"))
+                page.evaluate("syncRuleEntityOptions()")
+                result.eq("sync keeps exactly one .entity-picker per row",
+                          page.evaluate("document.querySelectorAll('#rule-list .entity-picker').length"),
+                          page.evaluate("document.querySelectorAll('#rule-list .rule-item').length"))
+
+                # ---------- 11. unchanged device options: no rebuild, search kept ----------
+                reload_rules()
+                expand(0)
+                page.evaluate("window.__pk=document.querySelector('#rule-list .rule-item .entity-picker')")
+                rows().nth(0).locator(".entity-search").fill("light.b")
+                page.evaluate("syncRuleEntityOptions(); syncRuleEntityOptions()")
+                page.wait_for_timeout(100)
+                result.check("sync keeps the very same picker node when options are unchanged",
+                             page.evaluate(
+                                 "window.__pk===document.querySelector('#rule-list .rule-item .entity-picker')"))
+                result.eq("sync keeps the entity search text",
+                          rows().nth(0).locator(".entity-search").input_value(), "light.b")
+
+                # ---------- 12. changed device options rebuild, selection survives ----------
+                page.evaluate(
+                    "haDevices=[{entity_id:'light.a',name:'客厅主灯',domain:'light'},"
+                    "{entity_id:'light.b',name:'客厅射灯',domain:'light'},"
+                    "{entity_id:'light.c',name:'卧室灯',domain:'light'},"
+                    "{entity_id:'light.d',name:'阳台灯',domain:'light'}]")
+                page.evaluate("syncRuleEntityOptions()")
+                page.wait_for_timeout(150)
+                result.eq("a real device change rebuilds the picker with four options",
+                          rows().nth(0).locator(".entity-option").count(), 4)
+                result.eq("the rebuild keeps the two selected entities",
+                          sorted(page.evaluate(
+                              "entityIdsOf(document.querySelector('#rule-list .rule-item'))")),
+                          ["light.a", "light.b"])
+
+                # ---------- 13. offline: re-clicking the active device type keeps targets ----------
+                reload_rules()
+                page.evaluate("haDevices = []")
+                expand(0)
+                result.eq("offline rule still shows its two selected targets",
+                          sorted(page.evaluate(
+                              "entityIdsOf(document.querySelector('#rule-list .rule-item'))")),
+                          ["light.a", "light.b"])
+                rows().nth(0).locator(".domain-btn.active").click()
+                page.wait_for_timeout(200)
+                result.eq("clicking the already active device type keeps the targets",
+                          sorted(page.evaluate(
+                              "entityIdsOf(document.querySelector('#rule-list .rule-item'))")),
+                          ["light.a", "light.b"])
+                result.eq("the two target checkboxes stay checked",
+                          rows().nth(0).locator(".r-e:checked").count(), 2)
+                result.check("clicking the already active device type does not mark the page dirty",
+                             not page.locator("#rules-dirty").is_visible())
+                result.eq("the active device type stays 灯光",
+                          page.evaluate(
+                              "document.querySelector('#rule-list .rule-item .r-d').value"), "light")
+                click_save(rows().nth(0).locator(".rule-save"))
+                saved_targets = last_post().get("config", {}).get("intent_rules", [{}])[0]
+                result.eq("saving after the no-op click still posts both targets",
+                          sorted(saved_targets.get("action", {}).get("entity_id") or []),
+                          ["light.a", "light.b"])
+
+                # ---------- 14. offline: switching device type drops the old targets ----------
+                rows().nth(0).locator(".domain-btn[onclick*=\"'climate'\"]").click()
+                page.wait_for_timeout(200)
+                result.eq("switching to 空调 drops the light entities while offline",
+                          page.evaluate(
+                              "entityIdsOf(document.querySelector('#rule-list .rule-item'))"), [])
+                result.eq("the picker follows the new domain",
+                          page.evaluate(
+                              "document.querySelector('#rule-list .rule-item .entity-picker').dataset.domain"),
+                          "climate")
+                result.check("a real type switch marks the page dirty",
+                             page.locator("#rules-dirty").is_visible())
+
+                # ---------- 15. export downloads the current drafts ----------
+                reload_rules()
+                page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+                with page.expect_download() as download:
+                    page.click("#page-rules button:has-text('导出')")
+                exported = json.loads(pathlib.Path(download.value.path()).read_text(encoding="utf-8"))
+                result.check("export downloads a rules-*.json file",
+                             download.value.suggested_filename.startswith("rules-")
+                             and download.value.suggested_filename.endswith(".json"),
+                             download.value.suggested_filename)
+                result.eq("the exported file holds every rule", len(exported), 3)
+                result.eq("the exported rule keeps its name", exported[0].get("name"), "客厅灯组")
+                result.eq("the exported rule keeps its targets",
+                          sorted(exported[0]["action"]["entity_id"]), ["light.a", "light.b"])
+                result.check("export reports success",
+                             "已导出" in page.evaluate(
+                                 "document.querySelector('#rules-alert').textContent"))
+
+                # ---------- 16. import stages the file as pending drafts ----------
+                imported_file = tmp / "imported-rules.json"
+                imported_file.write_text(json.dumps([
+                    {"pattern": "导入一号", "action": {"domain": "light", "service": "turn_on",
+                                                       "entity_id": "light.c", "reply": "好的"}},
+                    {"pattern": "导入二号", "action": {"domain": "switch", "service": "turn_on",
+                                                       "entity_id": "", "reply": "好的"}},
+                ], ensure_ascii=False), encoding="utf-8")
+                page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+                with page.expect_file_chooser() as chooser:
+                    page.click("#page-rules button:has-text('导入')")
+                chooser.value.set_files(str(imported_file))
+                page.wait_for_timeout(400)
+                result.eq("import replaces the list with the file's rules", rows().count(), 2)
+                result.check("import reports that 保存全部 is still needed",
+                             "点「保存全部」生效" in page.evaluate(
+                                 "document.querySelector('#rules-alert').textContent"))
+                result.eq("imported rules keep their titles",
+                          [rows().nth(0).locator(".rule-title").inner_text(),
+                           rows().nth(1).locator(".rule-title").inner_text()],
+                          ["导入一号", "导入二号"])
+
+                # ---------- 17. rule test button posts the current rules ----------
+                page.fill("#test-input", "导入一号")
+                page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+                page.click("#page-rules button:has-text('测试')")
+                page.wait_for_timeout(500)
+                result.eq("the test button sends exactly one /api/test/rule request",
+                          len(seen["tests"]), 1)
+                sent = seen["tests"][0] if seen["tests"] else {}
+                result.eq("the test request carries the typed sentence", sent.get("text"), "导入一号")
+                result.eq("the test request snapshots the two imported rules",
+                          len(sent.get("rules") or []), 2)
+                test_text = page.evaluate("document.querySelector('#test-result').textContent")
+                result.check("the test result renders 已执行 and the action JSON",
+                             "已执行" in test_text and '"entity_id": "light.a"' in test_text, test_text[:120])
+                result.check("the test result contains no undefined", "undefined" not in test_text)
+
+                # ---------- 18. browser errors -----------
                 pending = unhandled()
                 result.check("no unhandled promise rejections", not pending, repr(pending))
                 result.check("no pageerror / console.error", not errors, " | ".join(errors[:4]))

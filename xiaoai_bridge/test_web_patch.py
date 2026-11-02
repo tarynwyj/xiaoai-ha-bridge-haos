@@ -60,6 +60,8 @@ EXTRACT_FUNCTIONS = [
     "entityRowHtml",
     "entityPickerHtml",
     "entityPickerOf",
+    "entityOptionsSig",
+    "entityPickerMarkup",
     "entityIdsOf",
     "setEntitySelection",
     "updateEntityCount",
@@ -336,9 +338,11 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "ruleDraftFromRow always/never writes the name field",
         ),
         (
-            "sync rebuilds the picker in place and keeps the selection",
-            "const current=entityIdsOf(row)" in html and "picker.outerHTML=next" in html,
-            "syncRuleEntityOptions no longer preserves the checkbox selection",
+            "sync rebuilds the picker only when the device options changed",
+            "const current=entityIdsOf(row)" in html
+            and "picker.dataset.sig===sig" in html
+            and "picker.outerHTML=" in html,
+            "syncRuleEntityOptions lost its option signature or its selection preservation",
         ),
         (
             "structural rule changes mark the page dirty",

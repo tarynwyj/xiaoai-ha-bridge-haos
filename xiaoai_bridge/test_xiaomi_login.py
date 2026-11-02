@@ -402,6 +402,7 @@ class Harness:
             "asyncio": asyncio,
             "json": json,
             "os": __import__("os"),
+            "secrets": __import__("secrets"),
             "re": __import__("re"),
             "time": __import__("time"),
             "log": self.log,

@@ -432,7 +432,23 @@ class PatchedApp:
         )
 
         stack = FakeStack(self.log, self.bridge_state, self.sleeps, self.poll_script)
+
+        async def verified_service_login(session, uri, data=None, device_id="",
+                                         token=None, user_agent=""):
+            # Synthetic reply for the *verified* refresh transport, not the
+            # pinned MiService _serviceLogin() implementation (ssl=False).
+            state = token if isinstance(token, dict) else {}
+            return {
+                "code": 0,
+                "location": "https://api2.mina.mi.com/sts",
+                "nonce": "1234567",
+                "ssecurity": "ssecurity-value",
+                "userId": state.get("userId") or "user-1",
+                "passToken": state.get("passToken") or "pass-token-rotated",
+            }
+
         namespace = {
+            "_mi_service_login_verified": verified_service_login,
             # The add-on resolves these relative to its working directory
             # (/app); here they point at the synthetic /data tree instead.
             "CONFIG_PATH": self.config_path,

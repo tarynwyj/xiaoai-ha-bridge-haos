@@ -3960,6 +3960,126 @@ replace_exact(
     service_token = str(cookies.get("serviceToken") or "").strip()''',
 )
 
+# ──────────────── Durable polling watermarks & tracked delayed tasks ────────────────
+replace_exact(
+    "atomic durable timestamp writer",
+    '''async def bridge_loop():''',
+    '''def _write_last_timestamp_atomic(path, value):
+    """Crash-safe, private at-most-once voice-command watermark."""
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".last-timestamp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+# Process-local delay tasks are explicitly cancelled on bridge stop.
+# They are not a persistent scheduler; HA automation should be used for that.
+_delayed_tasks: set[asyncio.Task] = set()
+
+
+async def bridge_loop():''',
+)
+replace_exact(
+    "do not silently re-run commands after corrupted dedupe watermark",
+    '''    if LAST_TS_PATH.exists():
+        try:
+            last_timestamp = json.loads(LAST_TS_PATH.read_text())
+        except Exception:
+            last_timestamp = {}
+    log.info("上次记录时间戳: %s", last_timestamp)''',
+    '''    if LAST_TS_PATH.exists():
+        try:
+            last_timestamp = json.loads(LAST_TS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(last_timestamp, dict) or any(
+                not isinstance(key, str) or not isinstance(value, int) or value < 0
+                for key, value in last_timestamp.items()
+            ):
+                raise ValueError("invalid timestamp record")
+        except Exception:
+            log.error("语音去重记录损坏，拒绝重放旧指令；请检查 last_timestamp.json")
+            bridge_state["error"] = "语音去重记录损坏，已停止桥接以避免重复执行旧指令"
+            bridge_state["running"] = False
+            return
+    log.info("上次记录时间戳: %s", last_timestamp)''',
+)
+replace_exact(
+    "atomic watermark write off event loop before executing a command",
+    '''                    LAST_TS_PATH.write_text(json.dumps(last_timestamp, ensure_ascii=False))''',
+    '''                    # Keep at-most-once semantics deliberately: a failed
+                    # HA command is not automatically retried as a new command.
+                    # Use a thread so SD-card fsync cannot block conversation polls.
+                    await asyncio.to_thread(
+                        _write_last_timestamp_atomic, LAST_TS_PATH, dict(last_timestamp)
+                    )''',
+)
+replace_exact(
+    "register delayed task so stop can cancel it",
+    '''                            asyncio.create_task(_delayed_call(
+                                ha, domain, service, action, delay_sec, _bridge_session
+                            ))''',
+    '''                            delayed_task = asyncio.create_task(_delayed_call(
+                                ha, domain, service, action, delay_sec, _bridge_session
+                            ))
+                            _delayed_tasks.add(delayed_task)
+                            delayed_task.add_done_callback(_delayed_tasks.discard)''',
+)
+replace_exact(
+    "cancel and join delayed tasks before closing their HA session",
+    '''    finally:
+        bridge_state["running"] = False
+        bridge_state["connected"] = False
+        if _bridge_session and not _bridge_session.closed:
+            await _bridge_session.close()''',
+    '''    finally:
+        bridge_state["running"] = False
+        bridge_state["connected"] = False
+        if _delayed_tasks:
+            pending_delays = list(_delayed_tasks)
+            for pending_task in pending_delays:
+                pending_task.cancel()
+            await asyncio.gather(*pending_delays, return_exceptions=True)
+            _delayed_tasks.clear()
+            log.info("桥接器停止：已取消 %d 条尚未执行的延迟指令", len(pending_delays))
+        if _bridge_session and not _bridge_session.closed:
+            await _bridge_session.close()''',
+)
+replace_exact(
+    "log cancelled delayed actions explicitly",
+    '''    await asyncio.sleep(delay_sec)
+    try:
+        ok = await ha.call_service(domain, service, data, session)''',
+    '''    try:
+        await asyncio.sleep(delay_sec)
+    except asyncio.CancelledError:
+        log.info("延迟指令已随桥接器停止而取消：%s/%s", domain, service)
+        raise
+    try:
+        ok = await ha.call_service(domain, service, data, session)''',
+)
+replace_exact(
+    "avoid same-second automation IDs overwriting each other",
+    '''    automation_id = f"{_AUTOMATION_PREFIX}{int(time.time())}"''',
+    '''    automation_id = f"{_AUTOMATION_PREFIX}{int(time.time())}_{secrets.token_hex(4)}"''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

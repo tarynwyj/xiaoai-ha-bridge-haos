@@ -413,6 +413,7 @@ class Harness:
             "save_config": self.save_config,
             "_get_cookie": lambda cfg: None,
             "_save_auth_and_token": lambda account: None,
+            "_credential_write_allowed": lambda: True,
             "_read_saved_credential": lambda path: {},
             "_load_saved_xiaomi_identity": lambda: {},
             "_ERROR_HINTS": {

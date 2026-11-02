@@ -1282,18 +1282,18 @@ def _save_auth_and_token(account) -> None:
     micoapi = token.get("micoapi") or (previous_token.get("micoapi") if same_identity else None)
     if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
         token_data["micoapi"] = [micoapi[0], micoapi[1]]
+    if "micoapi" not in token_data:
+        log.warning("登录没有有效 micoapi serviceToken，拒绝覆盖原有凭据")
+        return
     try:
-        AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(AUTH_PATH, "w", encoding="utf-8") as f:
-            json.dump(identity, f, ensure_ascii=False)
+        _persist_sms_credentials({
+            "userId": identity["userId"], "passToken": identity["passToken"],
+            "deviceId": identity["deviceId"],
+            "ssecurity": token_data["micoapi"][0],
+            "serviceToken": token_data["micoapi"][1],
+        })
     except Exception as e:
-        log.warning("保存 auth.json 失败: %s", e)
-    try:
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(TOKEN_PATH, "w", encoding="utf-8") as f:
-            json.dump(token_data, f, ensure_ascii=False)
-    except Exception as e:
-        log.warning("保存 .mi.token 失败: %s", e)
+        log.warning("保存小米登录凭据失败 (%s)", type(e).__name__)
 ''',
 )
 
@@ -3640,6 +3640,28 @@ replace_exact(
             os.unlink(temp_name)
         except FileNotFoundError:
             pass
+''',
+)
+
+replace_exact(
+    "QR login also uses the atomic credential writer",
+    '''            AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUTH_PATH, "w", encoding="utf-8") as f:
+                json.dump(auth_data, f, ensure_ascii=False)
+            # 保存 .mi.token
+            token_data = {**auth_data, "micoapi": [auth_data["ssecurity"], service_token]}
+            TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+                json.dump(token_data, f, ensure_ascii=False)
+            # 保存 cookie_text 到配置
+            cfg = load_config()
+            mi_cfg = cfg.get("xiaomi", {})
+            cookie_text = f"userId={auth_data['userId']}; passToken={auth_data['passToken']}; serviceToken={service_token}; deviceId={auth_data['deviceId']}"
+            cfg.setdefault("xiaomi", {})["cookie_text"] = cookie_text
+            save_config(cfg)
+''',
+    '''            # Same 0600 + temp/replace/rollback path as OTP and Cookie login.
+            _persist_sms_credentials(auth_data)
 ''',
 )
 

@@ -161,6 +161,7 @@ NEW_ONLY_FUNCTIONS = (
     "_merge_xiaomi_credentials",
     "_delete_saved_login_files",
     "get_config",
+    "_config_section_revision",
     "_load_or_create_access_token",
 )
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the

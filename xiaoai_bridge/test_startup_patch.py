@@ -290,7 +290,21 @@ class Harness:
         return None
 
     def _build_namespace(self):
+        async def verified_service_login(session, uri, data=None, device_id="", token=None,
+                                         user_agent=""):
+            # Simulate the TLS-verified transport, not the pinned library's
+            # _serviceLogin implementation (which explicitly disables TLS).
+            if FakeAccount.reject_service_login:
+                return {"code": 70016, "description": "passToken 已失效"}
+            return {
+                "code": 0, "location": "https://api2.mina.mi.com/sts",
+                "nonce": "1234567", "ssecurity": "ssecurity-value",
+                "userId": (token or {}).get("userId", "user-1"),
+                "passToken": "pass-token-rotated",
+            }
+
         namespace = {
+            "_mi_service_login_verified": verified_service_login,
             "TOKEN_PATH": self.token_path,
             "AUTH_PATH": self.auth_path,
             "CONFIG_PATH": self.cfg_path,
@@ -564,8 +578,10 @@ def scenario_save_credentials_never_blank(root: Path):
     save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2"}))
     updated = harness.read_token()
     assert updated["userId"] == "user-2" and updated["passToken"] == "pass-2"
-    assert updated["micoapi"][1] == "old-service", "existing micoapi must be preserved"
-    return "_save_auth_and_token never blanks a valid credential"
+    assert not updated.get("micoapi"), "a different userId must not inherit the prior serviceToken"
+    save(IncompleteAccount({"userId": "user-3"}))
+    assert harness.read_token() == updated, "a new identity without a passToken must not be mixed with the old account"
+    return "_save_auth_and_token preserves same-user data but isolates different users"
 
 
 def scenario_post_config_credentials(root: Path):

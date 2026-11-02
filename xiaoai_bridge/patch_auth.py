@@ -2123,7 +2123,16 @@ OTP_TTL_SECONDS = 300            # 一次验证会话的有效期（秒）
 OTP_RESEND_COOLDOWN = 60         # 「获取验证码」的冷却时间（秒）
 OTP_MAX_ATTEMPTS = 5             # 一个验证会话最多允许输错几次
 OTP_MAX_REDIRECTS = 5            # 验证码通过后最多手动跟随几次跳转（逐跳校验）
-OTP_TRUSTED_AUTH_HOSTS = {"account.xiaomi.com"}  # 允许跟随的跳转主机（https + 443）
+# 两个信任集合的语义不同，不能合并成「小米域名都能跟」：
+#   OTP_TRUSTED_AUTH_HOSTS：小米「账号验证」页面（https + 443）。验证码通过后，
+#     这些页面的跳转可以在同一会话里继续 GET，属于账号验证链本身。
+#   OTP_MINACOM_STS_HOSTS：micoapi 的 STS 令牌端点（路径前缀 /sts，https + 443）。
+#     它不是验证页面，绝不可以作为链上的一跳去 GET：链在这个地址终止，地址只
+#     留在内存里交给 _otp_finish_login 的 _securityTokenService 做真正的
+#     clientSign 交换。其它任何主机仍然一律拒绝。
+OTP_TRUSTED_AUTH_HOSTS = {"account.xiaomi.com"}   # 允许跟随 GET 的账号验证主机
+OTP_MINACOM_STS_HOSTS = {"api2.mina.mi.com"}      # micoapi STS 端点主机（只作终止标记）
+OTP_MINACOM_STS_PATH = "/sts"                    # STS 端点路径前缀
 OTP_JSON_PREFIX = "&&&START&&&"  # account.xiaomi.com 的 JSON 前缀
 OTP_FLAG_PHONE = 4
 OTP_FLAG_EMAIL = 8
@@ -2419,13 +2428,102 @@ def _otp_normalize_location(location: str) -> str:
     return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
 
 
-def _otp_normalize_auth_hop(target: str) -> str:
+def _otp_split_target(target: str) -> tuple:
+    '''(host, path) of a redirect target: no query string, no userinfo.
+
+    The query string carries ticket/confirmUrl tokens and this fragment may end
+    up both in the log and in the message the UI shows, so only the hostname and
+    the path may ever be printed.
+    '''
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(str(target or "").strip())
+        host = (parts.hostname or "").lower()
+        path = parts.path or "/"
+    except Exception:
+        return "<unparsable>", ""
+    return host or "<no-host>", path
+
+
+def _otp_safe_label(target: str) -> str:
+    '''host + path of a target, for the one-line diagnostics and error messages.'''
+    host, path = _otp_split_target(target)
+    return host + path
+
+
+def _otp_sts_target(target: str) -> str:
+    '''Return the STS URL when target is the micoapi STS endpoint, else "".
+
+    Only https + an allowlisted micoapi host + the /sts path prefix qualifies.
+    The URL is returned intact because it is handed to _securityTokenService in
+    memory; the chain itself never GETs it and never logs its query string.
+    '''
+    from urllib.parse import urlsplit, urlunsplit
+    text = str(target or "").strip()
+    if not text.startswith("https://"):
+        return ""
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except Exception:
+        return ""
+    host = (parts.hostname or "").lower()
+    if (parts.scheme.lower() != "https" or host not in OTP_MINACOM_STS_HOSTS
+            or parts.username or parts.password or port not in (None, 443)):
+        return ""
+    if not (parts.path or "").startswith(OTP_MINACOM_STS_PATH):
+        return ""
+    return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
+
+
+def _otp_confirm_from_query(url: str) -> str:
+    '''Extract a confirmUrl embedded in url's query string (decoded), else "".
+
+    Real Xiaomi answers sometimes carry the confirmation target inside the final
+    URL instead of a header or a JSON field. The value is only decoded here: the
+    caller re-validates it as a normal hop before anything is requested.
+    '''
+    from urllib.parse import parse_qs, urlsplit
+    try:
+        query = parse_qs(urlsplit(str(url or "")).query, keep_blank_values=False)
+    except Exception:
+        return ""
+    for value in query.get("confirmUrl") or []:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _otp_too_many_redirects(stage: str, hops: int):
+    '''Refuse a chain longer than OTP_MAX_REDIRECTS instead of walking it forever.'''
+    log.warning("小米验证跳转次数超过上限 (stage=%s, hops=%s)", stage, hops)
+    raise OtpFlowError(
+        "unsupported", "too_many_redirects",
+        "小米的验证跳转超过 " + str(OTP_MAX_REDIRECTS)
+        + " 次，已停止跟随；请改用扫码登录",
+    )
+
+
+def _otp_log_sts_terminal(stage: str, hops: int, status: int, target: str) -> None:
+    '''Log the STS terminal: stage=sts_terminal plus host + path, never the query.'''
+    host, path = _otp_split_target(target)
+    log.info("小米验证：跳转指向 STS 端点，已停止跟随 (stage=sts_terminal, from=%s, "
+             "hop=%s, status=%s, host=%s, path=%s)", stage, hops, status, host, path)
+
+
+def _otp_normalize_auth_hop(target: str, status: int = 0, stage: str = "") -> str:
     '''Validate one hop of the post-verification chain: https + allowlisted host.
 
     Relative paths are completed onto account.xiaomi.com; scheme relative forms,
     other hosts, plain http, userinfo and non-443 ports are refused. The error
     code is stable (unsafe_redirect) so the caller drops the OTP session instead
     of resuming serviceLogin with a session that has been fed a foreign URL.
+
+    A rejection logs the stage, the HTTP status that produced the target (0 when
+    unknown) and the target host + path only; the query string holds the ticket/
+    confirmUrl tokens. The same host + path is put in the user-facing message so
+    a second real-device test is not needed just to learn which host was refused.
     '''
     from urllib.parse import urlsplit, urlunsplit
     text = str(target or "").strip()
@@ -2445,18 +2543,26 @@ def _otp_normalize_auth_hop(target: str) -> str:
         parts = urlsplit(text)
         port = parts.port
     except Exception:
+        host, path = _otp_split_target(text)
+        log.warning("小米验证：拒绝跟随无法解析的跳转 (stage=%s, status=%s, "
+                    "host=%s, path=%s)", stage or "unknown", status, host, path)
         raise OtpFlowError(
             "unsupported", "unsafe_redirect",
-            "小米返回的跳转地址无法解析，已拒绝跟随；请改用扫码登录",
+            "小米返回的跳转地址无法解析，已拒绝跟随（避免凭据外泄；目标: "
+            + host + path + "）；请改用扫码登录",
         ) from None
     host = (parts.hostname or "").lower()
     if (parts.scheme.lower() != "https" or host not in OTP_TRUSTED_AUTH_HOSTS
             or parts.username or parts.password or port not in (None, 443)):
+        safe_host, safe_path = _otp_split_target(text)
+        log.warning("小米验证：拒绝跟随跳转 (stage=%s, status=%s, host=%s, path=%s)",
+                    stage or "unknown", status, safe_host, safe_path)
         raise OtpFlowError(
             "unsupported", "unsafe_redirect",
             "小米返回的跳转地址不在允许的 HTTPS 主机（"
             + "、".join(sorted(OTP_TRUSTED_AUTH_HOSTS))
-            + "）内，已拒绝跟随（避免凭据外泄）；请改用扫码登录",
+            + "）内，已拒绝跟随（避免凭据外泄；目标: "
+            + safe_host + safe_path + "）；请改用扫码登录",
         )
     return urlunsplit(("https", host, parts.path or "/", parts.query, ""))
 
@@ -2500,16 +2606,32 @@ async def _otp_request(session, method: str, url: str, **kwargs):
 
 
 async def _otp_follow_auth_chain(session, target: str, headers: dict, cookies: dict,
-                                 stage: str):
+                                 stage: str, source_status: int = 0):
     '''Follow the post-code redirect chain by hand, hop by hop, on the same session.
 
     Every hop must be an allowlisted HTTPS account host and at most
     OTP_MAX_REDIRECTS redirects are followed. Anything else raises an explicit
     OtpFlowError so the caller drops the OTP state instead of resuming the
-    login. Logs carry the stage, the hop number and the status code only:
+    login.
+
+    Two terminal cases add no request of their own. A target on the micoapi STS
+    endpoint (api2.mina.mi.com/sts) is not an auth page: the chain stops, the URL
+    is only remembered as _otp_login["sts_location"], and the token is later
+    exchanged by _securityTokenService in _otp_finish_login. A 200 whose own URL
+    carries a confirmUrl query parameter continues on that decoded value, still
+    through the same hop validation.
+
+    source_status is the HTTP status that produced the incoming target (the code
+    submission answer; 0 when unknown) so a refusal can name it in the log.
+    Logs carry the stage, the hop number, the status and host + path only:
     never a URL (its query string holds tokens) and never a cookie.
     '''
-    url = _otp_normalize_auth_hop(target)
+    sts = _otp_sts_target(target)
+    if sts:
+        _otp_login["sts_location"] = sts
+        _otp_log_sts_terminal(stage, 0, source_status, sts)
+        return 0, b"", 0
+    url = _otp_normalize_auth_hop(target, status=source_status, stage=stage)
     hops = 0
     while True:
         status, raw, next_target = await _otp_exchange(
@@ -2524,14 +2646,15 @@ async def _otp_follow_auth_chain(session, target: str, headers: dict, cookies: d
                 )
             hops += 1
             if hops > OTP_MAX_REDIRECTS:
-                log.warning("小米验证跳转次数超过上限 (stage=%s, hops=%s)", stage, hops)
-                raise OtpFlowError(
-                    "unsupported", "too_many_redirects",
-                    "小米的验证跳转超过 " + str(OTP_MAX_REDIRECTS)
-                    + " 次，已停止跟随；请改用扫码登录",
-                )
-            url = _otp_normalize_auth_hop(next_target)
-            log.info("小米验证：跟随跳转 (stage=%s, hop=%s, status=%s)", stage, hops, status)
+                _otp_too_many_redirects(stage, hops)
+            sts = _otp_sts_target(next_target)
+            if sts:
+                _otp_login["sts_location"] = sts
+                _otp_log_sts_terminal(stage, hops, status, sts)
+                return status, raw, hops
+            url = _otp_normalize_auth_hop(next_target, status=status, stage=stage)
+            log.info("小米验证：跟随跳转 (stage=%s, hop=%s, status=%s, target=%s)",
+                     stage, hops, status, _otp_safe_label(url))
             continue
         if status >= 400:
             log.warning("小米验证跳转返回 HTTP %s (stage=%s)", status, stage)
@@ -2540,8 +2663,17 @@ async def _otp_follow_auth_chain(session, target: str, headers: dict, cookies: d
                 "小米账号服务返回 HTTP " + str(status) + "（" + stage
                 + "），无法继续验证；请改用扫码登录",
             )
-        log.info("小米验证：跳转链结束 (stage=%s, hops=%s, status=%s)", stage, hops, status)
-        return status, raw, hops
+        log.info("小米验证：跳转链结束 (stage=%s, hops=%s, status=%s, target=%s)",
+                 stage, hops, status, _otp_safe_label(url))
+        confirm = _otp_confirm_from_query(url)
+        if not confirm:
+            return status, raw, hops
+        hops += 1
+        if hops > OTP_MAX_REDIRECTS:
+            _otp_too_many_redirects(stage, hops)
+        url = _otp_normalize_auth_hop(confirm, status=status, stage=stage + "_confirm")
+        log.info("小米验证：跟随 confirmUrl (stage=%s, hop=%s, status=%s, target=%s)",
+                 stage, hops, status, _otp_safe_label(url))
 
 
 async def _otp_request_json(session, method: str, url: str, stage: str, **kwargs) -> dict:
@@ -2567,6 +2699,10 @@ async def _otp_finish_login(account, resp: dict, device_id: str,
             "unsupported", "resume_failed",
             "登录响应缺少必要字段（ssecurity/location/nonce），无法完成登录；请改用扫码登录",
         )
+    if _otp_login.get("sts_location"):
+        # 链上只把 STS 地址留在内存里做诊断；location/nonce/ssecurity 一律以
+        # resume 响应为准，绝不回退去 GET 那个被捕获的地址。
+        log.info("OTP 登录：resume 已返回 STS 参数，忽略链上捕获的地址 (source=resume)")
     service_token = str(await account._securityTokenService(location, nonce, ssecurity) or "").strip()
     if not service_token:
         raise OtpFlowError(
@@ -2875,14 +3011,15 @@ async def _otp_verify_code(code: str) -> dict:
     if is_redirect:
         # 同时给了 location 和 302 时，先跟随 302，再按响应体继续
         log.info("OTP 登录：验证响应为跳转（stage=verify_redirect, status=%s）", status)
-        await _otp_follow_auth_chain(session, redirect, headers, cookies, "verify_redirect")
+        await _otp_follow_auth_chain(session, redirect, headers, cookies,
+                                     "verify_redirect", status)
     if location:
         target = _otp_normalize_location(location)
         log.info("OTP 登录：验证通过，打开跳转地址（stage=follow_location）")
-        await _otp_follow_auth_chain(session, target, headers, cookies, "location")
+        await _otp_follow_auth_chain(session, target, headers, cookies, "location", status)
     if confirm:
         log.info("OTP 登录：小米要求二次确认（stage=follow_confirm）")
-        await _otp_follow_auth_chain(session, confirm, headers, cookies, "confirm")
+        await _otp_follow_auth_chain(session, confirm, headers, cookies, "confirm", status)
     from miservice import MiAccount
     username = str(_otp_login.get("username") or "")
     password = str(_otp_login.get("password") or "")

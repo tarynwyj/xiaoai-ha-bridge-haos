@@ -330,6 +330,12 @@ FUNCTIONS = (
     "_otp_mask_hint",
     "_otp_normalize_notification_url",
     "_otp_normalize_location",
+    "_otp_split_target",
+    "_otp_safe_label",
+    "_otp_sts_target",
+    "_otp_confirm_from_query",
+    "_otp_too_many_redirects",
+    "_otp_log_sts_terminal",
     "_otp_normalize_auth_hop",
     "_otp_exchange",
     "_otp_request",
@@ -1294,6 +1300,326 @@ def scenario_confirm_url():
         h.cleanup()
 
 
+# ─────────────── 10e. the STS endpoint terminates the chain (never fetched) ───────────────
+STS_TERMINAL = "https://api2.mina.mi.com/sts?sign=sts-sign-1&ticket=sts-ticket-2"
+
+
+def _drive_verify(h):
+    '''Start one OTP session and send the code request; returns the session.'''
+    need_otp(h)
+    session = h.otp_session()
+    session.responses = [response(200, {"code": 0}), response(200, {"code": 0})]
+    send(h)
+    return session
+
+
+def scenario_sts_terminal_hop():
+    h = Harness()
+    try:
+        # (a) probe failure: the STS hop adds no request, and no credential is written
+        h.auth_path.write_text('{"passToken": "old-pass", "userId": "old-user"}', encoding="utf-8")
+        h.token_path.write_text('{"passToken": "old-pass", "userId": "old-user", '
+                                '"micoapi": ["old-sec", "old-svc"]}', encoding="utf-8")
+        before = h.snapshot_data()
+        session = _drive_verify(h)
+        CURRENT["login_script"] = [_resume_reply("sts", "sts-ssecurity", "sts-nonce")]
+        CURRENT["service_token"] = "service-token-after-sts"
+        session.responses = [redirect(STS_TERMINAL)]
+        calls_before = len(session.calls)
+        CURRENT["device_error"] = RuntimeError("mina 500")
+        failed = verify(h, "123456")
+        check(failed.get("ok") is False and failed.get("action") == "verify_failed",
+              f"a failing probe must still fail explicitly, got {failed}")
+        urls = session.urls()
+        check(not any("api2.mina.mi.com" in url for url in urls),
+              f"the STS endpoint must never be fetched, got {urls}")
+        new_calls = session.calls[calls_before:]
+        check([method for method, _url, _kwargs in new_calls] == ["POST", "GET"],
+              f"the code POST and one resume GET are the only requests of the STS hop, "
+              f"got {new_calls}")
+        if new_calls:
+            check(new_calls[-1][1].startswith(LOGIN_PREFIX),
+                  f"the second request must be the same-session resume, got {new_calls[-1][1]}")
+        resume = [url for url in urls if url.startswith(LOGIN_PREFIX)]
+        check(len(resume) == 2,
+              f"the path must keep exactly the initial and the resumed serviceLogin, got {urls}")
+        check(h.snapshot_data() == before,
+              "nothing may be written before the speaker probe succeeded")
+        check(len(CURRENT["security_calls"]) == 1,
+              f"the resumed login must still run the token exchange, got {CURRENT['security_calls']}")
+        if CURRENT["security_calls"]:
+            _account, location, nonce, ssecurity = CURRENT["security_calls"][0]
+            check(location == "https://api2.mina.mi.com/sts?sign=sts",
+                  f"the exchange must use the resume location, got {location}")
+            check((nonce, ssecurity) == ("sts-nonce", "sts-ssecurity"),
+                  f"the exchange must use the resume nonce/ssecurity, got {nonce}/{ssecurity}")
+        check(h.otp_state().get("sts_location") == STS_TERMINAL,
+              "the captured STS URL must stay in memory for the exchange: "
+              f"{h.otp_state().get('sts_location')}")
+        CURRENT["device_error"] = None
+
+        # (b) the same hop with a healthy probe finishes the login on the same session
+        restart(h)
+        session = _drive_verify(h)
+        CURRENT["login_script"] = [_resume_reply("sts2", "sts-ssecurity-2", "sts-nonce-2")]
+        session.responses = [redirect(STS_TERMINAL)]
+        accounts_before = len(CURRENT["accounts"])
+        data = verify(h, "123456")
+        check(data.get("ok") is True, f"an STS hop must still finish the login, got {data}")
+        check(data.get("verified") is True, "an STS-hop login must be marked verified")
+        check(len(data.get("devices") or []) == 1, "the device list must come from the probe")
+        urls = session.urls()
+        check(not any("api2.mina.mi.com" in url for url in urls),
+              f"the STS endpoint must never be fetched, got {urls}")
+        resume = [index for index, (method, url, _kwargs) in enumerate(session.calls)
+                  if url.startswith(LOGIN_PREFIX) and method == "GET"]
+        check(len(resume) == 2,
+              f"exactly one resume serviceLogin must be issued after the code, got {urls}")
+        check(len(CURRENT["security_calls"]) == 2,
+              "exactly one token exchange per login expected on the resumed response")
+        if len(CURRENT["security_calls"]) == 2:
+            _account, location, nonce, ssecurity = CURRENT["security_calls"][-1]
+            check(location == "https://api2.mina.mi.com/sts?sign=sts2",
+                  f"the exchange must prefer the resume location over the captured STS URL, "
+                  f"got {location}")
+            check((nonce, ssecurity) == ("sts-nonce-2", "sts-ssecurity-2"),
+                  f"the exchange must use the resume nonce/ssecurity, got {nonce}/{ssecurity}")
+        check(all(call[2].get("allow_redirects") is False for call in session.calls),
+              "no request of the STS path may follow redirects")
+        check(len(CURRENT["accounts"]) == accounts_before + 2,
+              "the STS path must keep the resume account and the probe")
+        if check(h.auth_path.exists() and h.token_path.exists(),
+                 "a verified STS-hop login must persist both credential files"):
+            token = json.loads(h.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["sts-ssecurity-2", "service-token-after-sts"],
+                  f"the persisted token must come from the resume, got {token.get('micoapi')}")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "a successful STS-hop login must close and clear the OTP state")
+        check(session.closed is True, "the OTP session must be closed after success")
+
+        log_text = h.log.joined()
+        check("stage=sts_terminal" in log_text,
+              f"the STS terminal must be logged with its stage: {log_text}")
+        check("host=api2.mina.mi.com" in log_text and "path=/sts" in log_text,
+              f"the STS terminal must log host and path: {log_text}")
+        check("sts-sign-1" not in log_text and "sts-ticket-2" not in log_text,
+              f"the STS query string must never be logged: {log_text}")
+        check("source=resume" in log_text,
+              "the log must record that the resume response won over the captured STS URL")
+
+        # (c) a resume without ssecurity/location/nonce keeps failing explicitly
+        restart(h)
+        session = _drive_verify(h)
+        CURRENT["login_script"] = [{
+            "code": 0, "userId": "login-user", "passToken": "login-pass",
+            "deviceId": "login-device",
+        }]
+        session.responses = [redirect(STS_TERMINAL)]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+        check(data.get("ok") is False and data.get("code") == "resume_failed",
+              f"a resume without STS parameters must fail explicitly, got {data}")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "a resume without location/nonce/ssecurity must not reach the token exchange")
+        check(h.snapshot_data() == before,
+              "a resume without STS parameters must never write credentials")
+        check(not any("api2.mina.mi.com" in url for url in session.urls()),
+              f"the captured STS URL must never be fetched as a fallback, got {session.urls()}")
+        check(h.otp_state() == {}, "a failed resume must clear the OTP state")
+        ok("STS terminal: 302 to api2 stops the chain without a GET, the same-session resume "
+           "and the resume's own location/nonce/ssecurity drive the exchange")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 10f. a rejected hop names host+path, never the query ───────────────
+HOSTILE_HOP = "https://evil.example/pass/verify?ticket=HOSTILE-TICKET-1&code=909090"
+
+
+def scenario_untrusted_hop_diagnostics():
+    h = Harness()
+    try:
+        h.auth_path.write_text('{"passToken": "old-pass", "userId": "old-user"}', encoding="utf-8")
+        h.token_path.write_text('{"passToken": "old-pass", "userId": "old-user", '
+                                '"micoapi": ["old-sec", "old-svc"]}', encoding="utf-8")
+        before = h.snapshot_data()
+        session = _drive_verify(h)
+        session.responses = [redirect(HOSTILE_HOP)]
+        calls_before = len(session.calls)
+        accounts_before = len(CURRENT["accounts"])
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "271828")
+
+        check(data.get("ok") is False and data.get("action") == "unsupported",
+              f"an untrusted hop must be an explicit unsupported failure, got {data}")
+        check(data.get("code") == "unsafe_redirect",
+              f"an untrusted hop must report unsafe_redirect, got {data.get('code')}")
+        message = str(data.get("msg") or "")
+        check("evil.example/pass/verify" in message,
+              f"the message must name the refused host and path: {message}")
+        check("HOSTILE-TICKET-1" not in message and "ticket=" not in message,
+              f"the message must never carry the query string: {message}")
+        check("已拒绝跟随" in message and "扫码登录" in message,
+              f"the message must stay honest about the refusal: {message}")
+
+        log_text = h.log.joined()
+        check("stage=verify_redirect" in log_text,
+              f"the rejection must log the stage: {log_text}")
+        check("status=302" in log_text,
+              f"the rejection must log the HTTP status that produced the target: {log_text}")
+        check("拒绝跟随跳转 (stage=verify_redirect, status=302, host=evil.example, "
+              "path=/pass/verify)" in log_text,
+              f"the rejection must log stage/status/host/path in one line: {log_text}")
+        check("host=evil.example" in log_text and "path=/pass/verify" in log_text,
+              f"the rejection must log host and path: {log_text}")
+        check("HOSTILE-TICKET-1" not in log_text and "ticket=" not in log_text,
+              "the rejected query string must never be logged")
+        check("271828" not in log_text, "the verification code must never be logged")
+        check("909090" not in log_text, "the code echoed in the target must never be logged")
+        check("deviceId=RANDOMDEVICEID" not in log_text and "cookie" not in log_text.lower(),
+              "no cookie may be logged with the diagnostics")
+
+        urls = session.urls()
+        check(len(session.calls) == calls_before + 1,
+              f"the hostile target must never be fetched, got {urls}")
+        check(not any("evil.example" in url for url in urls),
+              f"an untrusted host must never be fetched, got {urls}")
+        check(len(CURRENT["accounts"]) == accounts_before,
+              "an untrusted hop must not resume the login")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "an untrusted hop must never reach the token exchange")
+        check(h.snapshot_data() == before, "an untrusted hop must not write any file")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "an untrusted hop must clear the OTP state")
+        check(session.closed is True, "an untrusted hop must close the OTP session")
+
+        # the rejection is diagnostic even when the same check runs on a later hop
+        restart(h)
+        session = _drive_verify(h)
+        session.responses = [
+            redirect("/pass/verify/hop1?t=1"),
+            redirect("https://api2.mina.mi.com.evil.example/sts?sign=x"),
+        ]
+        data = verify(h, "123456")
+        check(data.get("code") == "unsafe_redirect",
+              f"a later hostile hop must report unsafe_redirect, got {data.get('code')}")
+        check("api2.mina.mi.com.evil.example/sts" in str(data.get("msg") or ""),
+              f"the message must name the later hop's host: {data.get('msg')}")
+        check("host=api2.mina.mi.com.evil.example, path=/sts" in h.log.joined(),
+              "the rejection must carry the host/path and the status of the hop that "
+              "produced it")
+        ok("untrusted hop: refused with stage/status/host/path in the log and in the message, "
+           "no query, no code, no cookie")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 10g. confirmUrl embedded in the final URL's query ───────────────
+CONFIRM_IN_QUERY = ("https://account.xiaomi.com/pass/verify/final?confirmUrl="
+                    "https%3A%2F%2Faccount.xiaomi.com%2Fpass%2Fconfirm%3Ftoken%3Dcq1")
+CONFIRM_EXTRACTED = "https://account.xiaomi.com/pass/confirm?token=cq1"
+CONFIRM_IN_QUERY_EVIL = ("https://account.xiaomi.com/pass/verify/final?confirmUrl="
+                         "https%3A%2F%2Fevil.example%2Fpass%2Fconfirm%3Ftoken%3Dcq2")
+
+
+def scenario_confirm_from_query():
+    h = Harness()
+    try:
+        # (a) the trusted value is decoded, re-validated as a hop and followed
+        session = _drive_verify(h)
+        CURRENT["login_script"] = [_resume_reply("cq", "cq-ssecurity", "cq-nonce")]
+        CURRENT["service_token"] = "service-token-after-cq"
+        session.responses = [
+            response(200, {"code": 0, "location": CONFIRM_IN_QUERY}),
+            response(200, raw=b"<html>final</html>"),
+            response(200, raw=b"<html>confirmed</html>"),
+        ]
+        data = verify(h, "123456")
+        check(data.get("ok") is True, f"a confirmUrl in the query must finish the login, got {data}")
+        check(len(data.get("devices") or []) == 1, "the device list must come from the probe")
+        urls = session.urls()
+        finals = [index for index, (_m, url, _k) in enumerate(session.calls)
+                  if url == CONFIRM_IN_QUERY]
+        follows = [index for index, (_m, url, _k) in enumerate(session.calls)
+                   if url == CONFIRM_EXTRACTED]
+        check(len(finals) == 1,
+              f"the location hop must be opened once, got {urls}")
+        check(len(follows) == 1,
+              f"the decoded confirmUrl must be opened once, got {urls}")
+        if finals and follows:
+            check(follows[0] == finals[0] + 1,
+                  f"the confirmUrl must be followed right after the hop: {urls}")
+            method, _url, kwargs = session.calls[follows[0]]
+            check(method == "GET", f"the confirmUrl hop must be a GET, got {method}")
+            check(kwargs.get("allow_redirects") is False,
+                  f"the confirmUrl hop must not follow redirects, got "
+                  f"{kwargs.get('allow_redirects')}")
+        resume = [index for index, (method, url, _k) in enumerate(session.calls)
+                  if url.startswith(LOGIN_PREFIX) and method == "GET"]
+        check(len(resume) == 2,
+              f"the path must keep exactly the initial and the resumed serviceLogin, got {urls}")
+        if follows and resume:
+            check(resume[-1] > follows[0],
+                  "the extracted confirmation must happen before the login is resumed")
+        check(all(call[2].get("allow_redirects") is False for call in session.calls),
+              "no request of the confirmUrl path may follow redirects")
+        if check(h.auth_path.exists() and h.token_path.exists(),
+                 "a verified extracted confirmation must persist both credential files"):
+            token = json.loads(h.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["cq-ssecurity", "service-token-after-cq"],
+                  f"the persisted token must come from the resume, got {token.get('micoapi')}")
+        log_text = h.log.joined()
+        check("跟随 confirmUrl" in log_text,
+              f"the extracted hop must be logged as a confirmUrl follow: {log_text}")
+        check("target=account.xiaomi.com/pass/confirm" in log_text,
+              f"the accepted hop must log host + path: {log_text}")
+        check("token=cq1" not in log_text,
+              f"the accepted hop's query must never be logged: {log_text}")
+        check(h.otp_state() == {}, "a successful extraction must clear the OTP state")
+
+        # (b) an untrusted extracted value is refused by the very same hop validation
+        restart(h)
+        session = _drive_verify(h)
+        session.responses = [
+            response(200, {"code": 0, "location": CONFIRM_IN_QUERY_EVIL}),
+            response(200, raw=b"<html>final</html>"),
+        ]
+        accounts_before = len(CURRENT["accounts"])
+        security_before = len(CURRENT["security_calls"])
+        before = h.snapshot_data()
+        data = verify(h, "123456")
+        check(data.get("ok") is False and data.get("action") == "unsupported",
+              f"an untrusted extracted confirmUrl must be refused, got {data}")
+        check(data.get("code") == "unsafe_redirect",
+              f"an untrusted extraction must report unsafe_redirect, got {data.get('code')}")
+        message = str(data.get("msg") or "")
+        check("evil.example/pass/confirm" in message,
+              f"the message must name the extracted host: {message}")
+        check("cq2" not in message, f"the extracted query must never be echoed: {message}")
+        log_text = h.log.joined()
+        check("stage=location_confirm" in log_text,
+              f"the extraction rejection must log its own stage: {log_text}")
+        check("host=evil.example" in log_text and "path=/pass/confirm" in log_text,
+              f"the extraction rejection must log host and path: {log_text}")
+        check("cq2" not in log_text, "the extracted query must never be logged")
+        urls = session.urls()
+        check(not any(url.startswith("https://evil.example") for url in urls),
+              f"an untrusted extraction must never be fetched, got {urls}")
+        check(len(CURRENT["accounts"]) == accounts_before,
+              "an untrusted extraction must not resume the login")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "an untrusted extraction must never reach the token exchange")
+        check(h.snapshot_data() == before, "an untrusted extraction must not write any file")
+        check(h.otp_session() is None and h.otp_state() == {},
+              "an untrusted extraction must clear the OTP state")
+        check(session.closed is True, "an untrusted extraction must close the OTP session")
+        ok("confirmUrl in the final URL: decoded, re-validated and followed on the trusted host, "
+           "refused and logged when it points elsewhere")
+    finally:
+        h.cleanup()
+
+
 # ─────────────── 11. manual Cookie login ───────────────
 def scenario_cookie_login():
     h = Harness()
@@ -2205,6 +2531,9 @@ def main():
         scenario_redirect_after_code,
         scenario_redirect_allowlist_and_limit,
         scenario_confirm_url,
+        scenario_sts_terminal_hop,
+        scenario_untrusted_hop_diagnostics,
+        scenario_confirm_from_query,
         scenario_cookie_login,
         scenario_cookie_login_errors,
         scenario_cookie_login_clears_otp,

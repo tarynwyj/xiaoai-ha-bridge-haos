@@ -856,6 +856,56 @@ replace_exact(
     "body:JSON.stringify({text:t,rules:cfg.intent_rules||[],execute:execute})",
 )
 
+# ──────────────── CAS: per-section versioned UI writes ────────────────
+replace_exact(
+    "remember revision tokens per section",
+    "let cfg = {};\n/* Ingress-safe fetch:",
+    "let cfg = {};\nlet sectionRevisions = {};\n/* Ingress-safe fetch:",
+)
+
+replace_exact(
+    "separate revision metadata from editable config",
+    "cfg=await r.json();applyConfigToUI()",
+    "cfg=await r.json();sectionRevisions=cfg._section_revisions||{};delete cfg._section_revisions;applyConfigToUI()",
+)
+
+replace_exact(
+    "save only after CAS precondition and preserve unsaved drafts on conflict",
+    """async function saveCfg(sec){const map={xiaomi:'xiaomi-alert',ha:'ha-alert',rules:'rules-alert',adv:'adv-alert'};const a=document.getElementById(map[sec]||'dash-alert');try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,section:sec})});const d=await r.json();showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+(d.ok?'保存成功':'保存失败'))}catch(e){showAlert(a,'err','✗ '+e.message)}setTimeout(()=>a.classList.remove('show'),3000)}""",
+    """async function saveCfg(sec){
+  const map={xiaomi:'xiaomi-alert',ha:'ha-alert',rules:'rules-alert',adv:'adv-alert'};
+  const a=document.getElementById(map[sec]||'dash-alert');
+  const revision=sectionRevisions[sec];
+  if(!revision){
+    showAlert(a,'err','✗ 未获取到配置版本，保存已取消。请备份编辑内容后刷新页面');
+    return false;
+  }
+  try{
+    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({config:cfg,section:sec,revision:revision})});
+    const d=await r.json();
+    if(r.status===409||d.code==='config_conflict'){
+      showAlert(a,'err','⚠ 此分区已在另一窗口修改，服务器拒绝覆盖。你当前未保存的编辑仍在页面中；请先备份，再刷新页面处理冲突。');
+      return false;
+    }
+    if(!r.ok||!d.ok){
+      showAlert(a,'err','✗ '+(d.msg||'保存失败'));
+      return false;
+    }
+    if(!d.revision){
+      showAlert(a,'err','✗ 服务器未返回新的配置版本，请刷新页面确认保存结果');
+      return false;
+    }
+    sectionRevisions[sec]=d.revision;
+    showAlert(a,'ok','✓ 保存成功');
+    return true;
+  }catch(e){
+    showAlert(a,'err','✗ '+e.message);
+    return false;
+  }
+}""",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

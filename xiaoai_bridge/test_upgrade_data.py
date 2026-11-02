@@ -433,6 +433,20 @@ class PatchedApp:
 
         stack = FakeStack(self.log, self.bridge_state, self.sleeps, self.poll_script)
 
+        def persist_synthetic_credentials(creds):
+            identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
+            token = dict(identity)
+            token["micoapi"] = [creds.get("ssecurity", ""), creds.get("serviceToken", "")]
+            self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
+            self.token_path.write_text(json.dumps(token), encoding="utf-8")
+            cfg = self.load_config()
+            cfg.setdefault("xiaomi", {})["cookie_text"] = (
+                "userId=" + identity["userId"] + "; passToken=" + identity["passToken"]
+                + "; serviceToken=" + creds.get("serviceToken", "")
+                + "; deviceId=" + identity["deviceId"]
+            )
+            self.save_config(cfg)
+
         async def verified_service_login(session, uri, data=None, device_id="",
                                          token=None, user_agent=""):
             # Synthetic reply for the *verified* refresh transport, not the
@@ -449,6 +463,8 @@ class PatchedApp:
 
         namespace = {
             "_mi_service_login_verified": verified_service_login,
+            "_persist_sms_credentials": persist_synthetic_credentials,
+            "_credential_write_allowed": lambda: True,
             # The add-on resolves these relative to its working directory
             # (/app); here they point at the synthetic /data tree instead.
             "CONFIG_PATH": self.config_path,

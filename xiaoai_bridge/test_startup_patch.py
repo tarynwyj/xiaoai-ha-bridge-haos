@@ -699,6 +699,9 @@ def scenario_post_config_credentials(root: Path):
     assert harness.cfg["xiaomi"]["cookie_text"] == ""
     assert not harness.token_path.exists(), "explicit clear must delete .mi.token"
     assert not harness.auth_path.exists(), "explicit clear must delete auth.json"
+    assert "clear_login" not in (harness.cfg.get("xiaomi") or {}), (
+        "the transient clear_login flag must never be persisted into config.yaml"
+    )
     return "post_config keeps secrets unless the user explicitly clears them"
 
 

@@ -997,7 +997,7 @@ def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
     \'\'\'Decide the stored Xiaomi login when the config page is saved.
 
     masked / empty  -> keep what is stored (a stale page must not wipe QR login)
-    clear_login: true -> explicit user action, wipe saved credentials for real
+    clear_login        -> transient flag consumed by post_config, never persisted
     anything else  -> save the new value
     \'\'\'
     new_mi = cfg.get("xiaomi")
@@ -1005,11 +1005,10 @@ def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
         new_mi = {}
         cfg["xiaomi"] = new_mi
     old_mi = existing.get("xiaomi") or {}
-    if new_mi.pop("clear_login", False):
-        # The async post_config entrypoint invokes clear_xiaomi_login first.
-        new_mi["cookie_text"] = ""
-        new_mi["password"] = ""
-        return
+    # clear_login is a transient request flag: post_config consumes it and
+    # delegates to clear_xiaomi_login before any merge happens, so it must never
+    # reach the saved config. Drop it unconditionally instead of branching on it.
+    new_mi.pop("clear_login", None)
     if new_mi.get("password") in (masked, None):
         new_mi["password"] = old_mi.get("password", "")
     if new_mi.get("cookie_text") in (None, "", masked):

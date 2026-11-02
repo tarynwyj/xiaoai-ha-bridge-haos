@@ -134,6 +134,7 @@ def main() -> int:
         httpd, url = serve(html.parent)
         result = Result()
         errors: list[str] = []
+        expected_conflict_console: list[str] = []
         posted: list[dict] = []
         seen: dict[str, list] = {"tests": []}
         state = {
@@ -148,8 +149,17 @@ def main() -> int:
                 browser = pw.chromium.launch()
                 page = browser.new_page()
                 page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
-                page.on("console", lambda msg: errors.append(f"console.error: {msg.text}")
-                        if msg.type == "error" else None)
+                def capture_console(msg):
+                    if msg.type != "error":
+                        return
+                    if "Failed to load resource: the server responded with a status of 409 (Conflict)" in msg.text:
+                        # Chromium logs an expected CAS refusal as a resource
+                        # error. Only that exact 409 is allowed by this test.
+                        expected_conflict_console.append(msg.text)
+                    else:
+                        errors.append(f"console.error: {msg.text}")
+
+                page.on("console", capture_console)
                 page.add_init_script(
                     "window.__unhandled=[];"
                     "window.addEventListener('unhandledrejection',"
@@ -549,7 +559,7 @@ def main() -> int:
                 result.eq("stale browser save sends original revision",
                           posted[-1].get("revision"), stale_revision)
                 result.check("server 409 conflict displayed",
-                             "其他窗口" in page.locator("#rules-alert").inner_text(),
+                             "另一窗口" in page.locator("#rules-alert").inner_text(),
                              page.locator("#rules-alert").inner_text())
                 result.check("stale browser edit stays in DOM",
                              "本地未保存修改" in rows().nth(0).locator(".r-p").input_value())
@@ -557,6 +567,9 @@ def main() -> int:
                              page.locator("#rules-dirty").is_visible())
                 result.eq("409 keeps local revision unchanged",
                           page.evaluate("sectionRevisions.rules"), stale_revision)
+                result.check("only the expected 409 is tolerated as console noise",
+                             len(expected_conflict_console) <= 1,
+                             repr(expected_conflict_console))
 
                 result.check("the test result contains no undefined", "undefined" not in test_text)
 

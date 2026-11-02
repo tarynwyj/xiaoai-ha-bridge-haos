@@ -564,6 +564,80 @@ def main():
 
         # ── E: explicit credential clear removes files and stored cookie ──
         client.post("/api/session", json_body={"token": token})
+
+        # ── clear_login must compare CAS BEFORE any irreversible operation ──
+        auth_file = root / "config" / "auth.json"
+        token_file = root / "config" / ".mi.token"
+        auth_file.write_text('{"userId":"cas-user","passToken":"cas-pass","deviceId":"cas-device"}', encoding="utf-8")
+        token_file.write_text('{"userId":"cas-user","passToken":"cas-pass","deviceId":"cas-device","micoapi":["sec","svc"]}', encoding="utf-8")
+        config_before_clear = read_config(root)
+        config_before_clear["xiaomi"]["password"] = "cas-secret"
+        config_before_clear["xiaomi"]["cookie_text"] = "userId=cas-user; passToken=cas-pass"
+        bridge.save_config(config_before_clear)
+        previous_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+
+        # Another tab modifies the same Xiaomi section.
+        changed = read_config(root)
+        changed["xiaomi"]["hardware"] = "new-hardware"
+        bridge.save_config(changed)
+        old_data = (root / "config" / "config.yaml").read_bytes()
+        old_auth = auth_file.read_bytes()
+        old_token = token_file.read_bytes()
+        stale_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": previous_rev,
+                       "config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert stale_clear.status_code == 409 and stale_clear.json()["code"] == "config_conflict"
+        assert (root / "config" / "config.yaml").read_bytes() == old_data
+        assert auth_file.read_bytes() == old_auth and token_file.read_bytes() == old_token
+        ok("stale CAS clear_login returns 409 without deleting credentials or changing config")
+
+        current_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        fresh_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": current_rev,
+                       "config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert fresh_clear.status_code == 200 and fresh_clear.json()["ok"] is True, fresh_clear.text
+        assert fresh_clear.json()["revision"] == client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        assert not auth_file.exists() and not token_file.exists()
+        assert read_config(root)["xiaomi"]["password"] == ""
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        ok("fresh CAS clear_login succeeds and returns the new Xiaomi revision")
+
+        # Incomplete legacy config writes must preserve unrelated settings.
+        before_legacy = read_config(root)
+        legacy_partial = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"config": {"xiaomi": {"hardware": "legacy-only-change"}}},
+        )
+        assert legacy_partial.status_code == 200 and legacy_partial.json()["ok"], legacy_partial.text
+        after_legacy = read_config(root)
+        assert after_legacy["xiaomi"]["hardware"] == "legacy-only-change"
+        assert after_legacy["homeassistant"] == before_legacy["homeassistant"]
+        assert after_legacy["intent_rules"] == before_legacy["intent_rules"]
+        assert after_legacy["device_aliases"] == before_legacy["device_aliases"]
+        ok("legacy partial save does not erase HA, rules, aliases or other Xiaomi keys")
+
+        auth_file.write_bytes(old_auth)
+        token_file.write_bytes(old_token)
+        restored = read_config(root)
+        restored["xiaomi"]["password"] = "secret-to-clear"
+        restored["xiaomi"]["cookie_text"] = "userId=cas-user; passToken=cas-pass"
+        bridge.save_config(restored)
+        legacy_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert legacy_clear.status_code == 200 and legacy_clear.json()["ok"], legacy_clear.text
+        assert not auth_file.exists() and not token_file.exists()
+        assert read_config(root)["xiaomi"]["password"] == ""
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        assert read_config(root)["intent_rules"] == before_legacy["intent_rules"]
+        assert read_config(root)["homeassistant"] == before_legacy["homeassistant"]
+        ok("legacy partial clear_login clears only login and preserves all unrelated config")
+
         class FakePendingLogin:
             closed = False
 

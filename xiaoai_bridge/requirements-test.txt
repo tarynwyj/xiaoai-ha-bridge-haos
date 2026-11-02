@@ -1,0 +1,4 @@
+# Test-only dependencies (never installed into the add-on image).
+# Playwright drives the real rules page in Chromium; the version is pinned so a
+# browser upgrade cannot silently change behaviour under the suite.
+playwright==1.62.0

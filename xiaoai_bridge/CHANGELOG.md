@@ -43,6 +43,12 @@
   **不写任何文件**；进行中的验证码会话不会阻塞扫码登录，也不会阻塞 Cookie 登录。
 
 ### 意图规则界面（复选框设备选择、分条保存、规则名称）
+- 修复规则页按钮全部失效的问题：复选框/全选/清空等辅助函数把 `querySelectorAll()` 的
+  **NodeList** 当成数组调用 `.filter/.map`（浏览器里没有这些方法），导致除「编辑/收起」外的
+  按钮（新增、保存、保存全部、删除、导出、测试、设备类型、全选、清空）在真实浏览器里抛
+  `TypeError` 而毫无反应；测试桩返回数组，所以 CI 一直绿。已改为 `Array.from(...)`，并把测试桩
+  改成与浏览器一致的 NodeList（无 `.filter/.map`），此类回归以后会被 CI 拦住。
+
 - 设备选择从「按住 Ctrl 才能多选」的下拉框改为**复选框列表**：点选即可、显示名称与 `entity_id`、
   顶部「已选择 N 个设备」，支持按名称/`entity_id` 搜索、全选、清空；设备列表异步刷新与 HA
   暂时离线都不会清掉已选实体。
@@ -56,7 +62,12 @@
   没有 `name` 字段也能正常编辑、保存、导入导出（后端只读 `pattern` 与 `action`，未知字段原样保留）。
 
 ### 构建与测试
-- 新增 `test_xiaomi_login.py`（465 项检查 / 37 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
+- 新增 `test_rules_browser.py`（70 项检查，真实 Chromium）：用 Playwright 从固定上游重建页面、
+  起本地 HTTP 服务加载真实 HTML、`page.route` 模拟 `/api/config` 与 `/api/devices`，真实点击新增/
+  编辑收起/勾选设备/全选/清空/搜索/单条保存/保存全部/删除，并断言 API 载荷（单条保存不夹带其他
+  草稿、`entity_id` 单/多/空三种形状）与页面显示；`pageerror`、未处理 Promise、`console.error`
+  任一出现即失败。CI 的 host job 会自动安装 Chromium 并运行该套件。
+- 新增 `test_xiaomi_login.py`（550 项检查 / 40 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
   发送冷却与「只在显式点击时发送」、同会话 8 步换 Token（含断言所有 identity/verify 请求
   用的是同一个会话对象）、错误验证码计数与耗尽、TTL 过期、重新开始、unsupported 响应、
   `location` 白名单（6 种恶意形式）、Cookie 登录（换取 / 直连 / 过期 / 缺字段 / 探测失败）、

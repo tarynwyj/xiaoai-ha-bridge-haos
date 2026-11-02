@@ -228,7 +228,7 @@ function entityPickerOf(scope){
 function entityIdsOf(scope){
   const picker=entityPickerOf(scope);
   if(!picker)return [];
-  return picker.querySelectorAll('.r-e').filter(box=>box.checked).map(box=>box.value).filter(Boolean);
+  return Array.from(picker.querySelectorAll('.r-e')).filter(box=>box.checked).map(box=>box.value).filter(Boolean);
 }
 function setEntitySelection(scope,ids){
   const picker=entityPickerOf(scope);
@@ -240,7 +240,7 @@ function setEntitySelection(scope,ids){
 function updateEntityCount(picker){
   if(!picker)return 0;
   const count=picker.querySelector('.entity-count');
-  const total=picker.querySelectorAll('.r-e').filter(box=>box.checked).length;
+  const total=Array.from(picker.querySelectorAll('.r-e')).filter(box=>box.checked).length;
   if(count)count.textContent='已选择 '+total+' 个设备';
   return total;
 }
@@ -257,7 +257,7 @@ function filterEntityOptions(input){
   return shown;
 }
 function visibleEntityOptions(picker){
-  return picker?picker.querySelectorAll('.entity-option').filter(row=>row.style.display!=='none'):[];
+  return picker?Array.from(picker.querySelectorAll('.entity-option')).filter(row=>row.style.display!=='none'):[];
 }
 function selectAllEntities(btn){
   const picker=entityPickerOf(btn);
@@ -350,18 +350,24 @@ function renderRuleHead(row,state,index){
   if(chip)chip.style.display=state.dirty?'':'none';
   row.dataset.search=ruleSearchText(state.draft);
 }
+function entityOptionsSig(domain){
+  const rows=entityOptionItems(domain,[]);
+  return String(domain)+'|'+rows.map(row=>row.id+'='+row.label).join('|');
+}
+function entityPickerMarkup(domain,current,sig){
+  return entityPickerHtml(domain,current).replace('<div class="entity-picker"',
+    '<div class="entity-picker" data-sig="'+escHtml(sig)+'"');
+}
 function syncRuleEntityOptions(){
   const rows=document.querySelectorAll('#rule-list .rule-item');
   rows.forEach(row=>{
     const picker=row.querySelector('.entity-picker');
     if(!picker)return;
-    const current=entityIdsOf(row);
     const domain=(row.querySelector('.r-d')||{}).value||'light';
-    const next=entityPickerHtml(domain,current);
-    if(picker.dataset.sig!==next){
-      picker.dataset.sig=next;
-      picker.outerHTML=next;
-    }
+    const sig=entityOptionsSig(domain);
+    if(picker.dataset.sig===sig)return;
+    const current=entityIdsOf(row);
+    picker.outerHTML=entityPickerMarkup(domain,current,sig);
   });
   return rows.length;
 }
@@ -408,13 +414,13 @@ replace_exact(
 replace_exact(
     'rule row with checkbox picker and per-rule save',
     r'''function buildRule(rule,i){const a=rule.action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const div=document.createElement('div');div.className='rule-item';div.dataset.idx=i;let h='<div class="rule-head"><span class="rule-num">#'+(i+1)+'</span><button class="rule-del" onclick="deleteRule('+i+')">✕</button></div><div class="rule-grid"><div class="field full"><label>你说的话</label><input type="text" class="r-p" value="'+escHtml(rule.pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'" placeholder=\'{"brightness_pct":"{0}"}\'></div></div>';div.innerHTML=h;return div}''',
-    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label><div class="entity-picker" data-domain="'+escHtml(d)+'">'+entityPickerHtml(d,ids)+'</div></div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
+    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label>'+entityPickerHtml(d,ids)+'</div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
 )
 
 replace_exact(
     'domain switch keeps drafts',
     r'''function switchD(btn,d){btn.parentElement.querySelectorAll('.domain-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');const item=btn.closest('.rule-item');item.querySelector('.r-d').value=d;const info=DINFO[d];const sel=item.querySelector('.r-s');sel.innerHTML=Object.entries(info.s).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('');item.querySelector('.extra-fields').innerHTML=info.x.length?info.x.map(x=>'<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="" placeholder="'+(x.p||'')+'"></div>').join(''):''}''',
-    r"""function switchD(btn,d){btn.parentElement.querySelectorAll('.domain-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');const item=btn.closest('.rule-item');if(!item)return;item.querySelector('.r-d').value=d;const info=DINFO[d];const allowed=new Set((haDevices||[]).filter(device=>device.domain===d).map(device=>device.entity_id));const current=entityIdsOf(item).filter(id=>allowed.has(id));const picker=item.querySelector('.entity-picker');if(picker){picker.dataset.domain=d;picker.dataset.sig='';picker.innerHTML=entityPickerHtml(d,current)}const sel=item.querySelector('.r-s');if(sel){sel.innerHTML=Object.entries(info.s).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('');sel.value=Object.keys(info.s)[0]}const extra=item.querySelector('.extra-fields');if(extra){extra.innerHTML=info.x.length?info.x.map(x=>'<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="" placeholder="'+(x.p||'')+'"></div>').join(''):''}const index=Number(item.dataset.idx);if(!Number.isNaN(index)&&ruleState[index]){ruleState[index].draft=ruleDraftFromRow(item);ruleState[index].dirty=true;renderRuleHead(item,ruleState[index],index)}setRulesDirty(anyRuleDirty())}""",
+    r"""function switchD(btn,d){const item=btn?btn.closest('.rule-item'):null;if(!item)return;const hidden=item.querySelector('.r-d');const prev=hidden?hidden.value:'';if(prev===d)return;btn.parentElement.querySelectorAll('.domain-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');if(hidden)hidden.value=d;const info=DINFO[d];const current=entityIdsOf(item).filter(id=>String(id).split('.')[0]===d);const picker=item.querySelector('.entity-picker');if(picker){picker.outerHTML=entityPickerHtml(d,current)}const sel=item.querySelector('.r-s');if(sel){sel.innerHTML=Object.entries(info.s).map(([k,v])=>'<option value="'+k+'">'+v+'</option>').join('');sel.value=Object.keys(info.s)[0]}const extra=item.querySelector('.extra-fields');if(extra){extra.innerHTML=info.x.length?info.x.map(x=>'<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="" placeholder="'+(x.p||'')+'"></div>').join(''):''}const index=Number(item.dataset.idx);if(!Number.isNaN(index)&&ruleState[index]){ruleState[index].draft=ruleDraftFromRow(item);ruleState[index].dirty=true;renderRuleHead(item,ruleState[index],index)}setRulesDirty(anyRuleDirty());return current.length}""",
 )
 
 replace_exact(

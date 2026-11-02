@@ -170,10 +170,14 @@ def main() -> int:
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
                     elif path.startswith("/api/test/rule"):
-                        seen["tests"].append(json.loads(body or "{}"))
+                        request_data = json.loads(body or "{}")
+                        seen["tests"].append(request_data)
+                        execute = bool(request_data.get("execute"))
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "matched": True,
-                                                       "executed": True, "msg": "已执行",
+                                                       "executed": execute,
+                                                       "preview": not execute,
+                                                       "msg": "已执行" if execute else "仅预览",
                                                        "action": {"domain": "light",
                                                                   "service": "turn_on",
                                                                   "entity_id": "light.a"}}))
@@ -493,8 +497,21 @@ def main() -> int:
                 result.eq("the test request snapshots the two imported rules",
                           len(sent.get("rules") or []), 2)
                 test_text = page.evaluate("document.querySelector('#test-result').textContent")
-                result.check("the test result renders 已执行 and the action JSON",
-                             "已执行" in test_text and '"entity_id": "light.a"' in test_text, test_text[:120])
+                result.check("the test result renders a preview without executing",
+                             "仅预览" in test_text and '"entity_id": "light.a"' in test_text, test_text[:120])
+                result.check("rule test defaults to no live action",
+                             sent.get("execute") is False, repr(sent))
+                page.check("#test-execute")
+                page.once("dialog", lambda dialog: dialog.accept())
+                page.click("#page-rules button:has-text('测试')")
+                page.wait_for_timeout(150)
+                result.eq("explicit execution makes a second test call",
+                          len(seen["tests"]), 2)
+                result.check("live execution requires explicit opt-in",
+                             seen["tests"][-1].get("execute") is True)
+                result.check("rule-save posts include their scope",
+                             all(p.get("section") == "rules" for p in posted),
+                             repr([p.get("section") for p in posted]))
                 result.check("the test result contains no undefined", "undefined" not in test_text)
 
                 # ---------- 18. browser errors -----------

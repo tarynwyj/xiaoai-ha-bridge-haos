@@ -1085,14 +1085,17 @@ def scenario_5_corrupted_data(
     )
 
     app_b.run_loop()
-    assert app_b.bridge_state["error"] is None, f"S5b: {app_b.bridge_state['error']}"
-    assert app_b.log.has("passToken"), app_b.log.messages
-    repaired = app_b.read_json(app_b.token_path)
-    assert repaired["micoapi"][1] == "fresh-service-token", repaired
-    assert repaired["userId"] == "qr-user" and repaired["passToken"] == "qr-pass", repaired
+    # The new credential-pair hardening intentionally refuses a corrupt
+    # .mi.token before attempting a potentially cross-account refresh.
+    assert "凭据文件不一致" in (app_b.bridge_state["error"] or ""), (
+        f"S5b: corrupt token must fail closed: {app_b.bridge_state['error']!r}"
+    )
+    assert (data_b / "config" / ".mi.token").read_bytes() == bad_token, (
+        "S5b: startup must preserve unreadable token for user diagnosis"
+    )
     reporter.ok(
-        "S5b non-JSON .mi.token: 1.0.10 refreshes the passToken and repairs .mi.token "
-        "in place (bridge starts)"
+        "S5b non-JSON .mi.token: startup safely refuses a mismatched credential pair "
+        "without rewriting the user's damaged data"
     )
 
 

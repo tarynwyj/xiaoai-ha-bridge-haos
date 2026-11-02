@@ -358,7 +358,8 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
         ),
         (
             "failed save returns false and never re-renders",
-            "return ok}catch(e)" in html and "return false}}" in html,
+            "sectionRevisions[sec]=d.revision" in html and "return false;" in html
+            and "config_conflict" in html,
             "saveCfg does not report the save result",
         ),
         (
@@ -802,6 +803,8 @@ function nodeList(items){ return new NodeListLike(items); }
 // ===== page globals the extracted code expects =====
 const document = new Doc();
 let cfg = {};
+let sectionRevisions = {rules:'fixture-rules-0',xiaomi:'fixture-xiaomi-0',
+                        ha:'fixture-ha-0',adv:'fixture-adv-0'};
 let haDevices = [];
 let deviceAliases = {};
 let __alerts = [];
@@ -825,7 +828,7 @@ globalThis.fetch = function(url, init){
   }
   const call = { url, init: init || null, body };
   __fetchCalls.push(call);
-  const payload = __fetchResponder ? __fetchResponder(call) : { ok: true };
+  const payload = __fetchResponder ? __fetchResponder(call) : { ok: true, revision:'fixture-next' };
   return Promise.resolve({ ok: true, status: 200, json: async function(){ return payload; } });
 };
 

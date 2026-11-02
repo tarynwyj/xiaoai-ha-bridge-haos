@@ -66,6 +66,7 @@ jobs:
             xiaoai_bridge/test_poll_auth.py \
             xiaoai_bridge/test_sms_login.py \
             xiaoai_bridge/test_xiaomi_login.py \
+            xiaoai_bridge/test_tls_handshake.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
@@ -129,6 +130,9 @@ jobs:
         run: |
           python xiaoai_bridge/test_xiaomi_login.py /tmp/app/bridge.py \
             --html /tmp/app/web/index.html
+
+      - name: Real local TLS certificate handshake (no Xiaomi network)
+        run: python xiaoai_bridge/test_tls_handshake.py
 
       - name: HTTP access control
         run: python xiaoai_bridge/test_api_auth.py /tmp/app

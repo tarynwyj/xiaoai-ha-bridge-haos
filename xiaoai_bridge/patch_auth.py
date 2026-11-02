@@ -3778,7 +3778,7 @@ replace_exact(
             )
         if section == "xiaomi" and wants_clear:
             result = await clear_xiaomi_login()
-            if result.get("ok"):
+            if isinstance(result, dict) and result.get("ok"):
                 result["revision"] = _config_section_revision(load_config(), "xiaomi")
             return result
         incoming = cfg""",

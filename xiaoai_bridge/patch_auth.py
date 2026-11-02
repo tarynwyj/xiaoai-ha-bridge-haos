@@ -1086,10 +1086,13 @@ async def clear_xiaomi_login():
         task = _bridge_task
         if task is not None and not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            finished, pending = await asyncio.wait({task}, timeout=5)
+            if pending:
+                log.warning("桥接器未在超时内退出，拒绝清除凭据以避免旧任务写回")
+                return JSONResponse(
+                    {"ok": False, "msg": "桥接器尚未完全停止，未清除登录凭据，请稍后重试"},
+                    status_code=503,
+                )
         # OTP handlers use the SMS lock. Old requests retain their original
         # credential generation and cannot write after this wipe starts.
         async with _sms_lock_obj():
@@ -3440,15 +3443,19 @@ replace_exact(
     """    cfg = req.config
     # Revisions are response metadata, never persisted as user configuration.
     cfg.pop("_section_revisions", None)
-    if isinstance(cfg.get("xiaomi"), dict) and cfg["xiaomi"].get("clear_login"):
-        await clear_xiaomi_login()
-        cfg["xiaomi"]["cookie_text"] = ""
-        cfg["xiaomi"]["password"] = ""
-        cfg["xiaomi"].pop("clear_login", None)
+    section = getattr(req, "section", None)
+    wants_clear = isinstance(cfg.get("xiaomi"), dict) and bool(cfg["xiaomi"].get("clear_login"))
+    # Legacy clear is standalone, never an incomplete full-config save.
+    if wants_clear and section is None:
+        return await clear_xiaomi_login()
+    if wants_clear and section != "xiaomi":
+        return JSONResponse(
+            {"ok": False, "msg": "clear_login 仅允许用于小米配置分区"},
+            status_code=400,
+        )
     existing = load_config()
     # Preserve unrelated configuration from disk: stale tabs must not
     # overwrite aliases, tokens or another tab's settings.
-    section = getattr(req, "section", None)
     if section:
         if section not in ("xiaomi", "ha", "rules", "adv"):
             return {"ok": False, "msg": "不支持的配置分区"}
@@ -3462,12 +3469,25 @@ replace_exact(
                                     **dict(incoming.get("homeassistant") or {})}
         elif section == "rules":
             if "intent_rules" not in incoming or not isinstance(incoming["intent_rules"], list):
-                return {"ok": False, "msg": "规则保存必须明确提供 intent_rules 数组"}
+                return JSONResponse(
+                    {"ok": False, "msg": "规则保存必须明确提供 intent_rules 数组"},
+                    status_code=422,
+                )
             cfg["intent_rules"] = incoming["intent_rules"]
         else:
             for key in ("poll_interval_seconds", "ai_mode", "openai"):
                 if key in incoming:
                     cfg[key] = incoming[key]
+    else:
+        # Legacy clients may submit only some keys; never delete fields absent
+        # from their payload, even when they omit the section selector.
+        incoming = cfg
+        cfg = dict(existing)
+        for key, value in incoming.items():
+            if key in ("xiaomi", "homeassistant", "openai") and isinstance(value, dict):
+                cfg[key] = {**dict(existing.get(key) or {}), **value}
+            else:
+                cfg[key] = value
     # 脱敏字段保留原值
 """,
 )
@@ -3561,7 +3581,11 @@ replace_exact(
     """                login_result = await _otp_password_login(
                     mi_cfg["username"], mi_cfg["password"]
                 )
-                if login_result.get("ok"):
+                if login_result.get("need_otp"):
+                    # A background startup cannot complete interactive verification.
+                    await _reset_otp_state()
+                    log.info("后台登录需要二次验证，请在管理页面手动登录")
+                if login_result.get("ok") and login_result.get("verified") and not login_result.get("need_otp"):
                     _set_token(account, load_config())
                     candidate = MiNAService(account)
                     devices = await candidate.device_list()
@@ -3752,6 +3776,11 @@ replace_exact(
                  "msg": "这个配置分区已在其他窗口更新，未覆盖现有数据；请备份当前修改后刷新页面"},
                 status_code=409,
             )
+        if section == "xiaomi" and wants_clear:
+            result = await clear_xiaomi_login()
+            if result.get("ok"):
+                result["revision"] = _config_section_revision(load_config(), "xiaomi")
+            return result
         incoming = cfg""",
 )
 
@@ -3763,6 +3792,18 @@ replace_exact(
     """    log.info("配置已保存")
     return {"ok": True, "revision": _config_section_revision(cfg, section) if section else None}
 """,
+)
+
+# A slow legacy Xiaomi login may finish after another tab saved unrelated
+# config. Re-read the current file and update just the cookie field.
+replace_exact(
+    "legacy Xiaomi test must not write a stale whole-config snapshot",
+    '                        save_config({**cfg, "xiaomi": {**mi, "cookie_text": cookie_text}})',
+    '''                        latest = load_config()
+                        latest_mi = latest.setdefault("xiaomi", {})
+                        if not latest_mi.get("cookie_text"):
+                            latest_mi["cookie_text"] = cookie_text
+                            save_config(latest)''',
 )
 
 # Validate the built Python AST, not the patch source's quoted upstream templates.

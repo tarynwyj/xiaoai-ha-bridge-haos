@@ -251,6 +251,9 @@ class Harness:
             "command_count": 0,
         }
         self.account_hooks = {}
+        self.login_needs_otp = False
+        self.otp_pending = False
+        self.otp_cleanups = 0
         FakeHAClient.state = self.bridge_state
         self.namespace = self._build_namespace()
 
@@ -315,6 +318,9 @@ class Harness:
             )
 
         async def fake_otp_password_login(username, password):
+            if self.login_needs_otp:
+                self.otp_pending = True
+                return {"ok": True, "need_otp": True, "verified": False}
             from miservice import MiAccount
             account = MiAccount(FakeSession(), username, password, None)
             account.token = {"deviceId": "OTPDEVICE", "userId": "user-1",
@@ -326,6 +332,10 @@ class Harness:
                 "serviceToken": "fresh-service-token"
             })
             return {"ok": True, "verified": True, "devices": [{"deviceID": "speaker-1", "hardware": "L05C"}]}
+
+        async def reset_otp_login():
+            self.otp_pending = False
+            self.otp_cleanups += 1
 
         async def verified_service_login(session, uri, data=None, device_id="", token=None,
                                          user_agent=""):
@@ -346,6 +356,7 @@ class Harness:
             "_credential_write_allowed": lambda: True,
             "clear_xiaomi_login": clear_synthetic_login,
             "_otp_password_login": fake_otp_password_login,
+            "_reset_otp_state": reset_otp_login,
             "TOKEN_PATH": self.token_path,
             "AUTH_PATH": self.auth_path,
             "CONFIG_PATH": self.cfg_path,
@@ -673,6 +684,21 @@ def scenario_post_config_credentials(root: Path):
     return "post_config keeps secrets unless the user explicitly clears them"
 
 
+def scenario_background_otp_must_not_count_as_login(root: Path):
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["username"] = "someone"
+    harness.cfg["xiaomi"]["password"] = "test-password"
+    harness.login_needs_otp = True
+    harness.run()
+    assert harness.otp_cleanups == 1, "background login requiring OTP must close pending verification"
+    assert not harness.otp_pending, "pending OTP state may not survive a failed background login"
+    assert not harness.bridge_state["connected"], "need_otp is not verified login"
+    assert not harness.auth_path.exists() and not harness.token_path.exists(), (
+        "OTP pending may not persist a new credential set"
+    )
+    return "background startup requiring OTP refuses false success and closes its session"
+
+
 def scenario_multi_entity_rules():
     intent_node = next(
         node for node in tree.body
@@ -709,6 +735,7 @@ def main():
         scenario_runtime_refresh_failure,
         scenario_save_credentials_never_blank,
         scenario_post_config_credentials,
+        scenario_background_otp_must_not_count_as_login,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

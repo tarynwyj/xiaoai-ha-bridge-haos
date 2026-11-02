@@ -557,10 +557,24 @@ def main():
 
         # ── logout ──
         client.post("/api/session", json_body={"token": token})
+        old_cookie = client.cookies.get(bridge.SESSION_COOKIE)
+        assert old_cookie
         assert client.post("/api/logout", headers=UI_HEADER).status_code == 200
-        client.cookies.clear()
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: old_cookie}).status_code == 401, (
+            "a replay of a logged-out cookie must be refused by the server"
+        )
         assert client.get("/api/status").status_code == 401
-        ok("logout invalidates the direct session")
+        fresh_login = client.post("/api/session", json_body={"token": token})
+        assert fresh_login.status_code == 200
+        fresh_cookie = client.cookies.get(bridge.SESSION_COOKIE)
+        assert fresh_cookie != old_cookie
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: fresh_cookie}).status_code == 200
+        bridge._active_sessions[bridge._session_key(fresh_cookie)] = 1
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: fresh_cookie}).status_code == 401, (
+            "an expired cookie must be invalid even if the browser still sends it"
+        )
+        client.cookies.clear()
+        ok("logout revokes replayed direct cookies, new sessions are unique, expiry is enforced")
 
         # ── E: explicit credential clear removes files and stored cookie ──
         client.post("/api/session", json_body={"token": token})

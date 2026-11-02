@@ -948,6 +948,7 @@ const elements={
 global.document={getElementById:(id)=>elements[id]||null};
 global.showAlert=(a,cls,msg)=>{calls.push(['alert',cls,msg]);};
 global.renderDeviceList=(d)=>{calls.push(['devices',d]);};
+global.refreshXiaomiRevision=async()=>{calls.push(['revision_refresh']);return true;};
 global.fetch=(url,init)=>{
   calls.push(['fetch',url,init&&init.method,init&&init.body]);
   return Promise.resolve({ok:true,json:()=>Promise.resolve(RESPONSE)});

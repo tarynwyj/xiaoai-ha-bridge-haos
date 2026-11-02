@@ -1075,24 +1075,41 @@ async def clear_xiaomi_login():
     .mi.token. Because the files are gone, no later start-up can silently
     resurrect the credentials the user asked to remove.
     \'\'\'
-    lock = _sms_lock_obj()
-    async with lock:
-        await _reset_otp_state()
-        await _close_pending_session()
-        _clear_pending_login()
-        _qr_state.clear()
-        removed = _delete_saved_login_files()
-    cfg = load_config()
-    mi_cfg = cfg.setdefault("xiaomi", {})
-    if mi_cfg.get("cookie_text"):
-        mi_cfg["cookie_text"] = ""
-        removed.append("cookie_text")
-    if mi_cfg.get("password"):
-        mi_cfg["password"] = ""
-        removed.append("password")
-    save_config(cfg)
-    if bridge_state.get("running"):
-        await stop_bridge()
+    global _credential_generation, _credential_clearing
+    _credential_generation += 1
+    _credential_clearing = True
+    removed = []
+    try:
+        # Cancel and join the bridge before removing any files: it can write
+        # refreshed credentials during a 401 or a startup token exchange.
+        bridge_state["running"] = False
+        task = _bridge_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        # OTP handlers use the SMS lock. Old requests retain their original
+        # credential generation and cannot write after this wipe starts.
+        async with _sms_lock_obj():
+            await _reset_otp_state()
+            await _close_pending_session()
+            _clear_pending_login()
+            _qr_state.clear()
+            removed = _delete_saved_login_files()
+            cfg = load_config()
+            mi_cfg = cfg.setdefault("xiaomi", {})
+            if mi_cfg.get("cookie_text"):
+                mi_cfg["cookie_text"] = ""
+                removed.append("cookie_text")
+            if mi_cfg.get("password"):
+                mi_cfg["password"] = ""
+                removed.append("password")
+            save_config(cfg)
+    finally:
+        _credential_generation += 1
+        _credential_clearing = False
     bridge_state["error"] = None
     log.info("已清除已保存的小米登录凭据: %s", ", ".join(removed) or "无")
     return {
@@ -1238,6 +1255,9 @@ def _save_auth_and_token(account) -> None:
     只写回非空的身份字段；缺失字段回退到磁盘上已有的值，因此一次不完整的
     刷新不会销毁仍然可用的 passToken。
     """
+    if not _credential_write_allowed():
+        log.warning("已取消的登录请求不得重新保存凭据")
+        return
     token = getattr(account, "token", None)
     if not isinstance(token, dict) or not token:
         return
@@ -1915,6 +1935,8 @@ def _persist_sms_credentials(creds: dict) -> None:
     crash-safe transaction: a hard kill between the two renames can still leave a
     mixed pair on disk.
     '''
+    if not _credential_write_allowed():
+        raise RuntimeError("登录凭据已清除，旧请求不得重新写盘")
     missing = _missing_credentials(creds)
     if missing:
         raise ValueError("凭据不完整: " + "、".join(missing))
@@ -3542,6 +3564,40 @@ replace_exact(
                     na = candidate
                     logged_in = True""",
 )
+# ──────────────── Credential epoch guards for concurrent login/clear ────────────────
+replace_exact(
+    "credential generation state",
+    'INGRESS_HEADER = "x-ingress-path"',
+    """import contextvars
+
+_credential_generation = 0
+_credential_clearing = False
+_credential_context = contextvars.ContextVar('xiaoai_credential_generation', default=None)
+
+
+def _credential_write_allowed() -> bool:
+    expected = _credential_context.get()
+    return not _credential_clearing and (
+        expected is None or expected == _credential_generation
+    )
+
+
+INGRESS_HEADER = "x-ingress-path" """.rstrip(),
+)
+
+replace_exact(
+    "capture a request's credential generation before async work",
+    """async def _enforce_access_control(request: Request, call_next):
+    path = request.url.path""",
+    """async def _enforce_access_control(request: Request, call_next):
+    _credential_context.set(_credential_generation)
+    path = request.url.path""",
+)
+
+# Password, OTP, Cookie and QR routes share the same middleware snapshot. The
+# guard is checked immediately before credential persistence (no await between
+# the check and the atomic write), so clearing invalidates old in-flight requests.
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

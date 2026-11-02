@@ -718,6 +718,13 @@ def scenario_background_otp_must_not_count_as_login(root: Path):
 
 def scenario_atomic_timestamp_and_corruption(root: Path):
     harness = Harness(root)
+    harness.write_token({
+        "userId": "user-1", "passToken": "pass-1", "deviceId": "account-device",
+        "micoapi": ["ssecurity-value", "valid-service"],
+    })
+    harness.write_auth({
+        "userId": "user-1", "passToken": "pass-1", "deviceId": "account-device",
+    })
     path = harness.cfg_path.parent / "last_timestamp.json"
     writer = harness.namespace["_write_last_timestamp_atomic"]
     writer(path, {"speaker-1": 123456})

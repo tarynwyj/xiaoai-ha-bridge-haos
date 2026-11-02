@@ -162,6 +162,8 @@ NEW_ONLY_FUNCTIONS = (
     "_delete_saved_login_files",
     "get_config",
     "_config_section_revision",
+    "_saved_credential_pair_conflicted",
+    "_write_last_timestamp_atomic",
     "_load_or_create_access_token",
 )
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the

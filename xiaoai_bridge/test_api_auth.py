@@ -356,7 +356,9 @@ def main():
         assert alias_saved.status_code == 200 and alias_saved.json()["ok"] is True
         scoped = client.post(
             "/api/config", headers=UI_HEADER,
-            json_body={"section": "rules", "config": {
+            json_body={"section": "rules",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["rules"],
+                       "config": {
                 "intent_rules": [{"pattern": "开灯", "action": {
                     "domain": "light", "service": "turn_on",
                     "entity_id": "light.a", "reply": "好的"}}],
@@ -381,7 +383,9 @@ def main():
         bridge.save_config(cfg_before)
         scoped_xiaomi = client.post(
             "/api/config", headers=UI_HEADER,
-            json_body={"section": "xiaomi", "config": {
+            json_body={"section": "xiaomi",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["xiaomi"],
+                       "config": {
                 "xiaomi": {"username": FAKE_USER, "password": bridge.MASKED_VALUE,
                            "cookie_text": bridge.MASKED_VALUE,
                            "hardware": "NEW-HARDWARE"}}},
@@ -393,7 +397,9 @@ def main():
         assert saved_xiaomi["homeassistant"]["verify_ssl"] is True
         scoped_ha = client.post(
             "/api/config", headers=UI_HEADER,
-            json_body={"section": "ha", "config": {
+            json_body={"section": "ha",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["ha"],
+                       "config": {
                 "homeassistant": {"url": "http://homeassistant:80",
                                   "token": bridge.MASKED_VALUE}}},
         )
@@ -402,6 +408,72 @@ def main():
         assert read_config(root)["homeassistant"]["token"] == FAKE_HA_TOKEN
         assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
         ok("scoped Xiaomi/HA saves retain hidden settings and config stays mode 0600")
+
+        # ── real CAS semantics: same section conflicts, other sections do not ──
+        page_a = client.get("/api/config").json()["_section_revisions"].copy()
+        page_b = client.get("/api/config").json()["_section_revisions"].copy()
+        assert all(str(v).startswith("v1:") for v in page_a.values())
+        first = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": page_a["ha"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-a"}}},
+        )
+        assert first.status_code == 200 and first.json()["ok"], first.text
+        assert first.json()["revision"] != page_a["ha"]
+        previous = (root / "config" / "config.yaml").read_bytes()
+        stale = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": page_b["ha"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-b"}}},
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["code"] == "config_conflict"
+        assert (root / "config" / "config.yaml").read_bytes() == previous
+        assert read_config(root)["homeassistant"]["cas_note"] == "tab-a"
+        ok("stale second tab gets 409 and cannot overwrite saved HA changes")
+
+        # The same stale page's rules revision is still current: independent tabs.
+        independent = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "revision": page_b["rules"],
+                       "config": {"intent_rules": cfg_scoped["intent_rules"] + [{
+                           "pattern": "关灯", "action": {
+                               "domain": "light", "service": "turn_off",
+                               "entity_id": "light.a"}}]}},
+        )
+        assert independent.status_code == 200 and independent.json()["ok"], independent.text
+        second = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": first.json()["revision"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-a-second"}}},
+        )
+        assert second.status_code == 200 and second.json()["ok"], second.text
+        assert second.json()["revision"] != first.json()["revision"]
+        assert read_config(root)["homeassistant"]["cas_note"] == "tab-a-second"
+        ok("different sections coexist and fresh CAS tokens allow consecutive saves")
+
+        old_rules = read_config(root)["intent_rules"]
+        absent = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "config": {"intent_rules": []}},
+        )
+        assert absent.status_code == 428 and absent.json()["code"] == "revision_required"
+        assert read_config(root)["intent_rules"] == old_rules
+        stale_rules = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "revision": page_a["rules"],
+                       "config": {"intent_rules": []}},
+        )
+        assert stale_rules.status_code == 409
+        assert read_config(root)["intent_rules"] == old_rules
+        ok("CAS is required even for deliberate clear-all and rejects stale rule deletion")
+
 
         # ── test rules default to pure preview; never trigger HA services ──
         preview = client.post(
@@ -557,7 +629,9 @@ def main():
 
         missing_rules = client.post(
             "/api/config", headers=UI_HEADER,
-            json_body={"section": "rules", "config": {}},
+            json_body={"section": "rules",
+                           "revision": client.get("/api/config").json()["_section_revisions"]["rules"],
+                           "config": {}},
         )
         assert missing_rules.status_code == 200 and missing_rules.json()["ok"] is False
         assert read_config(root)["intent_rules"][0]["pattern"] == "开灯"

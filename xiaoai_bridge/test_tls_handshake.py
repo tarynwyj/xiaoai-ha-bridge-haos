@@ -16,6 +16,9 @@ from pathlib import Path
 
 import aiohttp
 
+# test_api_auth selects the generated runtime at import time.
+if len(sys.argv) < 2:
+    sys.argv.append("/tmp/app")
 from test_api_auth import build_runtime, load_bridge
 
 

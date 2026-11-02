@@ -1006,9 +1006,9 @@ def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
         cfg["xiaomi"] = new_mi
     old_mi = existing.get("xiaomi") or {}
     if new_mi.pop("clear_login", False):
-        _delete_saved_login_files()
+        # The async post_config entrypoint invokes clear_xiaomi_login first.
         new_mi["cookie_text"] = ""
-        log.info("已按请求清除已保存的小米登录凭据")
+        new_mi["password"] = ""
         return
     if new_mi.get("password") in (masked, None):
         new_mi["password"] = old_mi.get("password", "")
@@ -3416,6 +3416,11 @@ replace_exact(
     # 脱敏字段保留原值
 """,
     """    cfg = req.config
+    if isinstance(cfg.get("xiaomi"), dict) and cfg["xiaomi"].get("clear_login"):
+        await clear_xiaomi_login()
+        cfg["xiaomi"]["cookie_text"] = ""
+        cfg["xiaomi"]["password"] = ""
+        cfg["xiaomi"].pop("clear_login", None)
     existing = load_config()
     # Preserve unrelated configuration from disk: stale tabs must not
     # overwrite aliases, tokens or another tab's settings.
@@ -3430,7 +3435,9 @@ replace_exact(
         elif section == "ha":
             cfg["homeassistant"] = dict(incoming.get("homeassistant") or {})
         elif section == "rules":
-            cfg["intent_rules"] = incoming.get("intent_rules", [])
+            if "intent_rules" not in incoming or not isinstance(incoming["intent_rules"], list):
+                return {"ok": False, "msg": "规则保存必须明确提供 intent_rules 数组"}
+            cfg["intent_rules"] = incoming["intent_rules"]
         else:
             for key in ("poll_interval_seconds", "ai_mode", "openai"):
                 if key in incoming:

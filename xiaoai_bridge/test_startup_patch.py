@@ -290,6 +290,17 @@ class Harness:
         return None
 
     def _build_namespace(self):
+        async def clear_synthetic_login():
+            for p in (self.auth_path, self.token_path):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+            mi = self.cfg.setdefault("xiaomi", {})
+            mi["password"] = ""
+            mi["cookie_text"] = ""
+            return {"ok": True}
+
         def persist_synthetic_credentials(creds):
             if not creds.get("userId") or not creds.get("passToken") or not creds.get("serviceToken"):
                 raise ValueError("incomplete")
@@ -333,6 +344,7 @@ class Harness:
             "_mi_service_login_verified": verified_service_login,
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
+            "clear_xiaomi_login": clear_synthetic_login,
             "_otp_password_login": fake_otp_password_login,
             "TOKEN_PATH": self.token_path,
             "AUTH_PATH": self.auth_path,

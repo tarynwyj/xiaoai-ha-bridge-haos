@@ -4129,6 +4129,41 @@ replace_exact(
             ) as r:''',
 )
 
+# Credential pair is updated with rollback, but two renames are not
+# crash-atomic. On the next boot refuse mixed identities instead of silently
+# combining auth.json of one account with .mi.token from another account.
+replace_exact(
+    "reject mismatched saved Xiaomi account identities at startup",
+    '''async def bridge_loop():
+    global _bridge_session
+    cfg = load_config()''',
+    '''def _saved_credential_pair_conflicted() -> bool:
+    if not (AUTH_PATH.exists() and TOKEN_PATH.exists()):
+        return False
+    try:
+        auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        token = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+        if not isinstance(auth, dict) or not isinstance(token, dict):
+            return True
+        return any(
+            not auth.get(key) or not token.get(key)
+            or str(auth[key]) != str(token[key])
+            for key in ("userId", "passToken")
+        )
+    except (OSError, ValueError, TypeError):
+        return True
+
+
+async def bridge_loop():
+    global _bridge_session
+    if _saved_credential_pair_conflicted():
+        bridge_state["error"] = "小米登录凭据文件不一致，请在管理页面清除登录后重新认证"
+        bridge_state["running"] = False
+        log.error("auth.json 与 .mi.token 不一致，已拒绝加载混合身份")
+        return
+    cfg = load_config()''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

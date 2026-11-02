@@ -968,6 +968,24 @@ replace_exact(
       const card=""",
 )
 
+# A QR scan is followed by a legacy device probe that may rotate serviceToken;
+# refresh CAS after that second request, never before it.
+replace_exact(
+    "refresh Xiaomi CAS after QR follow-up instead of before",
+    "await refreshXiaomiRevision();const r2=await fetch('/api/test/xiaomi'",
+    "const r2=await fetch('/api/test/xiaomi'",
+)
+replace_exact(
+    "QR follows probe with fresh Xiaomi revision",
+    "const d2=await r2.json();if(d2.ok&&d2.devices&&d2.devices.length>0)renderDeviceList(d2.devices)",
+    "const d2=await r2.json();await refreshXiaomiRevision();if(d2.ok&&d2.devices&&d2.devices.length>0)renderDeviceList(d2.devices)",
+)
+replace_exact(
+    "manual Xiaomi test also refreshes CAS after success",
+    "if(d.ok&&d.devices&&d.devices.length>0)renderDeviceList(d.devices)}catch(e){showAlert(a,'err','✗ '+e.message)}}",
+    "if(d.ok&&!d.need_verify)await refreshXiaomiRevision();if(d.ok&&d.devices&&d.devices.length>0)renderDeviceList(d.devices)}catch(e){showAlert(a,'err','✗ '+e.message)}}",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

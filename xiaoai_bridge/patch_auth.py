@@ -3478,5 +3478,75 @@ replace_exact(
 """,
 )
 
+# ──────────────── Release hardening: legacy login TLS paths ────────────────
+replace_exact(
+    "old password login uses verified TLS",
+    "resp = await account._serviceLogin('serviceLogin?sid=micoapi&_json=true')",
+    """resp = await _mi_service_login_verified(
+            s, 'serviceLogin?sid=micoapi&_json=true',
+            device_id=account.token.get('deviceId', ''),
+            token=account.token,
+            user_agent=str(getattr(account, 'now_ua', '') or ''),
+        )""",
+)
+replace_exact(
+    "old password authentication POST uses verified TLS",
+    "resp = await account._serviceLogin('serviceLoginAuth2', data)",
+    """resp = await _mi_service_login_verified(
+                s, 'serviceLoginAuth2', data,
+                device_id=account.token.get('deviceId', ''),
+                token=account.token,
+                user_agent=str(getattr(account, 'now_ua', '') or ''),
+            )""",
+)
+replace_exact(
+    "legacy SMS retry uses verified TLS",
+    'resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")',
+    """resp = await _mi_service_login_verified(
+            session, "serviceLogin?sid=micoapi&_json=true",
+            device_id=account.token.get("deviceId", ""), token=account.token,
+            user_agent=str(getattr(account, "now_ua", "") or ""),
+        )""",
+)
+replace_exact(
+    "legacy SMS retry password POST uses verified TLS",
+    'resp = await account._serviceLogin("serviceLoginAuth2", payload)',
+    """resp = await _mi_service_login_verified(
+                session, "serviceLoginAuth2", payload,
+                device_id=account.token.get("deviceId", ""), token=account.token,
+                user_agent=str(getattr(account, "now_ua", "") or ""),
+            )""",
+)
+replace_exact(
+    "startup password fallback reuses verified OTP login",
+    """                if await password_account.login("micoapi"):
+                    candidate = MiNAService(password_account)
+                    devices = await candidate.device_list()
+                    account = password_account
+                    na = candidate
+                    logged_in = True""",
+    """                login_result = await _otp_password_login(
+                    mi_cfg["username"], mi_cfg["password"]
+                )
+                if login_result.get("ok"):
+                    _set_token(account, load_config())
+                    candidate = MiNAService(account)
+                    devices = await candidate.device_list()
+                    na = candidate
+                    logged_in = True""",
+)
+# Validate the built Python AST, not the patch source's quoted upstream templates.
+import ast
+_tree = ast.parse(source)
+_unverified = [
+    (getattr(node, 'lineno', '?'), node.func.attr)
+    for node in ast.walk(_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == '_serviceLogin'
+]
+if _unverified:
+    raise SystemExit("Unsafe dependency _serviceLogin calls in built bridge.py: " + repr(_unverified))
+
 path.write_text(source, encoding="utf-8")
 print(f"Patched {path} with validated micoapi token exchange")

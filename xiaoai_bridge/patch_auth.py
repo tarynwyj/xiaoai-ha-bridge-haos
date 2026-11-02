@@ -3884,6 +3884,82 @@ async def destroy_session(request: Request):
     return response''',
 )
 
+# ──────────────── Polling authentication fallback and identity validation ────────────────
+replace_exact(
+    "reject an incomplete cookie_text when there is no token file",
+    '''    if not TOKEN_PATH.exists():
+        if mi_cfg.get("cookie_text"):
+            from http.cookies import SimpleCookie
+            sc = SimpleCookie()
+            sc.load(mi_cfg["cookie_text"])
+            return {k: m.value for k, m in sc.items()}
+        return None
+''',
+    '''    if not TOKEN_PATH.exists():
+        return _valid_saved_cookie_text(mi_cfg)
+''',
+)
+replace_exact(
+    "add validated cookie fallback helper",
+    '''def _get_cookie(cfg: dict) -> dict | None:''',
+    '''def _valid_saved_cookie_text(mi_cfg: dict) -> dict | None:
+    from http.cookies import SimpleCookie
+    raw = str(mi_cfg.get("cookie_text") or "")
+    if not raw:
+        return None
+    try:
+        sc = SimpleCookie()
+        sc.load(raw)
+        parsed = {key: item.value for key, item in sc.items()}
+        if parsed.get("userId") and parsed.get("serviceToken"):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _get_cookie(cfg: dict) -> dict | None:''',
+)
+replace_exact(
+    "invalid cached micoapi falls back to validated cookie_text",
+    '''        micoapi = user_data.get("micoapi")
+        if not micoapi:
+            return None
+        service_token = micoapi[1]''',
+    '''        micoapi = user_data.get("micoapi")
+        if not isinstance(micoapi, (list, tuple)) or len(micoapi) < 2 or not micoapi[1]:
+            return _valid_saved_cookie_text(mi_cfg)
+        service_token = micoapi[1]''',
+)
+replace_exact(
+    "unreadable token uses verified cookie_text, never returns half-auth",
+    '''    except Exception as e:
+        log.warning("读取 .mi.token 失败: %s", e)
+        return None
+
+
+async def _get_latest_ask_from_xiaoai''',
+    '''    except Exception as e:
+        log.warning("读取 .mi.token 失败: %s", e)
+        return _valid_saved_cookie_text(mi_cfg)
+
+
+async def _get_latest_ask_from_xiaoai''',
+)
+replace_exact(
+    "reject credential sets with empty deviceId",
+    '''    return [key for key in ("userId", "passToken", "serviceToken") if not creds.get(key)]''',
+    '''    return [key for key in ("userId", "passToken", "serviceToken", "deviceId")
+            if not str(creds.get(key) or "").strip()]''',
+)
+replace_exact(
+    "generate a deviceId even for direct-serviceToken cookie login",
+    '''    device_id = str(cookies.get("deviceId") or "").strip()
+    service_token = str(cookies.get("serviceToken") or "").strip()''',
+    '''    device_id = str(cookies.get("deviceId") or "").strip() or secrets.token_hex(8).upper()
+    service_token = str(cookies.get("serviceToken") or "").strip()''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

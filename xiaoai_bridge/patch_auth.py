@@ -3667,6 +3667,102 @@ replace_exact(
 ''',
 )
 
+# ──────────────── Per-section optimistic concurrency (CAS) ────────────────
+replace_exact(
+    "revision signature from actual unmasked stored config",
+    "def _peer_is_supervisor(host) -> bool:",
+    """def _config_section_revision(cfg: dict, section: str) -> str:
+    '''Opaque keyed snapshot of exactly the fields managed by one UI section.
+
+    HMAC prevents the revision token from becoming a password/token hash oracle.
+    Two tabs loading the same section receive the same revision; an unrelated
+    section change leaves it unchanged.
+    '''
+    if section == "xiaomi":
+        value = cfg.get("xiaomi") or {}
+    elif section == "ha":
+        value = cfg.get("homeassistant") or {}
+    elif section == "rules":
+        value = cfg.get("intent_rules", [])
+    elif section == "adv":
+        value = {key: cfg.get(key) for key in
+                 ("poll_interval_seconds", "ai_mode", "openai")}
+    else:
+        raise ValueError("unknown configuration section")
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"), default=str)
+    return "v1:" + hmac.new(
+        ACCESS_TOKEN.encode("utf-8"),
+        (section + ":" + canonical).encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def _peer_is_supervisor(host) -> bool:""",
+)
+
+replace_exact(
+    "GET config returns section revisions before secrets are masked",
+    """    masked = MASKED_VALUE
+    xiaomi = cfg.setdefault("xiaomi", {})""",
+    """    cfg["_section_revisions"] = {
+        section: _config_section_revision(cfg, section)
+        for section in ("xiaomi", "ha", "rules", "adv")
+    }
+    masked = MASKED_VALUE
+    xiaomi = cfg.setdefault("xiaomi", {})""",
+)
+
+replace_exact(
+    "scoped save accepts one expected section revision",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+""",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+    revision: str | None = None
+""",
+)
+
+replace_exact(
+    "reject stale or missing CAS revision before scoped save",
+    """        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return {"ok": False, "msg": "不支持的配置分区"}
+        incoming = cfg""",
+    """        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return JSONResponse(
+                {"ok": False, "msg": "不支持的配置分区"}, status_code=400
+            )
+        expected = getattr(req, "revision", None)
+        if not isinstance(expected, str) or not expected:
+            return JSONResponse(
+                {"ok": False, "code": "revision_required",
+                 "msg": "缺少配置版本，请刷新页面后保存"},
+                status_code=428,
+            )
+        current_revision = _config_section_revision(existing, section)
+        if not hmac.compare_digest(expected, current_revision):
+            return JSONResponse(
+                {"ok": False, "code": "config_conflict",
+                 "section": section,
+                 "msg": "这个配置分区已在其他窗口更新，未覆盖现有数据；请备份当前修改后刷新页面"},
+                status_code=409,
+            )
+        incoming = cfg""",
+)
+
+replace_exact(
+    "successful scoped save issues the new section revision",
+    """    log.info("配置已保存")
+    return {"ok": True}
+""",
+    """    log.info("配置已保存")
+    return {"ok": True, "revision": _config_section_revision(cfg, section) if section else None}
+""",
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

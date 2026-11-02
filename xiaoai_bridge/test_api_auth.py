@@ -492,6 +492,48 @@ def main():
         assert not (root / "config" / ".mi.token").exists()
         ok("cleared credentials stay cleared (no silent resurrection)")
 
+        # ── deterministically race a stale authentication request with clear ──
+        async def race_stale_write_against_clear():
+            begun = asyncio.Event()
+            resume = asyncio.Event()
+            identity = {"userId": "stale", "passToken": "stale-pass",
+                        "deviceId": "stale-dev", "ssecurity": "stale-sec",
+                        "serviceToken": "stale-service"}
+
+            async def delayed_authenticated_request():
+                # Middleware captures this generation on request entry.
+                bridge._credential_context.set(bridge._credential_generation)
+                begun.set()
+                await resume.wait()
+                try:
+                    bridge._persist_sms_credentials(identity)
+                except RuntimeError as exc:
+                    return "旧请求" in str(exc)
+                return False
+
+            pending = asyncio.create_task(delayed_authenticated_request())
+            await begun.wait()
+            await bridge.clear_xiaomi_login()
+            resume.set()
+            return await pending
+
+        assert asyncio.run(race_stale_write_against_clear()), (
+            "an in-flight old login must be refused after credential clear"
+        )
+        assert not (root / "config" / ".mi.token").exists()
+        assert not (root / "config" / "auth.json").exists()
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        ok("in-flight authentication cannot resurrect credentials after clear")
+
+        missing_rules = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "config": {}},
+        )
+        assert missing_rules.status_code == 200 and missing_rules.json()["ok"] is False
+        assert read_config(root)["intent_rules"][0]["pattern"] == "开灯"
+        ok("omitting intent_rules never erases saved rules")
+
+
         # ── the access token survives a reload (persisted under /data) ──
         reloaded = load_bridge(root)
         assert reloaded.ACCESS_TOKEN == token, "access token must persist across restarts"

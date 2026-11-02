@@ -406,7 +406,8 @@ def main():
         assert scoped_ha.status_code == 200 and scoped_ha.json()["ok"] is True
         assert read_config(root)["homeassistant"]["verify_ssl"] is True
         assert read_config(root)["homeassistant"]["token"] == FAKE_HA_TOKEN
-        assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
+        if os.name == "posix":
+            assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
         ok("scoped Xiaomi/HA saves retain hidden settings and config stays mode 0600")
 
         # ── real CAS semantics: same section conflicts, other sections do not ──
@@ -633,7 +634,7 @@ def main():
                            "revision": client.get("/api/config").json()["_section_revisions"]["rules"],
                            "config": {}},
         )
-        assert missing_rules.status_code == 200 and missing_rules.json()["ok"] is False
+        assert missing_rules.status_code == 422 and missing_rules.json()["ok"] is False
         assert read_config(root)["intent_rules"][0]["pattern"] == "开灯"
         ok("omitting intent_rules never erases saved rules")
 

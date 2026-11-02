@@ -727,6 +727,56 @@ def main():
         ok("omitting intent_rules never erases saved rules")
 
 
+        # ── middleware owns credential context generation, not just a test stub ──
+        from fastapi import Request
+
+        @bridge.app.get("/api/__generation_probe")
+        async def generation_probe(request: Request):
+            return {
+                "captured": bridge._credential_context.get(),
+                "current": bridge._credential_generation,
+                "allowed": bridge._credential_write_allowed(),
+            }
+
+        first_epoch = client.get(
+            "/api/__generation_probe",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert first_epoch.status_code == 200, first_epoch.text
+        assert first_epoch.json()["captured"] == first_epoch.json()["current"]
+        assert first_epoch.json()["allowed"] is True
+        bridge._credential_generation += 2
+        next_epoch = client.get(
+            "/api/__generation_probe",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert next_epoch.status_code == 200
+        assert next_epoch.json()["captured"] == next_epoch.json()["current"]
+        assert next_epoch.json()["current"] == first_epoch.json()["current"] + 2
+        assert next_epoch.json()["allowed"] is True
+        ok("real HTTP middleware snapshots the credential generation on every request")
+
+        # An administrator may test a private HA address, but never the cloud
+        # metadata service, localhost, credential-bearing or non-HTTP URLs.
+        from types import SimpleNamespace
+        resolve = bridge._resolve_ha_credentials
+        assert resolve(SimpleNamespace(
+            url="http://homeassistant:8123", token="valid-demo-ha-token"
+        )) == ("http://homeassistant:8123", "valid-demo-ha-token")
+        for hostile_url in (
+            "file:///etc/passwd", "http://169.254.169.254/latest/meta-data",
+            "http://localhost:8123", "http://127.0.0.1:8123",
+            "http://user:pass@homeassistant:8123", "http://homeassistant/?token=secret",
+            "http://[::1]:8123",
+        ):
+            try:
+                resolve(SimpleNamespace(url=hostile_url, token="testing"))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unsafe HA URL was accepted: " + hostile_url)
+        ok("HA connection tests accept private HA while rejecting local metadata and unsafe URLs")
+
         # ── the access token survives a reload (persisted under /data) ──
         reloaded = load_bridge(root)
         assert reloaded.ACCESS_TOKEN == token, "access token must persist across restarts"

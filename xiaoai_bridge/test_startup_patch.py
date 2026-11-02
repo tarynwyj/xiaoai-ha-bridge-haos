@@ -290,6 +290,32 @@ class Harness:
         return None
 
     def _build_namespace(self):
+        def persist_synthetic_credentials(creds):
+            if not creds.get("userId") or not creds.get("passToken") or not creds.get("serviceToken"):
+                raise ValueError("incomplete")
+            identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
+            token = dict(identity)
+            token["micoapi"] = [creds.get("ssecurity", ""), creds["serviceToken"]]
+            self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
+            self.token_path.write_text(json.dumps(token), encoding="utf-8")
+            self.cfg.setdefault("xiaomi", {})["cookie_text"] = (
+                "userId=" + identity["userId"] + "; passToken=" + identity["passToken"]
+                + "; serviceToken=" + creds["serviceToken"]
+            )
+
+        async def fake_otp_password_login(username, password):
+            from miservice import MiAccount
+            account = MiAccount(FakeSession(), username, password, None)
+            account.token = {"deviceId": "OTPDEVICE", "userId": "user-1",
+                             "passToken": "pass-token-rotated"}
+            account.token["micoapi"] = ("ssecurity-value", "fresh-service-token")
+            persist_synthetic_credentials({
+                "userId": account.token["userId"], "passToken": account.token["passToken"],
+                "deviceId": account.token["deviceId"], "ssecurity": "ssecurity-value",
+                "serviceToken": "fresh-service-token"
+            })
+            return {"ok": True, "devices": [{"deviceID": "speaker-1", "hardware": "L05C"}]}
+
         async def verified_service_login(session, uri, data=None, device_id="", token=None,
                                          user_agent=""):
             # Simulate the TLS-verified transport, not the pinned library's
@@ -305,6 +331,9 @@ class Harness:
 
         namespace = {
             "_mi_service_login_verified": verified_service_login,
+            "_persist_sms_credentials": persist_synthetic_credentials,
+            "_credential_write_allowed": lambda: True,
+            "_otp_password_login": fake_otp_password_login,
             "TOKEN_PATH": self.token_path,
             "AUTH_PATH": self.auth_path,
             "CONFIG_PATH": self.cfg_path,
@@ -577,11 +606,15 @@ def scenario_save_credentials_never_blank(root: Path):
 
     save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2"}))
     updated = harness.read_token()
-    assert updated["userId"] == "user-2" and updated["passToken"] == "pass-2"
-    assert not updated.get("micoapi"), "a different userId must not inherit the prior serviceToken"
+    assert updated["userId"] == "user-1", "incomplete account switch must keep previous login"
+    assert updated["micoapi"][1] == "old-service", "do not mix old service token with new user"
     save(IncompleteAccount({"userId": "user-3"}))
-    assert harness.read_token() == updated, "a new identity without a passToken must not be mixed with the old account"
-    return "_save_auth_and_token preserves same-user data but isolates different users"
+    assert harness.read_token() == updated, "new identity without a valid service token must not be saved"
+    save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2",
+                            "micoapi": ["sec-2", "svc-2"]}))
+    assert harness.read_token()["userId"] == "user-2"
+    assert harness.read_token()["micoapi"][1] == "svc-2"
+    return "_save_auth_and_token switches account only with complete service credentials"
 
 
 def scenario_post_config_credentials(root: Path):

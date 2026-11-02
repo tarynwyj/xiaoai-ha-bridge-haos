@@ -4080,6 +4080,55 @@ replace_exact(
     '''    automation_id = f"{_AUTOMATION_PREFIX}{int(time.time())}_{secrets.token_hex(4)}"''',
 )
 
+# ──────────────── HA target URL hardening ────────────────
+replace_exact(
+    "validate HA test address and disallow metadata endpoints",
+    '''    url = req.url.strip().rstrip("/")
+    if not url:
+        raise ValueError("请先填写 Home Assistant 地址")
+
+    token = req.token.strip()''',
+    '''    url = req.url.strip().rstrip("/")
+    if not url:
+        raise ValueError("请先填写 Home Assistant 地址")
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.fragment or parts.query):
+        raise ValueError("HA 地址仅支持没有用户名、查询参数的 http(s) URL")
+    try:
+        _ = parts.port
+    except ValueError:
+        raise ValueError("HA 端口无效") from None
+    try:
+        addr = ipaddress.ip_address(parts.hostname)
+    except ValueError:
+        addr = None
+    if addr is not None and (
+        addr.is_link_local or addr.is_multicast or addr.is_unspecified
+        or addr.is_reserved or addr.is_loopback
+    ):
+        raise ValueError("HA 地址不可指向本机、链路本地或保留 IP")
+    if parts.hostname.lower() in ("localhost", "metadata.google.internal"):
+        raise ValueError("HA 地址不可指向本机或云元数据服务")
+
+    token = req.token.strip()''',
+)
+replace_exact(
+    "HA connection test must never forward token through redirect",
+    '''                f"{self.base}/api/", headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)''',
+    '''                f"{self.base}/api/", headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=5), allow_redirects=False''',
+)
+replace_exact(
+    "HA service discovery must not follow token-bearing redirect",
+    '''                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:''',
+    '''                timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False
+            ) as r:''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

@@ -40,6 +40,8 @@ WANTED_FUNCS = [
     "_set_token",
     "_load_saved_xiaomi_identity",
     "_get_cookie",
+    "_valid_saved_cookie_text",
+    "_write_last_timestamp_atomic",
     "_refresh_micoapi_token",
     "_token_snapshot",
     "_restore_token",
@@ -265,13 +267,27 @@ class Harness:
             if len(sleeps) > 50:
                 raise AssertionError("the poll loop did not terminate within 50 iterations")
 
+        class FinishedTask:
+            def done(self):
+                return True
+
+            def cancel(self):
+                return None
+
+            def add_done_callback(self, callback):
+                callback(self)
+
         def create_task(coro):
             coro.close()
-            return SimpleNamespace(done=lambda: True, cancel=lambda: None)
+            return FinishedTask()
+
+        async def to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
         return SimpleNamespace(
             sleep=sleep,
             create_task=create_task,
+            to_thread=to_thread,
             CancelledError=real_asyncio.CancelledError,
             TimeoutError=real_asyncio.TimeoutError,
         )
@@ -354,6 +370,7 @@ class Harness:
             "_mi_service_login_verified": verified_service_login,
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
+            "_delayed_tasks": set(),
             "clear_xiaomi_login": clear_synthetic_login,
             "_otp_password_login": fake_otp_password_login,
             "_reset_otp_state": reset_otp_login,

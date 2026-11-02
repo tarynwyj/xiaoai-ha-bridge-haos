@@ -277,7 +277,15 @@ class Harness:
         self.cfg = json.loads(json.dumps(cfg))
 
     def _build(self):
+        async def verified_service_login(session, uri, data=None, device_id="",
+                                         token=None, user_agent=""):
+            if not CURRENT["login_script"]:
+                raise RuntimeError("no scripted login response")
+            return CURRENT["login_script"].pop(0)
+
         ns = {
+            "_mi_service_login_verified": verified_service_login,
+            "_credential_write_allowed": lambda: True,
             "aiohttp": aiohttp_mod,
             "app": self.app,
             "asyncio": asyncio,

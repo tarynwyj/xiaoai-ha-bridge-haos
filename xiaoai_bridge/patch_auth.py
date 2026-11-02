@@ -160,7 +160,11 @@ async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
         "userId": str(user_id),
         "passToken": pass_token,
     }
-    resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+    resp = await _mi_service_login_verified(
+        account.session, "serviceLogin?sid=micoapi&_json=true",
+        device_id=device_id, token=account.token,
+        user_agent=str(getattr(account, "now_ua", "") or ""),
+    )
     if resp.get("code") != 0:
         code = resp.get("code", "unknown")
         description = resp.get("description") or resp.get("desc") or "登录验证失败"
@@ -1071,7 +1075,13 @@ async def clear_xiaomi_login():
     .mi.token. Because the files are gone, no later start-up can silently
     resurrect the credentials the user asked to remove.
     \'\'\'
-    removed = _delete_saved_login_files()
+    lock = _sms_lock_obj()
+    async with lock:
+        await _reset_otp_state()
+        await _close_pending_session()
+        _clear_pending_login()
+        _qr_state.clear()
+        removed = _delete_saved_login_files()
     cfg = load_config()
     mi_cfg = cfg.setdefault("xiaomi", {})
     if mi_cfg.get("cookie_text"):
@@ -1233,19 +1243,23 @@ def _save_auth_and_token(account) -> None:
         return
     previous_token = _read_saved_credential(TOKEN_PATH)
     previous_auth = _read_saved_credential(AUTH_PATH)
+    candidate_user = str(token.get("userId") or "").strip()
+    previous_user = str(previous_token.get("userId") or previous_auth.get("userId") or "").strip()
+    same_identity = not candidate_user or candidate_user == previous_user
     identity = {
-        "passToken": token.get("passToken") or previous_token.get("passToken")
-        or previous_auth.get("passToken") or "",
-        "userId": str(token.get("userId") or previous_token.get("userId")
-                      or previous_auth.get("userId") or ""),
-        "deviceId": token.get("deviceId") or previous_token.get("deviceId")
-        or previous_auth.get("deviceId") or "",
+        "passToken": token.get("passToken")
+        or (previous_token.get("passToken") if same_identity else None)
+        or (previous_auth.get("passToken") if same_identity else None) or "",
+        "userId": candidate_user or previous_user,
+        "deviceId": token.get("deviceId")
+        or (previous_token.get("deviceId") if same_identity else None)
+        or (previous_auth.get("deviceId") if same_identity else None) or "",
     }
     if not identity["userId"] or not identity["passToken"]:
         log.warning("跳过保存登录信息：凭据不完整，保留已有文件")
         return
     token_data = dict(identity)
-    micoapi = token.get("micoapi") or previous_token.get("micoapi")
+    micoapi = token.get("micoapi") or (previous_token.get("micoapi") if same_identity else None)
     if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
         token_data["micoapi"] = [micoapi[0], micoapi[1]]
     try:
@@ -3380,6 +3394,87 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
             except Exception:
                 pass
 # ──────────────── HA 设备列表 ────────────────
+""",
+)
+
+# ──────────────── Scoped config writes and rule preview ────────────────
+replace_exact(
+    "save config section request",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+""",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+""",
+)
+
+replace_exact(
+    "save only the requested config section",
+    """    cfg = req.config
+    existing = load_config()
+    # 脱敏字段保留原值
+""",
+    """    cfg = req.config
+    existing = load_config()
+    # Preserve unrelated configuration from disk: stale tabs must not
+    # overwrite aliases, tokens or another tab's settings.
+    section = getattr(req, "section", None)
+    if section:
+        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return {"ok": False, "msg": "不支持的配置分区"}
+        incoming = cfg
+        cfg = dict(existing)
+        if section == "xiaomi":
+            cfg["xiaomi"] = dict(incoming.get("xiaomi") or {})
+        elif section == "ha":
+            cfg["homeassistant"] = dict(incoming.get("homeassistant") or {})
+        elif section == "rules":
+            cfg["intent_rules"] = incoming.get("intent_rules", [])
+        else:
+            for key in ("poll_interval_seconds", "ai_mode", "openai"):
+                if key in incoming:
+                    cfg[key] = incoming[key]
+    # 脱敏字段保留原值
+""",
+)
+
+replace_exact(
+    "opt-in rule execution flag",
+    """class TestRuleRequest(BaseModel):
+    text: str
+    rules: list[dict]
+""",
+    """class TestRuleRequest(BaseModel):
+    text: str
+    rules: list[dict]
+    execute: bool = False
+""",
+)
+
+replace_exact(
+    "rule test only previews by default",
+    """    schedule_days = result.pop("schedule_days", None)
+
+    cfg = load_config()
+""",
+    """    schedule_days = result.pop("schedule_days", None)
+
+    if not req.execute:
+        preview = {**result, "domain": domain, "service": service, "reply": reply}
+        if delay is not None:
+            preview["delay_minutes"] = delay
+        if schedule_type is not None:
+            preview["type"] = schedule_type
+        if schedule_time is not None:
+            preview["schedule_time"] = schedule_time
+        if schedule_days is not None:
+            preview["schedule_days"] = schedule_days
+        return {"matched": True, "executed": False, "preview": True,
+                "msg": "仅预览匹配结果，没有执行 Home Assistant 操作",
+                "action": preview, "ai_used": ai_used}
+
+    cfg = load_config()
 """,
 )
 

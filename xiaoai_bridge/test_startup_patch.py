@@ -325,7 +325,7 @@ class Harness:
                 "deviceId": account.token["deviceId"], "ssecurity": "ssecurity-value",
                 "serviceToken": "fresh-service-token"
             })
-            return {"ok": True, "devices": [{"deviceID": "speaker-1", "hardware": "L05C"}]}
+            return {"ok": True, "verified": True, "devices": [{"deviceID": "speaker-1", "hardware": "L05C"}]}
 
         async def verified_service_login(session, uri, data=None, device_id="", token=None,
                                          user_agent=""):

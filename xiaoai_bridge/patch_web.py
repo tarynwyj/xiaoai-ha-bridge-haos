@@ -906,6 +906,68 @@ replace_exact(
 }""",
 )
 
+# Refresh the Xiaomi CAS token after a successful server-side credential write,
+# but never reload the whole form: other tabs can contain unsaved edits.
+replace_exact(
+    "Xiaomi-only revision refresh helper",
+    "async function startPasswordLogin(){",
+    """async function refreshXiaomiRevision(){
+  try{
+    const r=await fetch('/api/config');
+    if(!r.ok)return false;
+    const d=await r.json();
+    const revision=d&&d._section_revisions&&d._section_revisions.xiaomi;
+    if(!revision)return false;
+    sectionRevisions.xiaomi=revision;
+    return true;
+  }catch(e){return false;}
+}
+async function startPasswordLogin(){""",
+)
+replace_exact(
+    "successful password login refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      otpText('mi-login-status','');""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      otpText('mi-login-status','');""",
+)
+replace_exact(
+    "successful OTP verification refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));""",
+)
+replace_exact(
+    "successful Cookie login refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      if(box)box.value='';""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      if(box)box.value='';""",
+)
+replace_exact(
+    "successful QR polling refreshes Xiaomi CAS only",
+    "showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+d.msg);if(!d.ok)return;const r2",
+    "showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+d.msg);if(!d.ok)return;await refreshXiaomiRevision();const r2",
+)
+replace_exact(
+    "successful legacy SMS completion refreshes Xiaomi CAS only",
+    """      showAlert(a,'ok','✓ '+(d.msg||'短信验证完成'));
+      const card=""",
+    """      await refreshXiaomiRevision();
+      showAlert(a,'ok','✓ '+(d.msg||'短信验证完成'));
+      const card=""",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

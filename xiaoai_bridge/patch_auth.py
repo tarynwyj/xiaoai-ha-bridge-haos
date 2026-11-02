@@ -3438,6 +3438,8 @@ replace_exact(
     # 脱敏字段保留原值
 """,
     """    cfg = req.config
+    # Revisions are response metadata, never persisted as user configuration.
+    cfg.pop("_section_revisions", None)
     if isinstance(cfg.get("xiaomi"), dict) and cfg["xiaomi"].get("clear_login"):
         await clear_xiaomi_login()
         cfg["xiaomi"]["cookie_text"] = ""

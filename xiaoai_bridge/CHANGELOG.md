@@ -62,6 +62,11 @@
   没有 `name` 字段也能正常编辑、保存、导入导出（后端只读 `pattern` 与 `action`，未知字段原样保留）。
 
 ### 构建与测试
+- 新增 `test_rules_browser.py`（42 项检查，真实 Chromium）：用 Playwright 从固定上游重建页面、
+  起本地 HTTP 服务加载真实 HTML、`page.route` 模拟 `/api/config` 与 `/api/devices`，真实点击新增/
+  编辑收起/勾选设备/全选/清空/搜索/单条保存/保存全部/删除，并断言 API 载荷（单条保存不夹带其他
+  草稿、`entity_id` 单/多/空三种形状）与页面显示；`pageerror`、未处理 Promise、`console.error`
+  任一出现即失败。CI 的 host job 会自动安装 Chromium 并运行该套件。
 - 新增 `test_xiaomi_login.py`（550 项检查 / 40 个场景，含针对真实 `miservice_fork==2.9.3` 的契约段）：密码登录直接成功、触发验证码、
   发送冷却与「只在显式点击时发送」、同会话 8 步换 Token（含断言所有 identity/verify 请求
   用的是同一个会话对象）、错误验证码计数与耗尽、TTL 过期、重新开始、unsupported 响应、

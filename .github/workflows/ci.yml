@@ -60,6 +60,7 @@ jobs:
             xiaoai_bridge/test_startup_patch.py \
             xiaoai_bridge/test_api_auth.py \
             xiaoai_bridge/test_web_patch.py \
+            xiaoai_bridge/test_rules_browser.py \
             xiaoai_bridge/test_ingress_contract.py \
             xiaoai_bridge/test_upgrade_data.py \
             xiaoai_bridge/test_poll_auth.py \
@@ -136,6 +137,14 @@ jobs:
         run: |
           python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
           python xiaoai_bridge/test_web_patch.py --html /tmp/app/web/index.html
+
+      - name: Install Playwright + Chromium for the browser suite
+        run: |
+          python -m pip install -r xiaoai_bridge/requirements-test.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Rules page in a real browser (Playwright + Chromium)
+        run: python xiaoai_bridge/test_rules_browser.py --html /tmp/app/web/index.html
 
       - name: HAOS Ingress contract
         run: |

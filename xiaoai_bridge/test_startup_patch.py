@@ -42,6 +42,7 @@ WANTED_FUNCS = [
     "_get_cookie",
     "_valid_saved_cookie_text",
     "_write_last_timestamp_atomic",
+    "_saved_credential_pair_conflicted",
     "_refresh_micoapi_token",
     "_token_snapshot",
     "_restore_token",
@@ -746,6 +747,26 @@ def scenario_atomic_timestamp_and_corruption(root: Path):
     return "timestamps use atomic private writes and fail closed on corruption"
 
 
+def scenario_mixed_credential_pair_is_rejected(root: Path):
+    harness = Harness(root)
+    harness.write_auth({
+        "userId": "account-A", "passToken": "pass-A", "deviceId": "a",
+    })
+    harness.write_token({
+        "userId": "account-B", "passToken": "pass-B", "deviceId": "b",
+        "micoapi": ["sec-B", "svc-B"],
+    })
+    original_auth = harness.auth_path.read_bytes()
+    original_token = harness.token_path.read_bytes()
+    harness.run()
+    assert harness.bridge_state["running"] is False
+    assert harness.bridge_state["connected"] is False
+    assert "不一致" in str(harness.bridge_state["error"])
+    assert harness.auth_path.read_bytes() == original_auth
+    assert harness.token_path.read_bytes() == original_token
+    return "startup refuses mixed or interrupted Xiaomi credential identities"
+
+
 def scenario_multi_entity_rules():
     intent_node = next(
         node for node in tree.body
@@ -784,6 +805,7 @@ def main():
         scenario_post_config_credentials,
         scenario_background_otp_must_not_count_as_login,
         scenario_atomic_timestamp_and_corruption,
+        scenario_mixed_credential_pair_is_rejected,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

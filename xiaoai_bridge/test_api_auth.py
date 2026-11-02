@@ -348,6 +348,42 @@ def main():
         assert saved["homeassistant"]["token"] == FAKE_HA_TOKEN
         ok("cross-site POST is rejected (403) while same-origin save keeps secrets")
 
+        # ── scoped config saves must preserve changes from another tab ──
+        alias_saved = client.post(
+            "/api/aliases", headers=UI_HEADER,
+            json_body={"entity_id": "light.a", "alias": "客厅主灯"},
+        )
+        assert alias_saved.status_code == 200 and alias_saved.json()["ok"] is True
+        scoped = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "config": {
+                "intent_rules": [{"pattern": "开灯", "action": {
+                    "domain": "light", "service": "turn_on",
+                    "entity_id": "light.a", "reply": "好的"}}],
+                "device_aliases": {"light.a": "过期旧别名"},
+                "xiaomi": {"username": FAKE_USER, "cookie_text": ""},
+            }},
+        )
+        assert scoped.status_code == 200 and scoped.json()["ok"] is True, scoped.text
+        cfg_scoped = read_config(root)
+        assert cfg_scoped["device_aliases"]["light.a"] == "客厅主灯", (
+            "saving rules must not roll back a more recently saved device alias"
+        )
+        assert cfg_scoped["xiaomi"]["cookie_text"] == FAKE_COOKIE
+        assert cfg_scoped["intent_rules"][0]["pattern"] == "开灯"
+        ok("scoped rules save preserves device aliases and Xiaomi credentials")
+
+        # ── test rules default to pure preview; never trigger HA services ──
+        preview = client.post(
+            "/api/test/rule", headers=UI_HEADER,
+            json_body={"text": "开灯", "rules": cfg_scoped["intent_rules"]},
+        )
+        assert preview.status_code == 200 and preview.json()["matched"] is True, preview.text
+        assert preview.json()["preview"] is True
+        assert preview.json()["executed"] is False
+        assert preview.json()["action"]["entity_id"] == "light.a"
+        ok("rule test is preview-only unless execution is explicitly requested")
+
         # ── forged ingress header from a non-supervisor peer must not authenticate ──
         client.cookies.clear()
         forged = client.get(
@@ -425,9 +461,25 @@ def main():
 
         # ── E: explicit credential clear removes files and stored cookie ──
         client.post("/api/session", json_body={"token": token})
+        class FakePendingLogin:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        otp_pending = FakePendingLogin()
+        legacy_pending = FakePendingLogin()
+        bridge._otp_session = otp_pending
+        bridge._otp_login.update({"username": "test", "created_at": 1})
+        bridge._pending_session = legacy_pending
+        bridge._pending_login.update({"username": "test"})
+        bridge._qr_state.update({"ready": True, "lp_url": "https://example.invalid"})
         cleared = client.post("/api/xiaomi/clear-login", headers=UI_HEADER)
         assert cleared.status_code == 200, cleared.text
         assert cleared.json()["ok"] is True
+        assert otp_pending.closed and legacy_pending.closed
+        assert not bridge._otp_login and not bridge._pending_login and not bridge._qr_state
+
         assert not (root / "config" / ".mi.token").exists()
         assert not (root / "config" / "auth.json").exists()
         cfg_after = read_config(root)

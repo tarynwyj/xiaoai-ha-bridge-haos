@@ -2294,11 +2294,13 @@ async def _mi_service_login_verified(session, uri: str, data: dict | None = None
         "sdkVersion": "3.9",
         "deviceId": str(device_id or state.get("deviceId") or ""),
     }
-    if "passToken" in state:
+    # 不知道 passToken 时绝不要发一个空的：aiohttp 合并显式 cookies 与会话 CookieJar 时
+    # 同名键由显式值覆盖，空串会把验证链刚写进 Jar 的 passToken 抹掉，restore 请求就
+    # 变成匿名请求（真机「验证码已通过，但恢复登录失败」的根因）。参考实现
+    # miservice 3.0.1 的 _serviceLogin 同样只在已知时才发 userId/passToken。
+    if str(state.get("passToken") or "").strip():
         cookies["userId"] = str(state.get("userId") or "")
         cookies["passToken"] = str(state.get("passToken") or "")
-    else:
-        cookies["passToken"] = ""
     url = OTP_ACCOUNT_BASE + "/pass/" + uri
     headers = {"User-Agent": user_agent or OTP_USER_AGENT}
     timeout = aiohttp.ClientTimeout(total=15)
@@ -2321,6 +2323,36 @@ async def _mi_service_login_verified(session, uri: str, data: dict | None = None
             "retry", "network", "访问小米账号服务失败（网络错误），请稍后重试"
         ) from None
     return _otp_json(raw)
+
+
+def _otp_session_identity(session) -> dict:
+    '''Account cookies the verification chain left in the session CookieJar.
+
+    The OTP protocol authenticates the *session*: after the code is accepted the
+    verification pages set passToken / userId / cUserId as cookies, and the resume
+    request is only accepted while those cookies travel with it. aiohttp sends the
+    Jar by itself, but the resume explicitly passes a cookies mapping, so the same
+    names in that mapping would win. Reading them back here lets the caller put the
+    verified values into the token instead of relying on the merge.
+
+    Values are never logged; an empty result simply means the chain did not set
+    them (the resume then stays anonymous and fails explicitly).
+    '''
+    try:
+        from yarl import URL
+        jar = session.cookie_jar.filter_cookies(URL(OTP_ACCOUNT_BASE))
+    except Exception:
+        return {}
+    try:
+        items = list(jar.items())
+    except Exception:
+        return {}
+    identity = {}
+    for key, morsel in items:
+        value = getattr(morsel, "value", morsel)
+        if value:
+            identity[str(key)] = str(value)
+    return identity
 
 
 def _otp_age_seconds() -> int:
@@ -3088,15 +3120,30 @@ async def _otp_verify_code(code: str) -> dict:
         token = {}
     account.token = token
     token["deviceId"] = device_id or str(token.get("deviceId") or "")
+    # 验证状态记在会话 Cookie 上：先把它读回 token，resume 才不会变成匿名请求。
+    jar_identity = _otp_session_identity(session)
+    if jar_identity.get("passToken"):
+        token["passToken"] = jar_identity["passToken"]
+    if jar_identity.get("userId"):
+        token["userId"] = jar_identity["userId"]
+    log.info("OTP 登录：恢复前会话凭据 (passToken=%s, userId=%s)",
+             "yes" if token.get("passToken") else "no",
+             "yes" if token.get("userId") else "no")
     log.info("OTP 登录：在同一会话内恢复登录（stage=resume_login）")
     resp = await _mi_service_login_verified(
         session, "serviceLogin?sid=micoapi&_json=true", device_id=device_id,
         token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
     )
-    if _otp_int(resp.get("code"), -1) != 0:
+    resume_code = _otp_int(resp.get("code"), -1)
+    if resume_code != 0:
+        # 只记业务码与小米自己的错误短语：它们不含凭据，且是下一轮真机定位的唯一依据。
+        description = str(resp.get("description") or resp.get("desc") or "").strip()[:80]
+        log.warning("OTP 登录：恢复登录被拒绝 (code=%s, description=%s)",
+                    resume_code, description)
         raise OtpFlowError(
             "unsupported", "resume_failed",
-            "验证码已通过，但恢复登录失败（小米未返回成功响应），请重新点击「登录」",
+            "验证码已通过，但恢复登录失败（小米返回 code=" + str(resume_code)
+            + "），请重新点击「登录」",
         )
     devices = await _otp_finish_login(account, resp, device_id, username, password)
     await _reset_otp_state()
@@ -3342,68 +3389,70 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
     user_id = str(cookies.get("userId") or "").strip()
     pass_token = str(cookies.get("passToken") or "").strip()
     device_id = str(cookies.get("deviceId") or "").strip()
-    service_token = str(cookies.get("serviceToken") or "").strip()
-    ssecurity = str(cookies.get("ssecurity") or "").strip()
-    log.info("Cookie 登录：收到 Cookie (serviceToken=%s)", "yes" if service_token else "no")
+    pasted_service_token = str(cookies.get("serviceToken") or "").strip()
+    pasted_ssecurity = str(cookies.get("ssecurity") or "").strip()
+    log.info("Cookie 登录：收到 Cookie (serviceToken=%s)",
+             "yes" if pasted_service_token else "no")
     try:
         from miservice import MiAccount
     except ImportError:
         return {"ok": False, "action": "failed", "msg": "缺少依赖: pip install miservice"}
     session = None
+    service_token = ""
+    ssecurity = ""
     try:
-        if not service_token:
-            from miservice.miaccount import get_random
-            if not device_id:
-                device_id = get_random(16).upper()
-            # 只有需要换取 serviceToken 时才建立会话；直接带 serviceToken 时不发任何请求
-            session = aiohttp.ClientSession()
-            account = MiAccount(session, "", "", None)
-            account.token = {
-                "userId": user_id,
-                "passToken": pass_token,
-                "deviceId": device_id,
-            }
-            log.info("Cookie 登录：用 userId/passToken 换取 micoapi serviceToken")
-            exchanged = False
-            token = getattr(account, "token", None)
-            if not isinstance(token, dict):
-                token = {}
-                account.token = token
-            try:
-                # 契约：先预置 userId/passToken/deviceId，服务端才认这次换取；
-                # 请求本身走本地 helper，避免继承依赖里关闭证书校验的行为。
-                resp = await _mi_service_login_verified(
-                    session, "serviceLogin?sid=micoapi&_json=true",
-                    device_id=device_id, token=token,
-                    user_agent=str(getattr(account, "now_ua", "") or ""),
-                )
-                if _otp_int(resp.get("code"), -1) == 0:
-                    location = str(resp.get("location") or "")
-                    nonce = str(resp.get("nonce") or "")
-                    ssecurity_resp = str(resp.get("ssecurity") or "")
-                    if location and nonce and ssecurity_resp:
-                        service = str(await account._securityTokenService(
-                            location, nonce, ssecurity_resp) or "").strip()
-                        if service:
-                            token["micoapi"] = (ssecurity_resp, service)
-                            exchanged = True
+        from miservice.miaccount import get_random
+        if not device_id:
+            device_id = get_random(16).upper()
+        # 一律先用 userId/passToken 换取 micoapi serviceToken：浏览器里的 serviceToken
+        # 属于网页登录那一套（另一个 sid）而且很快过期，直接拿来打音箱接口必然失败。
+        # 换取成功就用换来的；换取失败时才把粘贴的 serviceToken 当兜底（旧做法）。
+        session = aiohttp.ClientSession()
+        account = MiAccount(session, "", "", None)
+        account.token = {
+            "userId": user_id,
+            "passToken": pass_token,
+            "deviceId": device_id,
+        }
+        log.info("Cookie 登录：用 userId/passToken 换取 micoapi serviceToken")
+        token = account.token
+        try:
+            # 契约：先预置 userId/passToken/deviceId，服务端才认这次换取；
+            # 请求本身走本地 helper，避免继承依赖里关闭证书校验的行为。
+            resp = await _mi_service_login_verified(
+                session, "serviceLogin?sid=micoapi&_json=true",
+                device_id=device_id, token=token,
+                user_agent=str(getattr(account, "now_ua", "") or ""),
+            )
+            code = _otp_int(resp.get("code"), -1)
+            if code == 0:
+                location = str(resp.get("location") or "")
+                nonce = str(resp.get("nonce") or "")
+                ssecurity_resp = str(resp.get("ssecurity") or "")
+                if location and nonce and ssecurity_resp:
+                    service = str(await account._securityTokenService(
+                        location, nonce, ssecurity_resp) or "").strip()
+                    if service:
+                        token["micoapi"] = (ssecurity_resp, service)
+                        ssecurity = ssecurity_resp
+                        service_token = service
                 else:
-                    log.info("Cookie 登录：换取请求被拒绝 (code=%s)", resp.get("code"))
-            except Exception as e:
-                log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
-                exchanged = False
-            pair = token.get("micoapi") if isinstance(token, dict) else None
-            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[1]:
-                ssecurity = str(ssecurity or pair[0] or "")
-                service_token = str(pair[1])
-            elif isinstance(pair, str) and pair:
-                service_token = pair
-            if not exchanged or not service_token:
-                return {
-                    "ok": False,
-                    "action": "exchange_failed",
-                    "msg": "用该 Cookie 换取 serviceToken 失败（Cookie 可能已过期或不完整），请重新登录小米账号后复制新 Cookie",
-                }
+                    log.info("Cookie 登录：换取响应缺少 STS 参数，未取得 serviceToken")
+            else:
+                log.info("Cookie 登录：换取请求被拒绝 (code=%s)", code)
+        except Exception as e:
+            log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
+        if not service_token and pasted_service_token:
+            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            service_token = pasted_service_token
+            ssecurity = pasted_ssecurity
+        if not service_token:
+            return {
+                "ok": False,
+                "action": "exchange_failed",
+                "msg": "用该 Cookie 换取 serviceToken 失败（Cookie 可能已过期或不完整）；"
+                       "如果粘贴内容里带了 serviceToken，请去掉它，只保留 userId 与 passToken 后重试",
+            }
         creds = {
             "userId": user_id,
             "passToken": pass_token,
@@ -3974,9 +4023,9 @@ replace_exact(
 replace_exact(
     "generate a deviceId even for direct-serviceToken cookie login",
     '''    device_id = str(cookies.get("deviceId") or "").strip()
-    service_token = str(cookies.get("serviceToken") or "").strip()''',
+    pasted_service_token = str(cookies.get("serviceToken") or "").strip()''',
     '''    device_id = str(cookies.get("deviceId") or "").strip() or secrets.token_hex(8).upper()
-    service_token = str(cookies.get("serviceToken") or "").strip()''',
+    pasted_service_token = str(cookies.get("serviceToken") or "").strip()''',
 )
 
 # ──────────────── Durable polling watermarks & tracked delayed tasks ────────────────

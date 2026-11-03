@@ -673,10 +673,10 @@ replace_exact(
           仅在扫码与账号密码都不可用时使用：浏览器已登录小米时，可以复制 Cookie 手动登录。<br>
           ① 打开 <a href="https://account.xiaomi.com" target="_blank" style="color:var(--accent)">account.xiaomi.com</a> 并登录<br>
           ② <b style="color:var(--txt-secondary)">F12</b> &rarr; <b style="color:var(--txt-secondary)">Application</b> &rarr; <b style="color:var(--txt-secondary)">Cookies</b><br>
-          ③ 复制 userId 与 passToken（有 serviceToken 也可以一起复制）<br>
+          ③ 复制 <b style="color:var(--txt-secondary)">userId</b> 与 <b style="color:var(--txt-secondary)">passToken</b> 两行；<b>不要</b>复制 serviceToken（浏览器里那个属于网页登录，粘进来会导致校验失败）<br>
           ④ 粘贴到下面 &rarr; 点「验证 Cookie」
         </div>
-        <div class="field"><label>Cookie 文本</label><textarea id="mi-cookie-text" rows="3" placeholder="userId=xxx; passToken=xxx; serviceToken=xxx; ..."></textarea></div>
+        <div class="field"><label>Cookie 文本</label><textarea id="mi-cookie-text" rows="3" placeholder="userId=xxx; passToken=xxx"></textarea></div>
         <div class="input-row" style="margin-top:8px">
           <button class="btn btn-primary" id="mi-cookie-submit" onclick="verifyCookieLogin()">&#10003; 验证 Cookie</button>
           <span id="mi-cookie-status" style="font-size:11px;color:var(--txt-muted)"></span>

@@ -1,5 +1,36 @@
 # Changelog
 
+## 未发布（1.0.13 真机反馈修复）
+
+### 登录（账号密码 + 验证码）
+- 修复真机「验证码已通过，但恢复登录失败」：`_mi_service_login_verified` 复刻
+  `miservice_fork==2.9.3` 时保留了 `else: cookies["passToken"] = ""`。aiohttp 合并显式
+  `cookies=` 与会话 CookieJar 时同名键由显式值覆盖，这一行会把验证链刚写进 Jar 的
+  `passToken` 清空，同会话 resume 于是变成匿名请求。现在 token 里没有 `passToken` 时不再
+  发送该 Cookie（与 `miservice==3.0.1` 的 `_serviceLogin` 一致）。
+- 新增 `_otp_session_identity()`：resume 前从会话 CookieJar 读回 `account.xiaomi.com` 上的
+  `passToken` / `userId` 写进 token，不再依赖 aiohttp 的合并语义；日志只记录这两个凭据的
+  "有/无"，从不记录值。
+- resume 被拒时记录并展示小米返回的业务码与错误短语（日志
+  `恢复登录被拒绝 (code=..., description=...)`，界面 `…（小米返回 code=…）`），下一轮真机
+  可直接区分参数不合法、风控或需要再验证；日志与界面都不含凭据。
+
+### 登录（手动 Cookie）
+- 「验证 Cookie」改为**先换取、后兜底**：一律先用 `userId`/`passToken` 换 micoapi
+  `serviceToken`，换取失败时才把粘贴内容里的 `serviceToken` 当兜底。浏览器
+  `account.xiaomi.com` 的 `serviceToken` 属于网页登录（另一个 sid）且很快失效，之前
+  「有就直接用」必然在设备列表校验处失败。
+- 界面第 ③ 步与输入框占位符改为「只复制 userId 与 passToken，不要复制 serviceToken」，
+  并说明原因；换取失败提示会建议去掉 `serviceToken` 后重试。
+- 设备探测失败仍是显式错误且不写任何凭据文件（行为未变）。
+
+### 测试
+- `test_xiaomi_login.py`：把「没有 passToken 时发送空 passToken」的断言改为「不发送该
+  Cookie」；verify 场景模拟验证链在会话里写入 `passToken`/`userId`，断言 resume 带上它们
+  且日志不记录值；新增 resume 被拒场景（断言业务码与 description 进日志/界面、不写文件、
+  清空 OTP 状态）；Cookie 场景改为「换取优先」，并新增「换取失败才兜底」与「兜底也失败
+  不写盘」。
+
 ## 1.0.13
 
 本版把 1.0.12 之后合入 `main` 的规则页修复一起发出去（NodeList 按钮失效、多设备选择状态丢失、

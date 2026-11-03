@@ -440,6 +440,21 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "自定义重复必须填写星期" in html,
             "empty custom weekday must be refused in the page",
         ),
+        (
+            "schedules form treats 504 as pending, not as failure",
+            "r.status===504" in html and "创建结果待确认" in html,
+            "HTTP 504 must show a pending-result warning, not '创建失败'",
+        ),
+        (
+            "schedules delete warns when the reload failed",
+            "d.reloaded===false" in html and "配置已删除，但 HA 重新加载失败" in html,
+            "the delete handler must surface a failed reload",
+        ),
+        (
+            "schedules form carries optional service data",
+            'id="sch-data"' in html and "data:extra" in html,
+            "the form must send the optional service data JSON",
+        ),
     ]
 
 

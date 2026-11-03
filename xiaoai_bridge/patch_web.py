@@ -1093,6 +1093,11 @@ replace_exact(
     "const id=(s.config_id||'').trim()||s.entity_id.replace('automation.','');",
 )
 replace_exact(
+    "schedules delete warns when the reload failed",
+    "if(d.ok){showAlert(a,'ok','已删除');loadSchedules()}else showAlert(a,'err',d.detail||'失败')",
+    "if(d.ok){showAlert(a,d.reloaded===false?'warn':'ok',d.reloaded===false?('⚠ '+(d.msg||'配置已删除，但 HA 重新加载失败')):'已删除');loadSchedules()}else showAlert(a,'err',d.detail||'失败')",
+)
+replace_exact(
     "schedules empty state mentions the new-task form",
     '<span style="font-size:11px">对小爱说「每天七点半打开热水器」</span>',
     '<span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span>',
@@ -1114,6 +1119,7 @@ replace_exact(
           <div class="field"><label>服务 service</label><input id="sch-service" value="turn_on" placeholder="turn_on"></div>
         </div>
         <div class="field"><label>实体 entity_id（可为空）</label><input id="sch-entity" placeholder="light.xiaomi_xxx"></div>
+        <div class="field"><label>服务参数（JSON，可留空；如 select.select_option 需要 option）</label><input id="sch-data" placeholder='{"option": "Heat"}'></div>
         <div class="input-row" style="margin-top:8px"><button class="btn btn-primary" id="sch-create" onclick="createSchedule()">&#10003; 创建</button><button class="btn" onclick="scheduleFormToggle()">取消</button><span id="sch-status" style="font-size:11px;color:var(--txt-muted)"></span></div>
         <div style="font-size:11px;color:var(--txt-dim);margin-top:6px">创建出来的是 HA 自动化（别名「小爱桥接-HH:MM 实体」），会出现在下方列表；也可以继续用语音「每天七点半打开热水器」。</div>
       </div>''',
@@ -1130,14 +1136,19 @@ async function createSchedule(){
   const val=function(id){const el=document.getElementById(id);return el?String(el.value||'').trim():'';};
   const time=val('sch-time');const domain=val('sch-domain');const service=val('sch-service');const entity=val('sch-entity');
   const daysSel=document.getElementById('sch-days');const daysRaw=scheduleDaysValue();
+  const dataRaw=val('sch-data');let extra={};
+  if(dataRaw){try{extra=JSON.parse(dataRaw)}catch(e){showAlert(a,'err','✗ 服务参数不是合法 JSON');return;}}
   if(daysSel&&daysSel.value==='custom'&&!daysRaw){showAlert(a,'err','✗ 自定义重复必须填写星期（如 1,3,5 或 mon,wed）');return;}
   if(!/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)){showAlert(a,'err','✗ 时间格式无效，请用 HH:MM（24 小时制）');return;}
   if(!entity&&['light','switch','climate','fan','cover','media_player','scene','script','input_boolean'].indexOf(domain)>=0){showAlert(a,'err','✗ 这个服务必须填写实体 entity_id');return;}
   if(btn)btn.disabled=true;if(st)st.textContent='⟳ 正在创建...';
   try{
-    const r=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({time:time,days:daysRaw,domain:domain,service:service,entity_id:entity})});
+    const r=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({time:time,days:daysRaw,domain:domain,service:service,entity_id:entity,data:extra})});
     const d=await r.json().catch(function(){return {};});
-    if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));
+    if(!r.ok){
+      if(r.status===504){if(st)st.textContent='';showAlert(a,'warn','⚠ '+(d&&d.detail||'创建结果待确认，请先去 HA 核对，不要直接重复提交'));return;}
+      throw new Error((d&&d.detail)||('HTTP '+r.status));
+    }
     if(st)st.textContent='';
     showAlert(a,d.reloaded===false?'warn':'ok',(d.reloaded===false?'⚠ ':'✓ ')+(d.msg||'已创建定时任务'));
     scheduleFormToggle();loadSchedules();

@@ -25,11 +25,13 @@ FUNCTIONS = (
     "_normalize_schedule_weekdays",
     "_schedule_form_days",
     "_schedule_form_action",
+    "_schedule_form_data",
     "_automation_entries",
     "_schedule_ha_target_error",
     "_automation_config_state",
     "_create_ha_automation",
     "create_automation",
+    "delete_automation",
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
           "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
@@ -43,9 +45,11 @@ ROUTES = {}
 class FakeHA:
     create_ok = True
     reload_ok = True
+    delete_ok = True
 
     def __init__(self):
         self.created = []
+        self.deleted = []
         self.base = "http://ha.local:8123"
         self.headers = {"Authorization": "Bearer ha-token"}
 
@@ -55,6 +59,10 @@ class FakeHA:
 
     async def reload_automations(self, session):
         return type(self).reload_ok
+
+    async def delete_automation(self, automation_id, session):
+        self.deleted.append(automation_id)
+        return type(self).delete_ok
 
     async def list_automation_states(self, session):
         return []
@@ -69,6 +77,13 @@ class HttpError(Exception):
 
 class StubApp:
     def post(self, path):
+        def decorator(func):
+            func.route = path
+            return func
+
+        return decorator
+
+    def delete(self, path):
         def decorator(func):
             func.route = path
             return func
@@ -157,9 +172,11 @@ def main() -> int:
     normalize_days = ns["_normalize_schedule_weekdays"]
     form_days = ns["_schedule_form_days"]
     form_action = ns["_schedule_form_action"]
+    form_data = ns["_schedule_form_data"]
     automation_entries = ns["_automation_entries"]
     create = ns["_create_ha_automation"]
     create_endpoint = ns["create_automation"]
+    delete_endpoint = ns["delete_automation"]
     checks = 0
     failures = []
 
@@ -290,14 +307,25 @@ def main() -> int:
     check("homeassistant may target any domain",
           error == "" and data == {"entity_id": "switch.plug_1"}, error)
 
+    data, error = form_data(None)
+    check("no service data is fine", error == "" and data == {})
+    data, error = form_data({"option": "Heat"})
+    check("scalar service data kept", data == {"option": "Heat"}, error)
+    data, error = form_data({"option": ["a"]})
+    check("nested service data refused", data == {} and "只支持" in error)
+    data, error = form_data({"Bad-Key": "x"})
+    check("bad data key refused", data == {} and "参数名" in error)
+    data, error = form_data("nope")
+    check("non-object service data refused", data == {} and "JSON 对象" in error)
+
     # ── the schedules-page form: POST /api/automations ──
     def call(req):
         return asyncio.run(create_endpoint(req))
 
     def form(time_value, days="daily", domain="light", service="turn_on",
-             entity="light.a"):
+             entity="light.a", data=None):
         return types.SimpleNamespace(time=time_value, days=days, domain=domain,
-                                     service=service, entity_id=entity)
+                                     service=service, entity_id=entity, data=data)
 
     def expect_error(req, label, hint, status=400):
         try:
@@ -339,7 +367,9 @@ def main() -> int:
     # audit P2-3: the target is checked against HA's own service/entity lists
     ROUTES["http://ha.local:8123/api/services"] = (
         200, [{"domain": "light", "services": {"turn_on": {}, "turn_off": {}}},
-              {"domain": "switch", "services": {"turn_on": {}}}])
+              {"domain": "switch", "services": {"turn_on": {}}},
+              {"domain": "select", "services": {
+                  "select_option": {"fields": {"option": {"required": True}}}}}])
     expect_error(form("07:30", service="turn_onn", entity="light.a"),
                  "form refuses an unknown HA service", "服务", 400)
     expect_error(form("07:30", entity="light.ghost"),
@@ -347,6 +377,18 @@ def main() -> int:
     ROUTES["http://ha.local:8123/api/states/light.a"] = (200, {"entity_id": "light.a"})
     response = call(form("07:30", entity="light.a"))
     check("form accepts a service/entity HA knows", response.get("ok") is True, response)
+
+    # audit P2-3: required service parameters are enforced (select.select_option)
+    ROUTES["http://ha.local:8123/api/states/select.scene"] = (200, {"entity_id": "select.scene"})
+    expect_error(form("07:30", domain="select", service="select_option",
+                      entity="select.scene"),
+                 "form refuses a service without its required parameter",
+                 "还需要参数", 400)
+    response = call(form("07:30", domain="select", service="select_option",
+                         entity="select.scene", data={"option": "Heat"}))
+    check("form passes service data into the action", response.get("ok") is True, response)
+    eq("service data lands in the created action",
+       CREATED_HA[-1].created[-1]["action"][0].get("data"), {"option": "Heat"})
 
     # audit P2-4: created but reload failed must not be reported as "not created"
     ROUTES["http://ha.local:8123/api/config/automation/config/"] = (200, {"alias": "x"})
@@ -381,6 +423,40 @@ def main() -> int:
     CURRENT_CONFIG["homeassistant"] = {"url": "", "token": ""}
     expect_error(form("07:30"), "form refuses when HA is not configured", "HA 未配置", 400)
     CURRENT_CONFIG["homeassistant"] = {"url": "http://ha.local:8123", "token": "ha-token"}
+
+    # ── delete: reload result must be reported, not assumed (audit P2-2) ──
+    def delete(id_value):
+        return asyncio.run(delete_endpoint(id_value))
+
+    def expect_delete_error(id_value, label, hint, status=400):
+        try:
+            result = delete(id_value)
+        except HttpError as exc:
+            check(label, exc.status_code == status and hint in str(exc.detail),
+                  f"got HTTP {exc.status_code}: {exc.detail}")
+            return
+        check(label, False, f"expected HTTPException, got {result}")
+
+    FakeHA.reload_ok = True
+    FakeHA.delete_ok = True
+    response = delete("xiaoai_bridge_delete_me")
+    check("delete reports a successful reload",
+          response.get("ok") is True and response.get("reloaded") is True, response)
+    FakeHA.reload_ok = False
+    try:
+        response = delete("xiaoai_bridge_delete_me")
+        check("delete warns when the reload failed",
+              response.get("ok") is True and response.get("reloaded") is False, response)
+    finally:
+        FakeHA.reload_ok = True
+    FakeHA.delete_ok = False
+    try:
+        expect_delete_error("xiaoai_bridge_delete_me",
+                            "a failed delete returns 500", "删除失败", 500)
+    finally:
+        FakeHA.delete_ok = True
+    expect_delete_error("automation.foreign",
+                        "delete refuses automations from elsewhere", "只能删除", 403)
 
     print()
     if failures:

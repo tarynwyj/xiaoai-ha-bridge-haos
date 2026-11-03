@@ -4487,6 +4487,7 @@ class ScheduleAutomationRequest(BaseModel):
     domain: str = "light"
     service: str = "turn_on"
     entity_id: str = ""
+    data: dict | None = None
 
 
 def _schedule_form_days(value) -> tuple:
@@ -4553,6 +4554,32 @@ def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     return data, ""
 
 
+def _schedule_form_data(value) -> tuple[dict, str]:
+    """Validate the optional service data field of the manual form.
+
+    HA services such as select.select_option need parameters (``option``) that this
+    form has no dedicated input for; a small JSON object keeps them reachable
+    without turning the page into a full action editor. Only flat scalar values and
+    HA-looking field names are accepted.
+    """
+    if value is None or value == "":
+        return {}, ""
+    if not isinstance(value, dict):
+        return {}, "服务参数必须是一个 JSON 对象，例如 {\"option\": \"Heat\"}"
+    data = {}
+    for key, item in value.items():
+        name = str(key or "").strip()
+        if not re.fullmatch(r"[a-z0-9_]+", name):
+            return {}, "服务参数名只能是英文小写字母/数字/下划线: " + name
+        if isinstance(item, bool) or isinstance(item, (int, float)):
+            data[name] = item
+        elif isinstance(item, str) and len(item) <= 200:
+            data[name] = item
+        else:
+            return {}, "服务参数 " + name + " 只支持字符串/数字/布尔值"
+    return data, ""
+
+
 async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
                                     session) -> str:
     """Best-effort check of the target against HA's own service and entity lists.
@@ -4575,13 +4602,28 @@ async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
         return ""
     known = {}
     for item in payload or []:
-        if isinstance(item, dict) and item.get("domain"):
-            known[str(item["domain"])] = set((item.get("services") or {}).keys())
+        if not isinstance(item, dict) or not item.get("domain"):
+            continue
+        domain_name = str(item["domain"])
+        services = item.get("services") or {}
+        known[domain_name] = {}
+        for service_name, spec in (services.items() if isinstance(services, dict) else ()):
+            required = set()
+            fields = (spec or {}).get("fields") if isinstance(spec, dict) else None
+            if isinstance(fields, dict):
+                required = {str(name) for name, field in fields.items()
+                            if isinstance(field, dict) and field.get("required")}
+            required.discard("entity_id")
+            known[domain_name][str(service_name)] = required
     if known:
         if domain not in known:
             return "HA 里没有这个域(domain): " + domain
-        if service not in known.get(domain, set()):
+        if service not in known.get(domain, {}):
             return "HA 里没有这个服务: " + domain + "." + service
+        missing = sorted(known[domain][service] - set((action or {}).keys()))
+        if missing:
+            return ("服务 " + domain + "." + service + " 还需要参数: "
+                    + ", ".join(missing) + "（写在「服务参数」JSON 里）")
     entity_id = str((action or {}).get("entity_id") or "").strip()
     if not entity_id:
         return ""
@@ -4639,11 +4681,15 @@ async def create_automation(req: ScheduleAutomationRequest):
     days, days_error = _schedule_form_days(getattr(req, "days", None))
     if days_error:
         raise HTTPException(400, days_error)
+    extra_data, data_error = _schedule_form_data(getattr(req, "data", None))
+    if data_error:
+        raise HTTPException(400, data_error)
     domain = str(getattr(req, "domain", "") or "").strip().lower()
     service = str(getattr(req, "service", "") or "").strip().lower()
     action, error = _schedule_form_action(domain, service, getattr(req, "entity_id", ""))
     if error:
         raise HTTPException(400, error)
+    action.update(extra_data)
     ha = HAClient(ha_cfg["url"], ha_cfg["token"])
     async with aiohttp.ClientSession() as s:
         target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
@@ -4673,6 +4719,28 @@ async def create_automation(req: ScheduleAutomationRequest):
 
 
 @app.delete("/api/automations/{automation_id}")''',
+)
+
+# 审计修复⑤：删除成功后 reload 失败不能一律报“已删除”。
+replace_exact(
+    "delete reports a failed reload instead of a clean success",
+    r'''    async with aiohttp.ClientSession() as s:
+        ok = await ha.delete_automation(automation_id, s)
+        if ok:
+            await ha.reload_automations(s)
+    if not ok:
+        raise HTTPException(500, "删除失败")
+    return {"ok": True}''',
+    r'''    async with aiohttp.ClientSession() as s:
+        ok = await ha.delete_automation(automation_id, s)
+        reloaded = await ha.reload_automations(s) if ok else False
+    if not ok:
+        raise HTTPException(500, "删除失败")
+    if not reloaded:
+        log.warning("定时任务 %s 的配置已删除，但重新加载自动化失败", automation_id)
+        return {"ok": True, "reloaded": False,
+                "msg": "配置已删除，但 HA 重新加载失败；稍后可在 HA 里重载或重启"}
+    return {"ok": True, "reloaded": True}''',
 )
 
 # Validate the built Python AST, not the patch source's quoted upstream templates.

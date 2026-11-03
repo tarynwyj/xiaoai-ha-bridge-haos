@@ -62,6 +62,13 @@
   `capability_attributes()`（`{id: unique_id}`），它会出现在 `/api/states` 的 attributes 里；
   `config/automation.py` 的 `_write_value` 又固定写入 `{"id": config_key}`，`automation/util.py`
   再把它作为实体的 `unique_id`。回归里额外断言「没有 `attributes.id` 的状态被忽略」。
+- **删除结果也区分 reload**：配置删除成功但 `automation/reload` 失败时返回
+  `ok: true, reloaded: false` 并提示手动重载；删除本身就失败才 500；页面显示警告而不是「已删除」。
+- **前端处理 504**：创建结果未知时页面显示「创建结果待确认，请先去 HA 核对，不要直接重复提交」，
+  不再落进「✗ 创建失败」分支。
+- **服务参数支持**：表单新增「服务参数（JSON，可留空）」；后端只接受扁平标量对象，并按 HA
+  `/api/services` 的 `fields.required` 校验必填参数（如 `select.select_option` 的 `option`），
+  缺参数直接 400 并在消息里点名，避免建出运行必然失败的自动化。
 - CI：Docker 镜像内回归清单补上 `test_schedule_automation.py`（此前只在主机阶段跑）。
 
 ### 测试

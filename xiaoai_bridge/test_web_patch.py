@@ -395,6 +395,66 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "cookie_text:o.cookie_text||''" in html,
             "saveXiaomi() cookie_text handling changed",
         ),
+        (
+            "schedules page has a new-task form",
+            'id="schedule-form"' in html
+            and 'id="sch-time"' in html
+            and 'id="sch-days"' in html
+            and 'id="sch-entity"' in html,
+            "schedules page is missing the create form fields",
+        ),
+        (
+            "schedules new-task button opens the form",
+            'onclick="scheduleFormToggle()"' in html
+            and "function scheduleFormToggle()" in html
+            and 'id="schedule-form"' in html,
+            "new-task button or toggle handler missing",
+        ),
+        (
+            "schedules form posts to the create endpoint",
+            "fetch('/api/automations',{method:'POST'" in html
+            and "async function createSchedule()" in html,
+            "createSchedule() must POST /api/automations",
+        ),
+        (
+            "schedules form repeats presets and a custom weekday field",
+            "scheduleDaysValue()" in html
+            and 'value="weekdays"' in html
+            and 'value="weekends"' in html
+            and 'id="sch-days-custom"' in html,
+            "weekday presets / custom weekday input missing",
+        ),
+        (
+            "schedules list deletes by the HA config id",
+            "(s.config_id||'').trim()" in html
+            and "deleteSchedule(\\''+escAttr(id)+'\\')" in html,
+            "the list must use the HA config id (not the entity id) for delete",
+        ),
+        (
+            "schedules form warns when HA saved but reload failed",
+            "d.reloaded===false" in html,
+            "reload-failure warning missing",
+        ),
+        (
+            "schedules form refuses an empty custom weekday",
+            "自定义重复必须填写星期" in html,
+            "empty custom weekday must be refused in the page",
+        ),
+        (
+            "schedules form treats 504 as pending, not as failure",
+            "r.status===504" in html and "创建结果待确认" in html,
+            "HTTP 504 must show a pending-result warning, not '创建失败'",
+        ),
+        (
+            "schedules delete warns when the reload failed",
+            "d.reloaded===false" in html and "配置已删除，但 HA 重新加载失败" in html,
+            "the delete handler must surface a failed reload",
+        ),
+        (
+            "schedules form carries optional service data",
+            'id="sch-data"' in html and "data:extra" in html,
+            "the form must send the optional service data JSON",
+        ),
     ]
 
 

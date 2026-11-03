@@ -254,6 +254,9 @@ jobs:
             --entrypoint python "$IMAGE" /tmp/test_xiaomi_login.py \
               /app/bridge.py --html /app/web/index.html
           docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_schedule_automation.py:/tmp/test_schedule_automation.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_schedule_automation.py /app/bridge.py
+          docker run --rm \
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \
               --bridge /app/bridge.py --html /app/web/index.html --no-node

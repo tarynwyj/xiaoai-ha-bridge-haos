@@ -109,9 +109,19 @@ class _ResponseContext:
 class FakeJar:
     def __init__(self):
         self.cookie = {}
+        self.filter_urls = []
 
     def update_cookies(self, cookies, url=None):
         self.cookie.update(dict(cookies or {}))
+
+    def filter_cookies(self, url=None):
+        '''What a real aiohttp CookieJar returns for account.xiaomi.com.'''
+        self.filter_urls.append(str(url))
+        from http.cookies import SimpleCookie
+        jar = SimpleCookie()
+        for key, value in self.cookie.items():
+            jar[str(key)] = str(value)
+        return jar
 
 
 ACCOUNT_PASS_URL = "https://account.xiaomi.com/pass/"
@@ -319,6 +329,8 @@ FUNCTIONS = (
     "_otp_int",
     "_otp_field",
     "_otp_json",
+    "_otp_session_identity",
+    "_safe_otp_description",
     "_mi_service_login_verified",
     "_otp_age_seconds",
     "_otp_is_fresh",
@@ -762,6 +774,10 @@ def scenario_verify_success():
         session.responses = [response(200, {"code": 0}), response(200, {"code": 0})]
         send(h)
 
+        # the verification chain authenticates this very session: its pages set these
+        # cookies, and the resume is only accepted while they travel with the request
+        session.jar.cookie.update({"passToken": "jar-pass", "userId": "jar-user"})
+
         CURRENT["verify_response"] = {
             "code": 0,
             "location": "/pass/verify/accepted?token=abc",
@@ -822,6 +838,22 @@ def scenario_verify_success():
         check(CURRENT["security_calls"][-1][2] == "resume-nonce"
               and CURRENT["security_calls"][-1][3] == "resume-ssecurity",
               "the clientSign inputs must be the resume nonce/ssecurity")
+        resume_cookies = CURRENT["verified_login_calls"][-1]["kwargs"].get("cookies") or {}
+        check(resume_cookies.get("passToken") == "jar-pass",
+              f"the resume must carry the passToken the verification session holds, "
+              f"got {resume_cookies}")
+        check(resume_cookies.get("userId") == "jar-user",
+              f"the resume must carry the session userId, got {resume_cookies}")
+        first_cookies = CURRENT["verified_login_calls"][0]["kwargs"].get("cookies") or {}
+        check("passToken" not in first_cookies,
+              f"the anonymous password login must not send an empty passToken, got {first_cookies}")
+        check("恢复前会话凭据 (passToken=yes, userId=yes)" in h.log.joined(),
+              "the log must record whether the resume had session credentials")
+        check("jar-pass" not in h.log.joined() and "jar-user" not in h.log.joined(),
+              "the session credentials must never be logged")
+        check(any("/pass/serviceLogin" in str(url) for url in session.jar.filter_urls),
+              "the resume identity must be read for the resume URL (Cookie Path), got "
+              f"{session.jar.filter_urls}")
 
         if not check(h.auth_path.exists() and h.token_path.exists(),
                      "a verified OTP login must persist both credential files"):
@@ -841,6 +873,46 @@ def scenario_verify_success():
               "a successful login must close and clear the OTP state")
         check(session.closed is True, "the OTP session must be closed after success")
         ok("verify: same-session code -> location -> resume -> serviceToken -> probe -> persist")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 5b. a rejected resume names the Xiaomi code, never a secret ───────────────
+def scenario_resume_rejected():
+    h = Harness()
+    try:
+        session = _drive_verify(h)
+        session.jar.cookie.update({"passToken": "jar-pass", "userId": "jar-user"})
+        session.responses = [
+            response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+            response(200, raw=b"<html>ok</html>"),
+        ]
+        CURRENT["login_script"] = [{
+            "code": 70016, "description": "登录参数不合法",
+            "userId": "login-user", "passToken": "login-pass",
+        }]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is False and data.get("code") == "resume_failed",
+              f"a rejected resume must fail explicitly, got {data}")
+        message = str(data.get("msg") or "")
+        check("70016" in message,
+              f"the user-facing message must carry the Xiaomi code: {message}")
+        log_text = h.log.joined()
+        check("恢复登录被拒绝 (code=70016, description=登录参数不合法)" in log_text,
+              f"the log must record the business code and description: {log_text}")
+        check("jar-pass" not in log_text and "login-pass" not in log_text,
+              "the rejection log must never carry a credential")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "a rejected resume must not exchange any serviceToken")
+        check(h.snapshot_data() == before,
+              "a rejected resume must not write any credential file")
+        check(h.otp_state() == {},
+              "a rejected resume must clear the OTP state so a new code can be requested")
+        ok("resume rejected: the Xiaomi code/description reach the log and the message, "
+           "no credential does")
     finally:
         h.cleanup()
 
@@ -1671,19 +1743,63 @@ def scenario_cookie_login():
         check("serviceToken=cookie-service-token" in cookie_text,
               f"cookie_text must carry the exchanged serviceToken, got {cookie_text!r}")
 
-        # (b) a cookie that already has a serviceToken is probed directly
+        # (b) a pasted serviceToken does not win over a working passToken exchange:
+        #     the browser one belongs to the web login (another sid), never to micoapi
         h2 = Harness()
         try:
-            data = cookie_login(h2, "userId=u; passToken=p; serviceToken=svc-direct; deviceId=d")
-            check(data.get("ok") is True, f"a direct serviceToken cookie must log in, got {data}")
-            check(CURRENT["verified_login_calls"] == [],
-                  "a cookie with serviceToken must not run any exchange")
+            CURRENT["login_script"] = [{
+                "code": 0, "userId": "u", "passToken": "p",
+                "ssecurity": "exchanged-ssecurity",
+                "location": "https://api2.mina.mi.com/sts?sign=exchange",
+                "nonce": "exchanged-nonce",
+            }]
+            CURRENT["service_token"] = "exchanged-service-token"
+            data = cookie_login(h2, "userId=u; passToken=p; serviceToken=pasted-web-token; deviceId=d")
+            check(data.get("ok") is True,
+                  f"a cookie with a pasted serviceToken must still log in, got {data}")
+            check(len(CURRENT["verified_login_calls"]) == 1,
+                  "the passToken exchange must run even when a serviceToken was pasted")
             token = json.loads(h2.token_path.read_text(encoding="utf-8"))
-            check(token.get("micoapi") == ["", "svc-direct"],
-                  f"the direct serviceToken must be persisted, got {token.get('micoapi')}")
+            check(token.get("micoapi") == ["exchanged-ssecurity", "exchanged-service-token"],
+                  f"the exchanged token must win over the pasted one, got {token.get('micoapi')}")
         finally:
             h2.cleanup()
-        ok("cookie: preloaded-token exchange over verified TLS, direct serviceToken also verified")
+
+        # (c) the pasted serviceToken is only a fallback when the exchange fails
+        h3 = Harness()
+        try:
+            CURRENT["login_script"] = []
+            CURRENT["cookie_login"] = "fail"
+            data = cookie_login(h3, "userId=u; passToken=p; serviceToken=svc-fallback")
+            check(data.get("ok") is True,
+                  f"a failed exchange must fall back to the pasted token, got {data}")
+            check(len(CURRENT["verified_login_calls"]) == 1,
+                  "the fallback must still try the exchange first")
+            token = json.loads(h3.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["", "svc-fallback"],
+                  f"the pasted token may only be the fallback, got {token.get('micoapi')}")
+            check("兜底" in h3.log.joined(), "the fallback must be visible in the log")
+        finally:
+            CURRENT["cookie_login"] = "ok"
+            h3.cleanup()
+
+        # (d) exchange failure + failing fallback stays explicit and writes nothing
+        h4 = Harness()
+        try:
+            CURRENT["login_script"] = []
+            CURRENT["cookie_login"] = "fail"
+            CURRENT["device_error"] = RuntimeError("mina 401")
+            before = h4.snapshot_data()
+            data = cookie_login(h4, "userId=u; passToken=p; serviceToken=svc-bad")
+            check(data.get("ok") is False and data.get("action") == "device_list",
+                  f"a bad fallback token must fail at the device probe, got {data}")
+            check(h4.snapshot_data() == before,
+                  "a failed fallback must not write any credential file")
+        finally:
+            CURRENT["cookie_login"] = "ok"
+            CURRENT["device_error"] = None
+            h4.cleanup()
+        ok("cookie: passToken exchange wins, a pasted serviceToken is only a fallback")
     finally:
         h.cleanup()
 
@@ -2289,8 +2405,9 @@ def scenario_verified_transport():
             check(cookies.get("deviceId") == "RANDOMDEVICEID"
                   and cookies.get("sdkVersion") == "3.9",
                   f"the login must carry deviceId/sdkVersion cookies, got {cookies}")
-            check(cookies.get("passToken") == "" and "userId" not in cookies,
-                  f"a token without passToken sends only an empty passToken, got {cookies}")
+            check("passToken" not in cookies and "userId" not in cookies,
+                  f"a token without passToken must not send that cookie at all "
+                  f"(an empty one would cover the session jar), got {cookies}")
             check(second["method"] == "POST"
                   and second["url"] == LOGIN_PREFIX + "Auth2",
                   f"the Auth2 submit must POST serviceLoginAuth2, got {second['url']}")
@@ -2508,6 +2625,60 @@ def scenario_real_293_contracts():
         h.cleanup()
 
 
+# ─────────────── 6. audit fixes: Cookie Path scoping and log sanitisation ───────────────
+def scenario_otp_cookie_path_scope():
+    h = Harness()
+    try:
+        try:
+            import aiohttp as real_aiohttp
+            from yarl import URL as RealURL
+        except Exception as exc:  # pragma: no cover - environment without aiohttp
+            ok(f"[skip] real aiohttp CookieJar unavailable: {exc}")
+            return
+
+        async def run():
+            jar = real_aiohttp.CookieJar()
+            jar.update_cookies_from_headers(
+                ["passToken=PT-VALUE; Path=/pass; Domain=account.xiaomi.com"],
+                RealURL("https://account.xiaomi.com/pass/identity/list"))
+
+            class _Session:
+                cookie_jar = jar
+
+            identity = h.ns["_otp_session_identity"](_Session())
+            root_only = jar.filter_cookies(RealURL("https://account.xiaomi.com/"))
+            return identity, root_only
+
+        identity, root_only = asyncio.run(run())
+        check(identity.get("passToken") == "PT-VALUE",
+              "a Path=/pass cookie must be found via the resume URL, got " + repr(identity))
+        check("passToken" not in root_only,
+              "the fixture must actually be path-scoped (a root filter must miss it)")
+        ok("[audit] resume identity reads the CookieJar with the resume URL "
+           "(Path=/pass cookies are visible; the root URL alone would miss them)")
+    finally:
+        h.cleanup()
+
+
+def scenario_provider_error_is_sanitised():
+    h = Harness()
+    try:
+        safe = h.ns["_safe_otp_description"]
+        raw = ("登录参数不合法 passToken=abc123def456\n控制符\x07 serviceToken="
+               + "A" * 40)
+        text = safe(raw)
+        check("\x07" not in text and "\n" not in text,
+              "control characters must never reach the log, got " + repr(text))
+        check("abc123def456" not in text and "A" * 40 not in text,
+              "credential-like values must be masked, got " + repr(text))
+        check("登录参数不合法" in text,
+              "the human-readable meaning must survive, got " + repr(text))
+        ok("[audit] provider error phrases are masked before logging "
+           "(cookie pairs and long opaque runs never reach the log)")
+    finally:
+        h.cleanup()
+
+
 def main():
     probe = Harness()
     probe.cleanup()
@@ -2524,6 +2695,7 @@ def main():
         scenario_send_after_cooldown,
         scenario_verify_phone_business_code,
         scenario_verify_success,
+        scenario_resume_rejected,
         scenario_wrong_code,
         scenario_otp_device_probe_gates_writes,
         scenario_ttl_expiry,
@@ -2541,6 +2713,8 @@ def main():
         scenario_cookie_login_clears_otp,
         scenario_legacy_message,
         scenario_secrets_not_logged,
+        scenario_otp_cookie_path_scope,
+        scenario_provider_error_is_sanitised,
         scenario_failures_leave_data_untouched,
         scenario_compatibility,
         scenario_verified_transport,

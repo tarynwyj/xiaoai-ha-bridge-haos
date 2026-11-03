@@ -395,6 +395,35 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "cookie_text:o.cookie_text||''" in html,
             "saveXiaomi() cookie_text handling changed",
         ),
+        (
+            "schedules page has a new-task form",
+            'id="schedule-form"' in html
+            and 'id="sch-time"' in html
+            and 'id="sch-days"' in html
+            and 'id="sch-entity"' in html,
+            "schedules page is missing the create form fields",
+        ),
+        (
+            "schedules new-task button opens the form",
+            'onclick="scheduleFormToggle()"' in html
+            and "function scheduleFormToggle()" in html
+            and 'id="schedule-form"' in html,
+            "new-task button or toggle handler missing",
+        ),
+        (
+            "schedules form posts to the create endpoint",
+            "fetch('/api/automations',{method:'POST'" in html
+            and "async function createSchedule()" in html,
+            "createSchedule() must POST /api/automations",
+        ),
+        (
+            "schedules form repeats presets and a custom weekday field",
+            "scheduleDaysValue()" in html
+            and 'value="weekdays"' in html
+            and 'value="weekends"' in html
+            and 'id="sch-days-custom"' in html,
+            "weekday presets / custom weekday input missing",
+        ),
     ]
 
 

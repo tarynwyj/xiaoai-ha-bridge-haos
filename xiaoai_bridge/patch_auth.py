@@ -4360,6 +4360,76 @@ replace_exact(
 ''',
 )
 
+# ──────────────── 定时任务：页面表单创建（与语音路径共用 _create_ha_automation） ────────────────
+replace_exact(
+    "schedules page: create one automation from the form",
+    '@app.delete("/api/automations/{automation_id}")',
+    r'''class ScheduleAutomationRequest(BaseModel):
+    time: str
+    days: str | None = None
+    domain: str = "light"
+    service: str = "turn_on"
+    entity_id: str = ""
+
+
+def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
+    """Validate the schedules-page form and build the action payload.
+
+    Only HA service names (``light`` / ``turn_on``) and a normal entity_id are
+    accepted: the endpoint writes an automation that later runs inside HA, so a
+    typo must be refused before anything is created. Returns (data, error).
+    """
+    domain_text = str(domain or "").strip().lower()
+    service_text = str(service or "").strip().lower()
+    entity_text = str(entity_id or "").strip()
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", domain_text):
+        return {}, "域(domain)应为 HA 的英文名，如 light / switch / climate"
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*", service_text):
+        return {}, "服务(service)应为 HA 的英文服务名，如 turn_on / turn_off"
+    if entity_text and not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", entity_text):
+        return {}, "实体 ID 应形如 light.xiaomi_xxx"
+    data = {}
+    if entity_text:
+        data["entity_id"] = entity_text
+    return data, ""
+
+
+@app.post("/api/automations")
+async def create_automation(req: ScheduleAutomationRequest):
+    """Create one time-triggered automation from the schedules page form.
+
+    The voice path calls the same _create_ha_automation helper, so a manually
+    created task gets the same id prefix, alias, weekday normalisation and HA
+    reload; only the input source differs.
+    """
+    cfg = load_config()
+    ha_cfg = cfg.get("homeassistant", {})
+    if not ha_cfg.get("url") or not ha_cfg.get("token"):
+        raise HTTPException(400, "HA 未配置")
+    schedule_time = _normalize_schedule_time(getattr(req, "time", ""))
+    if not schedule_time:
+        raise HTTPException(400, "时间格式无效，请用 HH:MM（24 小时制）")
+    domain = str(getattr(req, "domain", "") or "").strip().lower()
+    service = str(getattr(req, "service", "") or "").strip().lower()
+    action, error = _schedule_form_action(domain, service, getattr(req, "entity_id", ""))
+    if error:
+        raise HTTPException(400, error)
+    ha = HAClient(ha_cfg["url"], ha_cfg["token"])
+    async with aiohttp.ClientSession() as s:
+        automation_id, ok = await _create_ha_automation(
+            ha, domain, service, action, schedule_time,
+            getattr(req, "days", None), s,
+        )
+    if not ok:
+        raise HTTPException(500, "创建失败，请检查 HA 连接与实体 ID")
+    log.info("已创建定时任务 %s（手动）", automation_id)
+    return {"ok": True, "automation_id": automation_id,
+            "msg": "已创建定时任务 " + schedule_time[:5]}
+
+
+@app.delete("/api/automations/{automation_id}")''',
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

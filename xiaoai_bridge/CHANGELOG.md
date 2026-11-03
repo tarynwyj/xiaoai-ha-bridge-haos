@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布（1.0.13 真机反馈修复）
+## 未发布（1.0.14：真机登录修复 + 定时任务表单）
 
 ### 登录（账号密码 + 验证码）
 - 修复真机「验证码已通过，但恢复登录失败」：`_mi_service_login_verified` 复刻
@@ -24,12 +24,26 @@
   并说明原因；换取失败提示会建议去掉 `serviceToken` 后重试。
 - 设备探测失败仍是显式错误且不写任何凭据文件（行为未变）。
 
+### 定时任务（页面新建）
+- 定时任务页新增「＋ 新建定时任务」表单：时间（24 小时制，`HH:MM`）、重复（每天 / 工作日 /
+  周末 / 自定义星期）、`domain` / `service`、`entity_id`（可留空），点「创建」即可生成 HA 自动化。
+  之前该页只读，只能靠语音「每天七点半打开热水器」创建。
+- 新增 `POST /api/automations`：与语音路径**共用** `_create_ha_automation()`，因此 id 前缀
+  （`xiaoai_bridge_`）、别名「小爱桥接-HH:MM 实体」、星期归一化（名称或 1–7 整数）与创建后的
+  HA reload 完全一致；创建出来会立即出现在页面列表里（列表仍只显示 `automation.xiaoai_bridge_*`）。
+- 输入校验前置：时间格式、`domain`/`service` 只接受 HA 英文名（如 `light` / `turn_on`）、
+  `entity_id` 必须形如 `light.xiaomi_xxx`；HA 未配置返回 400，创建失败返回 500，页面显示具体原因。
+  校验函数 `_schedule_form_action()` 与端点分离，便于回归。
+
 ### 测试
 - `test_xiaomi_login.py`：把「没有 passToken 时发送空 passToken」的断言改为「不发送该
   Cookie」；verify 场景模拟验证链在会话里写入 `passToken`/`userId`，断言 resume 带上它们
   且日志不记录值；新增 resume 被拒场景（断言业务码与 description 进日志/界面、不写文件、
   清空 OTP 状态）；Cookie 场景改为「换取优先」，并新增「换取失败才兜底」与「兜底也失败
   不写盘」。
+- `test_schedule_automation.py`：新增表单校验与 `POST /api/automations` 端点场景（合法请求生成
+  与语音一致的 automation、时间/域/服务/实体非法与 HA 未配置均被拒）；`test_web_patch.py`
+  新增表单结构与 `POST /api/automations` 接线断言。
 
 ## 1.0.13
 

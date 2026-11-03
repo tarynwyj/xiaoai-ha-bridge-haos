@@ -121,6 +121,9 @@ jobs:
             --html /tmp/app/web/index.html
           python xiaoai_bridge/test_api_auth.py /tmp/app
           python xiaoai_bridge/test_web_patch.py --pristine /tmp/pinned/index.html
+          python xiaoai_bridge/test_tls_handshake.py /tmp/app
+          python xiaoai_bridge/test_schedule_automation.py /tmp/app/bridge.py
+          python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
           python xiaoai_bridge/test_ingress_contract.py \
             --bridge /tmp/app/bridge.py \
             --html /tmp/app/web/index.html \

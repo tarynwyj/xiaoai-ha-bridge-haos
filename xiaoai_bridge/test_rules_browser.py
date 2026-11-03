@@ -134,17 +134,34 @@ def main() -> int:
         httpd, url = serve(html.parent)
         result = Result()
         errors: list[str] = []
+        expected_conflict_console: list[str] = []
         posted: list[dict] = []
         seen: dict[str, list] = {"tests": []}
-        state = {"config": json.loads(json.dumps(CONFIG))}
+        state = {
+            "hold": False,
+            "held": [],
+            "config": json.loads(json.dumps(CONFIG)),
+            "revisions": {key: "fixture-" + key + "-0"
+                          for key in ("xiaomi", "ha", "rules", "adv")},
+            "counter": 0,
+        }
 
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch()
                 page = browser.new_page()
                 page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
-                page.on("console", lambda msg: errors.append(f"console.error: {msg.text}")
-                        if msg.type == "error" else None)
+                def capture_console(msg):
+                    if msg.type != "error":
+                        return
+                    if "Failed to load resource: the server responded with a status of 409 (Conflict)" in msg.text:
+                        # Chromium logs an expected CAS refusal as a resource
+                        # error. Only that exact 409 is allowed by this test.
+                        expected_conflict_console.append(msg.text)
+                    else:
+                        errors.append(f"console.error: {msg.text}")
+
+                page.on("console", capture_console)
                 page.add_init_script(
                     "window.__unhandled=[];"
                     "window.addEventListener('unhandledrejection',"
@@ -155,25 +172,69 @@ def main() -> int:
                     path = route.request.url.split("://", 1)[-1]
                     path = "/" + path.split("/", 1)[1] if "/" in path else "/"
                     body = route.request.post_data
+                    if path.startswith("/api/xiaomi/clear-login"):
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "revision": "clear-rev",
+                                                       "msg": "已清除"}))
+                        return
+                    if (path.startswith("/api/config") and route.request.method == "POST"
+                            and state.get("hold")):
+                        data = json.loads(body or "{}")
+                        posted.append(data)
+                        state["held"].append(route)
+                        return
                     if path.startswith("/api/config"):
                         if route.request.method == "POST":
                             data = json.loads(body or "{}")
                             posted.append(data)
-                            state["config"] = data.get("config", {})
-                            route.fulfill(status=200, content_type="application/json",
-                                          body=json.dumps({"ok": True}))
+                            section = data.get("section")
+                            if data.get("revision") != state["revisions"].get(section):
+                                route.fulfill(status=409, content_type="application/json",
+                                              body=json.dumps({"ok": False,
+                                                               "code": "config_conflict"}))
+                            else:
+                                state["config"] = data.get("config", {})
+                                state["counter"] += 1
+                                state["revisions"][section] = (
+                                    "fixture-" + section + "-" + str(state["counter"]))
+                                route.fulfill(status=200, content_type="application/json",
+                                              body=json.dumps({"ok": True,
+                                                               "revision": state["revisions"][section]}))
                         else:
                             route.fulfill(status=200, content_type="application/json",
-                                          body=json.dumps(state["config"]))
+                                          body=json.dumps({**state["config"],
+                                              "_section_revisions": state["revisions"]}))
                     elif path.startswith("/api/devices"):
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
+                    elif path.startswith("/api/qr/poll"):
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "done": True,
+                                                       "msg": "扫码已完成"}))
+                    elif path == "/api/test/xiaomi":
+                        state["counter"] += 1
+                        state["revisions"]["xiaomi"] = "fixture-probed-" + str(state["counter"])
+                        state["config"].setdefault("xiaomi", {})["cookie_text"] = "••••••••"
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "verified": True, "devices": [],
+                                                       "msg": "设备连接测试成功"}))
+                    elif path.startswith("/api/test/xiaomi/cookie-login"):
+                        state["counter"] += 1
+                        state["revisions"]["xiaomi"] = "fixture-xiaomi-login-" + str(state["counter"])
+                        state["config"].setdefault("xiaomi", {})["cookie_text"] = "••••••••"
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "verified": True, "devices": [],
+                                                       "msg": "Cookie 登录成功"}))
                     elif path.startswith("/api/test/rule"):
-                        seen["tests"].append(json.loads(body or "{}"))
+                        request_data = json.loads(body or "{}")
+                        seen["tests"].append(request_data)
+                        execute = bool(request_data.get("execute"))
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "matched": True,
-                                                       "executed": True, "msg": "已执行",
+                                                       "executed": execute,
+                                                       "preview": not execute,
+                                                       "msg": "已执行" if execute else "仅预览",
                                                        "action": {"domain": "light",
                                                                   "service": "turn_on",
                                                                   "entity_id": "light.a"}}))
@@ -209,6 +270,9 @@ def main() -> int:
                 def reload_rules():
                     """Reload with the fixture config so a section starts from a known state."""
                     state["config"] = json.loads(json.dumps(CONFIG))
+                    state["revisions"] = {key: "fixture-" + key + "-0"
+                                          for key in ("xiaomi", "ha", "rules", "adv")}
+                    state["counter"] = 0
                     page.goto(url, wait_until="load")
                     page.click('[data-page="rules"]')
                     page.wait_for_selector("#page-rules.active")
@@ -493,9 +557,181 @@ def main() -> int:
                 result.eq("the test request snapshots the two imported rules",
                           len(sent.get("rules") or []), 2)
                 test_text = page.evaluate("document.querySelector('#test-result').textContent")
-                result.check("the test result renders 已执行 and the action JSON",
-                             "已执行" in test_text and '"entity_id": "light.a"' in test_text, test_text[:120])
+                result.check("the test result renders a preview without executing",
+                             "仅预览" in test_text and '"entity_id": "light.a"' in test_text, test_text[:120])
+                result.check("rule test defaults to no live action",
+                             sent.get("execute") is False, repr(sent))
+                page.check("#test-execute")
+                page.once("dialog", lambda dialog: dialog.accept())
+                page.click("#page-rules button:has-text('测试')")
+                page.wait_for_timeout(150)
+                result.eq("explicit execution makes a second test call",
+                          len(seen["tests"]), 2)
+                result.check("live execution requires explicit opt-in",
+                             seen["tests"][-1].get("execute") is True)
+                result.check("rule-save posts include their scope",
+                             all(p.get("section") == "rules" for p in posted),
+                             repr([p.get("section") for p in posted]))
+
+                result.check("every browser rules save sends the last received CAS revision",
+                             all(bool(p.get("revision")) for p in posted),
+                             repr([p.get("revision") for p in posted]))
+
+                # ---------- CAS: two-tab stale edits never silently overwrite ----------
+                reload_rules()
+                expand(0)
+                stale_revision = page.evaluate("sectionRevisions.rules")
+                page.evaluate("() => { document.querySelector('#rule-list .rule-item .r-p').value='本地未保存修改'; }")
+                page.evaluate("() => { markRulesDirty(); }")
+                state["revisions"]["rules"] = "fixture-external-change"
+                before_post_count = len(posted)
+                click_save(rows().nth(0).locator(".rule-save"))
+                result.eq("stale browser save posts once", len(posted), before_post_count + 1)
+                result.eq("stale browser save sends original revision",
+                          posted[-1].get("revision"), stale_revision)
+                result.check("server 409 conflict displayed",
+                             "另一窗口" in page.locator("#rules-alert").inner_text(),
+                             page.locator("#rules-alert").inner_text())
+                result.check("stale browser edit stays in DOM",
+                             "本地未保存修改" in rows().nth(0).locator(".r-p").input_value())
+                result.check("rule draft stays marked as unsaved",
+                             page.locator("#rules-dirty").is_visible())
+                result.eq("409 keeps local revision unchanged",
+                          page.evaluate("sectionRevisions.rules"), stale_revision)
+                result.check("only the expected 409 is tolerated as console noise",
+                             len(expected_conflict_console) <= 1,
+                             repr(expected_conflict_console))
+
+                # ---------- CAS: login refreshes its own revision, then save succeeds ----------
+                reload_rules()
+                page.click('[data-page="xiaomi"]')
+                rev_before_login = page.evaluate("sectionRevisions.xiaomi")
+                page.evaluate("document.getElementById('mi-cookie-text').value='userId=u; passToken=p'")
+                page.evaluate("verifyCookieLogin()")
+                rev_after_login = page.evaluate("sectionRevisions.xiaomi")
+                result.check("login obtains latest Xiaomi revision without refreshing all drafts",
+                             rev_before_login != rev_after_login
+                             and rev_after_login == state["revisions"]["xiaomi"])
+                page.evaluate("saveXiaomi()")
+                page.wait_for_timeout(250)
+                last_xiaomi = next((p for p in reversed(posted) if p.get("section") == "xiaomi"), {})
+                result.check("saving immediately after login uses refreshed CAS",
+                             last_xiaomi.get("revision") == rev_after_login,
+                             repr(last_xiaomi.get("revision")))
+                result.check("post-login config save succeeds without 409",
+                             page.evaluate("sectionRevisions.xiaomi") == state["revisions"]["xiaomi"]
+                             and page.evaluate("sectionRevisions.xiaomi") != rev_after_login)
+
+                # ---------- CAS: both legacy connection test and QR follow-up rotate cookies ----------
+                for flow_name, action in (
+                    ("manual-test", "testXiaomi()"),
+                    ("qr-follow-up", "pollQrLogin()"),
+                ):
+                    reload_rules()
+                    page.click('[data-page="xiaomi"]')
+                    page.locator("#mi-username").fill("test-account")
+                    page.locator("#mi-password").fill("test-password")
+                    before = page.evaluate("sectionRevisions.xiaomi")
+                    page.evaluate(action)
+                    after = page.evaluate("sectionRevisions.xiaomi")
+                    result.check(flow_name + " refreshes the last server-side Xiaomi revision",
+                                 before != after and after == state["revisions"]["xiaomi"],
+                                 repr((before, after, state["revisions"]["xiaomi"])))
+                    page.evaluate("saveXiaomi()")
+                    last = next((p for p in reversed(posted) if p.get("section") == "xiaomi"), {})
+                    result.eq(flow_name + " sends the fresh revision on immediate save",
+                              last.get("revision"), after)
+                    result.check(flow_name + " immediate save has no 409",
+                                 page.evaluate("sectionRevisions.xiaomi")
+                                 == state["revisions"]["xiaomi"]
+                                 and state["revisions"]["xiaomi"] != after)
+
                 result.check("the test result contains no undefined", "undefined" not in test_text)
+
+                # ---------- 18. edits made while a save is in flight survive ----------
+                reload_rules()
+                state["hold"] = True
+                state["held"].clear()
+                expand(0)
+                rows().nth(0).locator(".r-p").fill("保存前的内容")
+                posted.clear()
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(300)
+                result.eq("the save request is still pending", len(state["held"]), 1)
+                rows().nth(0).locator(".r-p").fill("保存期间的新修改")
+                state["held"].pop().fulfill(status=200, content_type="application/json",
+                                            body=json.dumps({"ok": True}))
+                page.wait_for_timeout(300)
+                result.eq("the request carried the pre-edit snapshot",
+                          posted[-1]["config"]["intent_rules"][0]["pattern"], "保存前的内容")
+                result.eq("the edit made during the request stays in the DOM",
+                          rows().nth(0).locator(".r-p").input_value(), "保存期间的新修改")
+                result.check("the row still shows 未保存",
+                             rows().nth(0).locator(".rule-chip").is_visible())
+                result.check("the page still shows the unsaved marker",
+                             page.locator("#rules-dirty").is_visible())
+                result.check("the chip and marker prove the newer edit is unsaved",
+                             rows().nth(0).locator(".rule-chip").is_visible()
+                             and page.locator("#rules-dirty").is_visible())
+                state["hold"] = False
+                page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(400)
+                result.eq("the second save persists the newer edit",
+                          posted[-1]["config"]["intent_rules"][0]["pattern"], "保存期间的新修改")
+
+                # ---------- 19. save-all keeps rules added while it is in flight ----------
+                reload_rules()
+                state["hold"] = True
+                state["held"].clear()
+                page.get_by_role("button", name="保存全部").click()
+                page.wait_for_timeout(300)
+                result.eq("save-all request is pending", len(state["held"]), 1)
+                page.get_by_role("button", name="+新增").click()
+                expand(0)
+                rows().nth(0).locator(".r-p").fill("保存全部期间改的")
+                state["held"].pop().fulfill(status=200, content_type="application/json",
+                                            body=json.dumps({"ok": True}))
+                page.wait_for_timeout(400)
+                state["hold"] = False
+                result.eq("the rule added during save-all is still there", rows().count(), 4)
+                result.eq("the edit made during save-all stays in the DOM",
+                          rows().nth(0).locator(".r-p").input_value(), "保存全部期间改的")
+                result.check("save-all leaves the newer work marked unsaved",
+                             page.locator("#rules-dirty").is_visible())
+
+                # ---------- 20. invalid 其他(JSON) blocks the save ----------
+                reload_rules()
+                expand(0)
+                posted.clear()
+                rows().nth(0).locator(".r-j").fill("{这不是 JSON")
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(250)
+                result.eq("invalid JSON refuses to save", len(posted), 0)
+                result.check("the alert names 其他(JSON)",
+                             "其他(JSON)" in page.evaluate(
+                                 "document.querySelector('#rules-alert').textContent"))
+                rows().nth(0).locator(".r-j").fill('{"entity_id":"light.zzz"}')
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(250)
+                result.eq("JSON may not override the entity picked in the form", len(posted), 0)
+                rows().nth(0).locator(".r-j").fill('{"delay_minutes": 5}')
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(400)
+                result.eq("a valid extra JSON still saves", len(posted), 1)
+                result.eq("the extra key reaches the action",
+                          posted[-1]["config"]["intent_rules"][0]["action"].get("delay_minutes"), 5)
+
+                # ---------- 21. clearing the Xiaomi login keeps other tabs' edits ----------
+                page.on("dialog", lambda dialog: dialog.accept())
+                page.evaluate("() => { const el=document.getElementById('adv-interval'); if(el) el.value='99'; }")
+                page.click('[data-page="xiaomi"]')
+                page.wait_for_selector("#page-xiaomi.active")
+                page.evaluate("() => document.querySelector('#xiaomi-alert').classList.remove('show')")
+                page.click("#page-xiaomi button:has-text('清除')")
+                page.wait_for_timeout(500)
+                result.eq("the unrelated advanced input survives the clear-login refresh",
+                          page.evaluate("(document.getElementById('adv-interval')||{}).value"), "99")
 
                 # ---------- 18. browser errors -----------
                 pending = unhandled()

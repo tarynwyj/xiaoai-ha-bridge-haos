@@ -66,7 +66,17 @@ async function clearXiaomiLogin(){
     const r=await fetch('/api/xiaomi/clear-login',{method:'POST'});
     const d=await r.json();
     showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+(d.msg||''));
-    if(d.ok){await loadConfig();}
+    if(d.ok){
+      try{
+        const fresh=await (await fetch('/api/config')).json();
+        cfg.xiaomi=(fresh&&fresh.xiaomi)||{};
+        if(d.revision)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:d.revision};
+        else if(fresh&&fresh._section_revisions)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:fresh._section_revisions.xiaomi};
+        safeSet('mi-username',(cfg.xiaomi||{}).username||'');
+        safeSet('mi-password',(cfg.xiaomi||{}).password||'');
+        safeSet('mi-cookie-text',(cfg.xiaomi||{}).cookie_text||'');
+      }catch(e){}
+    }
   }catch(e){showAlert(a,'err','✗ '+e.message);}
 }""",
 )
@@ -272,6 +282,29 @@ function clearEntities(btn){
   visibleEntityOptions(picker).forEach(row=>{const box=row.querySelector('.r-e');if(box)box.checked=false});
   return updateEntityCount(picker);
 }
+function parseRuleExtra(raw){
+  // "其他(JSON)" is merged into the action. A typo used to be swallowed silently
+  // and a JSON key could even override the visible form fields; both are refused
+  // here so a rule can never be saved with a different action than the UI shows.
+  const reserved=['domain','service','entity_id','reply'];
+  const value=String(raw||'').trim();
+  if(!value)return {ok:true,value:{}};
+  let parsed;
+  try{parsed=JSON.parse(value)}catch(e){return {ok:false,error:'不是合法 JSON：'+e.message}}
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return {ok:false,error:'必须是 JSON 对象'};
+  const conflicts=Object.keys(parsed).filter(key=>reserved.indexOf(key)>=0);
+  if(conflicts.length)return {ok:false,error:'不能覆盖界面字段：'+conflicts.join(', ')};
+  return {ok:true,value:parsed};
+}
+function ruleExtraIssue(row){
+  return (row&&row.dataset&&row.dataset.extraError)?row.dataset.extraError:'';
+}
+function firstRuleExtraIssue(){
+  const rows=document.querySelectorAll('#rule-list .rule-item');
+  for(const row of rows){const issue=ruleExtraIssue(row);if(issue)return {row:row,issue:issue}}
+  return null;
+}
+function ruleSignature(draft){try{return JSON.stringify(draft||{})}catch(e){return String(Date.now())}}
 function ruleDraftFromRow(row){
   const ids=entityIdsOf(row);
   const action={
@@ -282,7 +315,9 @@ function ruleDraftFromRow(row){
   };
   row.querySelectorAll('.r-xk').forEach(inp=>{const v=(inp.value||'').trim();if(v)action[inp.dataset.key]=v});
   const extra=((row.querySelector('.r-j')||{}).value||'').trim();
-  if(extra){try{Object.assign(action,JSON.parse(extra))}catch(e){}}
+  const parsedExtra=parseRuleExtra(extra);
+  if(parsedExtra.ok){Object.assign(action,parsedExtra.value);delete row.dataset.extraError}
+  else{row.dataset.extraError=parsedExtra.error}
   const rule={pattern:((row.querySelector('.r-p')||{}).value||'').trim(),action};
   const name=((row.querySelector('.r-n')||{}).value||'').trim();
   if(name)rule.name=name;
@@ -400,7 +435,38 @@ function persistRules(mergedRules){
   return saveCfg('rules');
 }
 
-async function saveOneRule(i){if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);const alerts=document.getElementById('rules-alert');if(ruleBulkPending){showAlert(alerts,'err','✗ 已导入新的规则列表，请先点「保存全部」');return false}if(ruleDeleted.length>0){showAlert(alerts,'err','✗ 有规则等待删除，请先点「保存全部」');return false}const rows=document.querySelectorAll('#rule-list .rule-item');const row=rows[i];const state=ruleState[i];if(!row||!state)return false;state.draft=ruleDraftFromRow(row);const merged=ruleBaseline.map(entry=>cloneRule(entry.rule));const pos=ruleBaseline.findIndex(entry=>entry.uid===state.uid);if(pos>=0)merged[pos]=cloneRule(state.draft);else merged.push(cloneRule(state.draft));const ok=await persistRules(merged);if(ok){if(pos>=0)ruleBaseline[pos].rule=cloneRule(state.draft);else ruleBaseline.push({uid:state.uid,rule:cloneRule(state.draft)});state.base=true;state.dirty=false;state.open=true;cfg.intent_rules=merged;renderRuleHead(row,state,i);setRulesDirty(anyRuleDirty());showAlert(alerts,'ok','✓ 已保存：'+escHtml(ruleName(state.draft)||state.draft.pattern||('规则 #'+(i+1))))}else{state.dirty=true;setRulesDirty(true)}return ok}
+async function saveOneRule(i){
+  if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);
+  const alerts=document.getElementById('rules-alert');
+  if(ruleBulkPending){showAlert(alerts,'err','✗ 已导入新的规则列表，请先点「保存全部」');return false}
+  if(ruleDeleted.length>0){showAlert(alerts,'err','✗ 有规则等待删除，请先点「保存全部」');return false}
+  const rows=document.querySelectorAll('#rule-list .rule-item');
+  const row=rows[i];const state=ruleState[i];
+  if(!row||!state)return false;
+  const extraIssue=ruleExtraIssue(row);
+  if(extraIssue){showAlert(alerts,'err','✗ 其他(JSON) 有误：'+escHtml(extraIssue));return false}
+  state.draft=ruleDraftFromRow(row);
+  const snapshot=cloneRule(state.draft);
+  const signature=ruleSignature(snapshot);
+  const merged=ruleBaseline.map(entry=>cloneRule(entry.rule));
+  const pos=ruleBaseline.findIndex(entry=>entry.uid===state.uid);
+  if(pos>=0)merged[pos]=cloneRule(snapshot);else merged.push(cloneRule(snapshot));
+  const ok=await persistRules(merged);
+  if(!ok){state.dirty=true;setRulesDirty(true);return false}
+  if(pos>=0)ruleBaseline[pos].rule=cloneRule(snapshot);
+  else ruleBaseline.push({uid:state.uid,rule:cloneRule(snapshot)});
+  state.base=true;state.open=true;
+  const live=row.isConnected?ruleDraftFromRow(row):state.draft;
+  state.draft=live;
+  state.dirty=ruleSignature(live)!==signature;
+  cfg.intent_rules=merged;
+  if(row.isConnected)renderRuleHead(row,state,i);
+  setRulesDirty(anyRuleDirty());
+  if(state.dirty)showAlert(alerts,'ok','✓ 已保存，但保存期间产生的新修改尚未保存');
+  else showAlert(alerts,'ok','✓ 已保存：'+escHtml(ruleName(state.draft)||state.draft.pattern||('规则 #'+(i+1))));
+  return true;
+}
+
 
 // ═══════════ DOMAIN INFO ═══════════""",
 )
@@ -414,7 +480,7 @@ replace_exact(
 replace_exact(
     'rule row with checkbox picker and per-rule save',
     r'''function buildRule(rule,i){const a=rule.action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const div=document.createElement('div');div.className='rule-item';div.dataset.idx=i;let h='<div class="rule-head"><span class="rule-num">#'+(i+1)+'</span><button class="rule-del" onclick="deleteRule('+i+')">✕</button></div><div class="rule-grid"><div class="field full"><label>你说的话</label><input type="text" class="r-p" value="'+escHtml(rule.pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'" placeholder=\'{"brightness_pct":"{0}"}\'></div></div>';div.innerHTML=h;return div}''',
-    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label>'+entityPickerHtml(d,ids)+'</div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
+    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;if(state)div.dataset.uid=state.uid;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label>'+entityPickerHtml(d,ids)+'</div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
 )
 
 replace_exact(
@@ -444,7 +510,42 @@ replace_exact(
 replace_exact(
     'save all rules from drafts',
     r'''async function saveRules(){collectRulesFromUI();await saveCfg('rules')}''',
-    r"""async function saveRules(){if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);collectRuleDrafts();const merged=[];ruleBaseline.forEach(entry=>{if(ruleDeleted.indexOf(entry.uid)>=0)return;const state=ruleState[ruleIndexByUid(entry.uid)];merged.push(cloneRule(state?state.draft:entry.rule))});ruleState.forEach(state=>{if(!state.base)merged.push(cloneRule(state.draft))});const ok=await persistRules(merged);if(ok){ruleStateInit(merged);cfg.intent_rules=merged;renderRules();setRulesDirty(false);showAlert(document.getElementById('rules-alert'),'ok','✓ 已保存全部规则')}return ok}""",
+    r"""async function saveRules(){
+  if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);
+  const alerts=document.getElementById('rules-alert');
+  const issue=firstRuleExtraIssue();
+  if(issue){showAlert(alerts,'err','✗ 其他(JSON) 有误：'+escHtml(issue.issue));return false}
+  collectRuleDrafts();
+  const savedUids=[];
+  const snapshot=[];
+  ruleBaseline.forEach(entry=>{
+    if(ruleDeleted.indexOf(entry.uid)>=0)return;
+    const state=ruleState[ruleIndexByUid(entry.uid)];
+    savedUids.push(entry.uid);
+    snapshot.push(cloneRule(state?state.draft:entry.rule));
+  });
+  ruleState.forEach(state=>{
+    if(!state.base){savedUids.push(state.uid);snapshot.push(cloneRule(state.draft))}
+  });
+  const ok=await persistRules(snapshot);
+  if(!ok){setRulesDirty(true);return false}
+  ruleBaseline=savedUids.map((uid,index)=>({uid:uid,rule:cloneRule(snapshot[index])}));
+  ruleDeleted=[];ruleBulkPending=false;
+  ruleState.forEach(state=>{
+    const saved=ruleBaseline.find(entry=>entry.uid===state.uid);
+    state.base=!!saved;
+    state.dirty=!saved||ruleSignature(state.draft)!==ruleSignature(saved.rule);
+  });
+  cfg.intent_rules=snapshot;
+  document.querySelectorAll('#rule-list .rule-item').forEach((row,index)=>{
+    if(ruleState[index])renderRuleHead(row,ruleState[index],index);
+  });
+  const pending=anyRuleDirty();
+  setRulesDirty(pending);
+  showAlert(alerts,'ok',pending?'✓ 已保存，但保存期间产生的新修改尚未保存':'✓ 已保存全部规则');
+  return true;
+}
+""",
 )
 
 replace_exact(
@@ -829,6 +930,161 @@ replace_exact(
   }
 }
 async function qrLogin(){""",
+)
+
+# ──────────────── Section-scoped saves and safe rule testing ────────────────
+replace_exact(
+    "send the active config section, not a stale whole-config overwrite",
+    "body:JSON.stringify({config:cfg})",
+    "body:JSON.stringify({config:cfg,section:sec})",
+)
+
+replace_exact(
+    "show rule-test execution choice",
+    '<div class="test-result" id="test-result">点击测试查看匹配</div>',
+    '<label style="display:flex;align-items:center;gap:8px;font-size:12px;margin:8px 0"><input type="checkbox" id="test-execute"> 实际执行此规则（可能操作真实设备或创建自动化）</label><div class="test-result" id="test-result">默认只预览匹配，不执行设备操作</div>',
+)
+
+replace_exact(
+    "require confirmation for live test execution",
+    "const r=await fetch('/api/test/rule',{method:'POST'",
+    "const execute=!!((document.getElementById('test-execute')||{}).checked);if(execute&&!confirm('将实际调用 Home Assistant，可能开关设备或创建自动化。确定继续？'))return;const r=await fetch('/api/test/rule',{method:'POST'",
+)
+
+replace_exact(
+    "pass explicit execute flag to the rule-test endpoint",
+    "body:JSON.stringify({text:t,rules:cfg.intent_rules||[]})",
+    "body:JSON.stringify({text:t,rules:cfg.intent_rules||[],execute:execute})",
+)
+
+# ──────────────── CAS: per-section versioned UI writes ────────────────
+replace_exact(
+    "remember revision tokens per section",
+    "let cfg = {};\n/* Ingress-safe fetch:",
+    "let cfg = {};\nlet sectionRevisions = {};\n/* Ingress-safe fetch:",
+)
+
+replace_exact(
+    "separate revision metadata from editable config",
+    "cfg=await r.json();applyConfigToUI()",
+    "cfg=await r.json();sectionRevisions=cfg._section_revisions||{};delete cfg._section_revisions;applyConfigToUI()",
+)
+
+replace_exact(
+    "save only after CAS precondition and preserve unsaved drafts on conflict",
+    """async function saveCfg(sec){const map={xiaomi:'xiaomi-alert',ha:'ha-alert',rules:'rules-alert',adv:'adv-alert'};const a=document.getElementById(map[sec]||'dash-alert');try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg,section:sec})});const d=await r.json();const ok=!!(d&&d.ok);showAlert(a,ok?'ok':'err',(ok?'✓ ':'✗ ')+(ok?'保存成功':(d.msg||'保存失败')));setTimeout(()=>a.classList.remove('show'),3000);return ok}catch(e){showAlert(a,'err','✗ '+e.message);setTimeout(()=>a.classList.remove('show'),3000);return false}}""",
+    """async function saveCfg(sec){
+  const map={xiaomi:'xiaomi-alert',ha:'ha-alert',rules:'rules-alert',adv:'adv-alert'};
+  const a=document.getElementById(map[sec]||'dash-alert');
+  const revision=sectionRevisions[sec];
+  if(!revision){
+    showAlert(a,'err','✗ 未获取到配置版本，保存已取消。请备份编辑内容后刷新页面');
+    return false;
+  }
+  try{
+    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({config:cfg,section:sec,revision:revision})});
+    const d=await r.json();
+    if(r.status===409||d.code==='config_conflict'){
+      showAlert(a,'err','⚠ 此分区已在另一窗口修改，服务器拒绝覆盖。你当前未保存的编辑仍在页面中；请先备份，再刷新页面处理冲突。');
+      return false;
+    }
+    if(!r.ok||!d.ok){
+      showAlert(a,'err','✗ '+(d.msg||'保存失败'));
+      return false;
+    }
+    if(!d.revision){
+      showAlert(a,'err','✗ 服务器未返回新的配置版本，请刷新页面确认保存结果');
+      return false;
+    }
+    sectionRevisions[sec]=d.revision;
+    showAlert(a,'ok','✓ 保存成功');
+    return true;
+  }catch(e){
+    showAlert(a,'err','✗ '+e.message);
+    return false;
+  }
+}""",
+)
+
+# Refresh the Xiaomi CAS token after a successful server-side credential write,
+# but never reload the whole form: other tabs can contain unsaved edits.
+replace_exact(
+    "Xiaomi-only revision refresh helper",
+    "async function startPasswordLogin(){",
+    """async function refreshXiaomiRevision(){
+  try{
+    const r=await fetch('/api/config');
+    if(!r.ok)return false;
+    const d=await r.json();
+    const revision=d&&d._section_revisions&&d._section_revisions.xiaomi;
+    if(!revision)return false;
+    sectionRevisions.xiaomi=revision;
+    return true;
+  }catch(e){return false;}
+}
+async function startPasswordLogin(){""",
+)
+replace_exact(
+    "successful password login refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      otpText('mi-login-status','');""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      otpText('mi-login-status','');""",
+)
+replace_exact(
+    "successful OTP verification refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'登录成功'));""",
+)
+replace_exact(
+    "successful Cookie login refreshes Xiaomi CAS only",
+    """    if(d&&d.ok){
+      otpReset();
+      if(box)box.value='';""",
+    """    if(d&&d.ok){
+      otpReset();
+      await refreshXiaomiRevision();
+      if(box)box.value='';""",
+)
+replace_exact(
+    "successful QR polling refreshes Xiaomi CAS only",
+    "showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+d.msg);if(!d.ok)return;const r2",
+    "showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+d.msg);if(!d.ok)return;await refreshXiaomiRevision();const r2",
+)
+replace_exact(
+    "successful legacy SMS completion refreshes Xiaomi CAS only",
+    """      showAlert(a,'ok','✓ '+(d.msg||'短信验证完成'));
+      const card=""",
+    """      await refreshXiaomiRevision();
+      showAlert(a,'ok','✓ '+(d.msg||'短信验证完成'));
+      const card=""",
+)
+
+# A QR scan is followed by a legacy device probe that may rotate serviceToken;
+# refresh CAS after that second request, never before it.
+replace_exact(
+    "refresh Xiaomi CAS after QR follow-up instead of before",
+    "await refreshXiaomiRevision();const r2=await fetch('/api/test/xiaomi'",
+    "const r2=await fetch('/api/test/xiaomi'",
+)
+replace_exact(
+    "QR follows probe with fresh Xiaomi revision",
+    "const d2=await r2.json();if(d2.ok&&d2.devices&&d2.devices.length>0)renderDeviceList(d2.devices)",
+    "const d2=await r2.json();await refreshXiaomiRevision();if(d2.ok&&d2.devices&&d2.devices.length>0)renderDeviceList(d2.devices)",
+)
+replace_exact(
+    "manual Xiaomi test also refreshes CAS after success",
+    "if(d.ok&&d.devices&&d.devices.length>0)renderDeviceList(d.devices)}catch(e){showAlert(a,'err','✗ '+e.message)}}",
+    "if(d.ok&&!d.need_verify)await refreshXiaomiRevision();if(d.ok&&d.devices&&d.devices.length>0)renderDeviceList(d.devices)}catch(e){showAlert(a,'err','✗ '+e.message)}}",
 )
 
 path.write_text(html, encoding="utf-8")

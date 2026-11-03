@@ -402,6 +402,7 @@ class Harness:
             "asyncio": asyncio,
             "json": json,
             "os": __import__("os"),
+            "secrets": __import__("secrets"),
             "re": __import__("re"),
             "time": __import__("time"),
             "log": self.log,
@@ -413,6 +414,7 @@ class Harness:
             "save_config": self.save_config,
             "_get_cookie": lambda cfg: None,
             "_save_auth_and_token": lambda account: None,
+            "_credential_write_allowed": lambda: True,
             "_read_saved_credential": lambda path: {},
             "_load_saved_xiaomi_identity": lambda: {},
             "_ERROR_HINTS": {
@@ -2201,8 +2203,8 @@ def scenario_frontend_behaviour():
     )
     if payload:
         fetches = [call for call in payload["calls"] if call[0] == "fetch"]
-        check(len(fetches) == 1,
-              f"the cookie button must make exactly one request even while OTP is pending, got {fetches}")
+        check(len(fetches) == 2 and fetches[1][1] == "/api/config",
+              f"successful cookie login must POST once and then GET Xiaomi CAS revision, got {fetches}")
         if fetches:
             check(fetches[0][1] == "/api/test/xiaomi/cookie-login",
                   f"the cookie button must POST the relative cookie-login path, got {fetches[0][1]}")

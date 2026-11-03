@@ -160,7 +160,11 @@ async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
         "userId": str(user_id),
         "passToken": pass_token,
     }
-    resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")
+    resp = await _mi_service_login_verified(
+        account.session, "serviceLogin?sid=micoapi&_json=true",
+        device_id=device_id, token=account.token,
+        user_agent=str(getattr(account, "now_ua", "") or ""),
+    )
     if resp.get("code") != 0:
         code = resp.get("code", "unknown")
         description = resp.get("description") or resp.get("desc") or "登录验证失败"
@@ -977,23 +981,32 @@ async def reveal_direct_token(request: Request):
     return {"ok": True, "token": ACCESS_TOKEN, "path": str(AUTH_TOKEN_PATH)}
 
 
-def _delete_saved_login_files() -> list:
+def _delete_saved_login_files() -> tuple:
+    """Delete auth.json and .mi.token; return (removed, failures).
+
+    A failed unlink used to be a warning only, which let /api/xiaomi/clear-login
+    report success while a credential file survived on disk. Callers must treat a
+    non-empty failure list (or a file that still exists) as an error.
+    """
     removed = []
+    failures = []
     for saved_path in (AUTH_PATH, TOKEN_PATH):
         try:
             if saved_path.exists():
                 saved_path.unlink()
                 removed.append(saved_path.name)
+            if saved_path.exists():
+                failures.append(f"{saved_path.name} 删除后仍存在")
         except Exception as e:
-            log.warning("删除 %s 失败: %s", saved_path.name, e)
-    return removed
+            failures.append(f"{saved_path.name}: {e}")
+    return removed, failures
 
 
 def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
     \'\'\'Decide the stored Xiaomi login when the config page is saved.
 
     masked / empty  -> keep what is stored (a stale page must not wipe QR login)
-    clear_login: true -> explicit user action, wipe saved credentials for real
+    clear_login        -> transient flag consumed by post_config, never persisted
     anything else  -> save the new value
     \'\'\'
     new_mi = cfg.get("xiaomi")
@@ -1001,11 +1014,10 @@ def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
         new_mi = {}
         cfg["xiaomi"] = new_mi
     old_mi = existing.get("xiaomi") or {}
-    if new_mi.pop("clear_login", False):
-        _delete_saved_login_files()
-        new_mi["cookie_text"] = ""
-        log.info("已按请求清除已保存的小米登录凭据")
-        return
+    # clear_login is a transient request flag: post_config consumes it and
+    # delegates to clear_xiaomi_login before any merge happens, so it must never
+    # reach the saved config. Drop it unconditionally instead of branching on it.
+    new_mi.pop("clear_login", None)
     if new_mi.get("password") in (masked, None):
         new_mi["password"] = old_mi.get("password", "")
     if new_mi.get("cookie_text") in (None, "", masked):
@@ -1071,23 +1083,60 @@ async def clear_xiaomi_login():
     .mi.token. Because the files are gone, no later start-up can silently
     resurrect the credentials the user asked to remove.
     \'\'\'
-    removed = _delete_saved_login_files()
-    cfg = load_config()
-    mi_cfg = cfg.setdefault("xiaomi", {})
-    if mi_cfg.get("cookie_text"):
-        mi_cfg["cookie_text"] = ""
-        removed.append("cookie_text")
-    if mi_cfg.get("password"):
-        mi_cfg["password"] = ""
-        removed.append("password")
-    save_config(cfg)
-    if bridge_state.get("running"):
-        await stop_bridge()
+    global _credential_generation, _credential_clearing
+    _credential_generation += 1
+    _credential_clearing = True
+    removed = []
+    try:
+        # Cancel and join the bridge before removing any files: it can write
+        # refreshed credentials during a 401 or a startup token exchange.
+        bridge_state["running"] = False
+        task = _bridge_task
+        if task is not None and not task.done():
+            task.cancel()
+            finished, pending = await asyncio.wait({task}, timeout=5)
+            if pending:
+                log.warning("桥接器未在超时内退出，拒绝清除凭据以避免旧任务写回")
+                return JSONResponse(
+                    {"ok": False, "msg": "桥接器尚未完全停止，未清除登录凭据，请稍后重试"},
+                    status_code=503,
+                )
+        # OTP handlers use the SMS lock. Old requests retain their original
+        # credential generation and cannot write after this wipe starts.
+        async with _sms_lock_obj():
+            await _reset_otp_state()
+            await _close_pending_session()
+            _clear_pending_login()
+            _qr_state.clear()
+            removed, delete_failures = _delete_saved_login_files()
+            cfg = load_config()
+            mi_cfg = cfg.setdefault("xiaomi", {})
+            if mi_cfg.get("cookie_text"):
+                mi_cfg["cookie_text"] = ""
+                removed.append("cookie_text")
+            if mi_cfg.get("password"):
+                mi_cfg["password"] = ""
+                removed.append("password")
+            save_config(cfg)
+    finally:
+        _credential_generation += 1
+        _credential_clearing = False
+    leftovers = [name for name, saved_path in (("auth.json", AUTH_PATH), (".mi.token", TOKEN_PATH))
+                 if saved_path.exists()]
+    if delete_failures or leftovers:
+        detail = "；".join(delete_failures + [f"{name} 仍存在" for name in leftovers])
+        log.error("清除登录凭据未完成：%s", detail)
+        return JSONResponse(
+            {"ok": False, "removed": removed,
+             "msg": "未能删除全部登录凭据文件，请检查 /data/config 权限后重试：" + detail},
+            status_code=500,
+        )
     bridge_state["error"] = None
     log.info("已清除已保存的小米登录凭据: %s", ", ".join(removed) or "无")
     return {
         "ok": True,
         "removed": removed,
+        "revision": _config_section_revision(load_config(), "xiaomi"),
         "msg": "已清除已保存的小米登录凭据，请重新扫码登录",
     }
 ''',
@@ -1228,38 +1277,45 @@ def _save_auth_and_token(account) -> None:
     只写回非空的身份字段；缺失字段回退到磁盘上已有的值，因此一次不完整的
     刷新不会销毁仍然可用的 passToken。
     """
+    if not _credential_write_allowed():
+        log.warning("已取消的登录请求不得重新保存凭据")
+        return
     token = getattr(account, "token", None)
     if not isinstance(token, dict) or not token:
         return
     previous_token = _read_saved_credential(TOKEN_PATH)
     previous_auth = _read_saved_credential(AUTH_PATH)
+    candidate_user = str(token.get("userId") or "").strip()
+    previous_user = str(previous_token.get("userId") or previous_auth.get("userId") or "").strip()
+    same_identity = not candidate_user or candidate_user == previous_user
     identity = {
-        "passToken": token.get("passToken") or previous_token.get("passToken")
-        or previous_auth.get("passToken") or "",
-        "userId": str(token.get("userId") or previous_token.get("userId")
-                      or previous_auth.get("userId") or ""),
-        "deviceId": token.get("deviceId") or previous_token.get("deviceId")
-        or previous_auth.get("deviceId") or "",
+        "passToken": token.get("passToken")
+        or (previous_token.get("passToken") if same_identity else None)
+        or (previous_auth.get("passToken") if same_identity else None) or "",
+        "userId": candidate_user or previous_user,
+        "deviceId": token.get("deviceId")
+        or (previous_token.get("deviceId") if same_identity else None)
+        or (previous_auth.get("deviceId") if same_identity else None) or "",
     }
     if not identity["userId"] or not identity["passToken"]:
         log.warning("跳过保存登录信息：凭据不完整，保留已有文件")
         return
     token_data = dict(identity)
-    micoapi = token.get("micoapi") or previous_token.get("micoapi")
+    micoapi = token.get("micoapi") or (previous_token.get("micoapi") if same_identity else None)
     if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
         token_data["micoapi"] = [micoapi[0], micoapi[1]]
+    if "micoapi" not in token_data:
+        log.warning("登录没有有效 micoapi serviceToken，拒绝覆盖原有凭据")
+        return
     try:
-        AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(AUTH_PATH, "w", encoding="utf-8") as f:
-            json.dump(identity, f, ensure_ascii=False)
+        _persist_sms_credentials({
+            "userId": identity["userId"], "passToken": identity["passToken"],
+            "deviceId": identity["deviceId"],
+            "ssecurity": token_data["micoapi"][0],
+            "serviceToken": token_data["micoapi"][1],
+        })
     except Exception as e:
-        log.warning("保存 auth.json 失败: %s", e)
-    try:
-        TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(TOKEN_PATH, "w", encoding="utf-8") as f:
-            json.dump(token_data, f, ensure_ascii=False)
-    except Exception as e:
-        log.warning("保存 .mi.token 失败: %s", e)
+        log.warning("保存小米登录凭据失败 (%s)", type(e).__name__)
 ''',
 )
 
@@ -1901,6 +1957,8 @@ def _persist_sms_credentials(creds: dict) -> None:
     crash-safe transaction: a hard kill between the two renames can still leave a
     mixed pair on disk.
     '''
+    if not _credential_write_allowed():
+        raise RuntimeError("登录凭据已清除，旧请求不得重新写盘")
     missing = _missing_credentials(creds)
     if missing:
         raise ValueError("凭据不完整: " + "、".join(missing))
@@ -3382,6 +3440,889 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
 # ──────────────── HA 设备列表 ────────────────
 """,
 )
+
+# ──────────────── Scoped config writes and rule preview ────────────────
+replace_exact(
+    "save config section request",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+""",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+""",
+)
+
+replace_exact(
+    "save only the requested config section",
+    """    cfg = req.config
+    existing = load_config()
+    # 脱敏字段保留原值
+""",
+    """    cfg = req.config
+    # Revisions are response metadata, never persisted as user configuration.
+    cfg.pop("_section_revisions", None)
+    section = getattr(req, "section", None)
+    wants_clear = isinstance(cfg.get("xiaomi"), dict) and bool(cfg["xiaomi"].get("clear_login"))
+    # Legacy clear is standalone, never an incomplete full-config save.
+    if wants_clear and section is None:
+        return await clear_xiaomi_login()
+    if wants_clear and section != "xiaomi":
+        return JSONResponse(
+            {"ok": False, "msg": "clear_login 仅允许用于小米配置分区"},
+            status_code=400,
+        )
+    existing = load_config()
+    # Preserve unrelated configuration from disk: stale tabs must not
+    # overwrite aliases, tokens or another tab's settings.
+    if section:
+        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return {"ok": False, "msg": "不支持的配置分区"}
+        incoming = cfg
+        cfg = dict(existing)
+        if section == "xiaomi":
+            cfg["xiaomi"] = {**dict(existing.get("xiaomi") or {}),
+                             **dict(incoming.get("xiaomi") or {})}
+        elif section == "ha":
+            cfg["homeassistant"] = {**dict(existing.get("homeassistant") or {}),
+                                    **dict(incoming.get("homeassistant") or {})}
+        elif section == "rules":
+            if "intent_rules" not in incoming or not isinstance(incoming["intent_rules"], list):
+                return JSONResponse(
+                    {"ok": False, "msg": "规则保存必须明确提供 intent_rules 数组"},
+                    status_code=422,
+                )
+            cfg["intent_rules"] = incoming["intent_rules"]
+        else:
+            for key in ("poll_interval_seconds", "ai_mode", "openai"):
+                if key in incoming:
+                    cfg[key] = incoming[key]
+    else:
+        # Legacy clients may submit only some keys; never delete fields absent
+        # from their payload, even when they omit the section selector.
+        incoming = cfg
+        cfg = dict(existing)
+        for key, value in incoming.items():
+            if key in ("xiaomi", "homeassistant", "openai") and isinstance(value, dict):
+                cfg[key] = {**dict(existing.get(key) or {}), **value}
+            else:
+                cfg[key] = value
+    # 脱敏字段保留原值
+""",
+)
+
+replace_exact(
+    "opt-in rule execution flag",
+    """class TestRuleRequest(BaseModel):
+    text: str
+    rules: list[dict]
+""",
+    """class TestRuleRequest(BaseModel):
+    text: str
+    rules: list[dict]
+    execute: bool = False
+""",
+)
+
+replace_exact(
+    "rule test only previews by default",
+    """    schedule_days = result.pop("schedule_days", None)
+
+    cfg = load_config()
+""",
+    """    schedule_days = result.pop("schedule_days", None)
+
+    if not req.execute:
+        preview = {**result, "domain": domain, "service": service, "reply": reply}
+        if delay is not None:
+            preview["delay_minutes"] = delay
+        if schedule_type is not None:
+            preview["type"] = schedule_type
+        if schedule_time is not None:
+            preview["schedule_time"] = schedule_time
+        if schedule_days is not None:
+            preview["schedule_days"] = schedule_days
+        return {"matched": True, "executed": False, "preview": True,
+                "msg": "仅预览匹配结果，没有执行 Home Assistant 操作",
+                "action": preview, "ai_used": ai_used}
+
+    cfg = load_config()
+""",
+)
+
+# ──────────────── Release hardening: legacy login TLS paths ────────────────
+replace_exact(
+    "old password login uses verified TLS",
+    "resp = await account._serviceLogin('serviceLogin?sid=micoapi&_json=true')",
+    """resp = await _mi_service_login_verified(
+            s, 'serviceLogin?sid=micoapi&_json=true',
+            device_id=account.token.get('deviceId', ''),
+            token=account.token,
+            user_agent=str(getattr(account, 'now_ua', '') or ''),
+        )""",
+)
+replace_exact(
+    "old password authentication POST uses verified TLS",
+    "resp = await account._serviceLogin('serviceLoginAuth2', data)",
+    """resp = await _mi_service_login_verified(
+                s, 'serviceLoginAuth2', data,
+                device_id=account.token.get('deviceId', ''),
+                token=account.token,
+                user_agent=str(getattr(account, 'now_ua', '') or ''),
+            )""",
+)
+replace_exact(
+    "legacy SMS retry uses verified TLS",
+    'resp = await account._serviceLogin("serviceLogin?sid=micoapi&_json=true")',
+    """resp = await _mi_service_login_verified(
+            session, "serviceLogin?sid=micoapi&_json=true",
+            device_id=account.token.get("deviceId", ""), token=account.token,
+            user_agent=str(getattr(account, "now_ua", "") or ""),
+        )""",
+)
+replace_exact(
+    "legacy SMS retry password POST uses verified TLS",
+    'resp = await account._serviceLogin("serviceLoginAuth2", payload)',
+    """resp = await _mi_service_login_verified(
+                session, "serviceLoginAuth2", payload,
+                device_id=account.token.get("deviceId", ""), token=account.token,
+                user_agent=str(getattr(account, "now_ua", "") or ""),
+            )""",
+)
+replace_exact(
+    "startup password fallback reuses verified OTP login",
+    """                if await password_account.login("micoapi"):
+                    candidate = MiNAService(password_account)
+                    devices = await candidate.device_list()
+                    account = password_account
+                    na = candidate
+                    logged_in = True""",
+    """                login_result = await _otp_password_login(
+                    mi_cfg["username"], mi_cfg["password"]
+                )
+                if login_result.get("need_otp"):
+                    # A background startup cannot complete interactive verification.
+                    await _reset_otp_state()
+                    log.info("后台登录需要二次验证，请在管理页面手动登录")
+                if login_result.get("ok") and login_result.get("verified") and not login_result.get("need_otp"):
+                    _set_token(account, load_config())
+                    candidate = MiNAService(account)
+                    devices = await candidate.device_list()
+                    na = candidate
+                    logged_in = True""",
+)
+# ──────────────── Credential epoch guards for concurrent login/clear ────────────────
+replace_exact(
+    "credential generation state",
+    'INGRESS_HEADER = "x-ingress-path"',
+    """import contextvars
+
+_credential_generation = 0
+_credential_clearing = False
+_credential_context = contextvars.ContextVar('xiaoai_credential_generation', default=None)
+
+
+def _credential_write_allowed() -> bool:
+    expected = _credential_context.get()
+    return not _credential_clearing and (
+        expected is None or expected == _credential_generation
+    )
+
+
+INGRESS_HEADER = "x-ingress-path" """.rstrip(),
+)
+
+replace_exact(
+    "capture a request's credential generation before async work",
+    """async def _enforce_access_control(request: Request, call_next):
+    path = request.url.path""",
+    """async def _enforce_access_control(request: Request, call_next):
+    _credential_context.set(_credential_generation)
+    path = request.url.path""",
+)
+
+# Password, OTP, Cookie and QR routes share the same middleware snapshot. The
+# guard is checked immediately before credential persistence (no await between
+# the check and the atomic write), so clearing invalidates old in-flight requests.
+
+# ──────────────── Crash-safe private configuration write ────────────────
+replace_exact(
+    "atomic config.yaml save",
+    '''def save_config(cfg: dict):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+''',
+    '''def save_config(cfg: dict):
+    """Write the entire YAML atomically with private permissions.
+
+    Calls are synchronous and contain no await; in this single-worker ASGI app,
+    ordinary API config updates cannot interleave between read and replace.
+    """
+    import tempfile
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".config-", suffix=".yaml.tmp",
+                                     dir=str(CONFIG_PATH.parent))
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            yaml.safe_dump(cfg, out, allow_unicode=True,
+                           default_flow_style=False, sort_keys=False)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temp_name, CONFIG_PATH)
+        try:
+            directory_fd = os.open(str(CONFIG_PATH.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+''',
+)
+
+replace_exact(
+    "QR login also uses the atomic credential writer",
+    '''            AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(AUTH_PATH, "w", encoding="utf-8") as f:
+                json.dump(auth_data, f, ensure_ascii=False)
+            # 保存 .mi.token
+            token_data = {**auth_data, "micoapi": [auth_data["ssecurity"], service_token]}
+            TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+                json.dump(token_data, f, ensure_ascii=False)
+            # 保存 cookie_text 到配置
+            cfg = load_config()
+            mi_cfg = cfg.get("xiaomi", {})
+            cookie_text = f"userId={auth_data['userId']}; passToken={auth_data['passToken']}; serviceToken={service_token}; deviceId={auth_data['deviceId']}"
+            cfg.setdefault("xiaomi", {})["cookie_text"] = cookie_text
+            save_config(cfg)
+''',
+    '''            # Same 0600 + temp/replace/rollback path as OTP and Cookie login.
+            _persist_sms_credentials(auth_data)
+''',
+)
+
+# ──────────────── Per-section optimistic concurrency (CAS) ────────────────
+replace_exact(
+    "revision signature from actual unmasked stored config",
+    "def _peer_is_supervisor(host) -> bool:",
+    """def _config_section_revision(cfg: dict, section: str) -> str:
+    '''Opaque keyed snapshot of exactly the fields managed by one UI section.
+
+    HMAC prevents the revision token from becoming a password/token hash oracle.
+    Two tabs loading the same section receive the same revision; an unrelated
+    section change leaves it unchanged.
+    '''
+    if section == "xiaomi":
+        value = cfg.get("xiaomi") or {}
+    elif section == "ha":
+        value = cfg.get("homeassistant") or {}
+    elif section == "rules":
+        value = cfg.get("intent_rules", [])
+    elif section == "adv":
+        value = {key: cfg.get(key) for key in
+                 ("poll_interval_seconds", "ai_mode", "openai")}
+    else:
+        raise ValueError("unknown configuration section")
+    canonical = json.dumps(value, sort_keys=True, ensure_ascii=False,
+                           separators=(",", ":"), default=str)
+    return "v1:" + hmac.new(
+        ACCESS_TOKEN.encode("utf-8"),
+        (section + ":" + canonical).encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def _peer_is_supervisor(host) -> bool:""",
+)
+
+replace_exact(
+    "GET config returns section revisions before secrets are masked",
+    """    masked = MASKED_VALUE
+    xiaomi = cfg.setdefault("xiaomi", {})""",
+    """    cfg["_section_revisions"] = {
+        section: _config_section_revision(cfg, section)
+        for section in ("xiaomi", "ha", "rules", "adv")
+    }
+    masked = MASKED_VALUE
+    xiaomi = cfg.setdefault("xiaomi", {})""",
+)
+
+replace_exact(
+    "scoped save accepts one expected section revision",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+""",
+    """class SaveConfigRequest(BaseModel):
+    config: dict[str, Any]
+    section: str | None = None
+    revision: str | None = None
+""",
+)
+
+replace_exact(
+    "reject stale or missing CAS revision before scoped save",
+    """        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return {"ok": False, "msg": "不支持的配置分区"}
+        incoming = cfg""",
+    """        if section not in ("xiaomi", "ha", "rules", "adv"):
+            return JSONResponse(
+                {"ok": False, "msg": "不支持的配置分区"}, status_code=400
+            )
+        expected = getattr(req, "revision", None)
+        if not isinstance(expected, str) or not expected:
+            return JSONResponse(
+                {"ok": False, "code": "revision_required",
+                 "msg": "缺少配置版本，请刷新页面后保存"},
+                status_code=428,
+            )
+        current_revision = _config_section_revision(existing, section)
+        if not hmac.compare_digest(expected, current_revision):
+            return JSONResponse(
+                {"ok": False, "code": "config_conflict",
+                 "section": section,
+                 "msg": "这个配置分区已在其他窗口更新，未覆盖现有数据；请备份当前修改后刷新页面"},
+                status_code=409,
+            )
+        if section == "xiaomi" and wants_clear:
+            result = await clear_xiaomi_login()
+            if isinstance(result, dict) and result.get("ok"):
+                result["revision"] = _config_section_revision(load_config(), "xiaomi")
+            return result
+        incoming = cfg""",
+)
+
+replace_exact(
+    "successful scoped save issues the new section revision",
+    """    log.info("配置已保存")
+    return {"ok": True}
+""",
+    """    log.info("配置已保存")
+    return {"ok": True, "revision": _config_section_revision(cfg, section) if section else None}
+""",
+)
+
+# A slow legacy Xiaomi login may finish after another tab saved unrelated
+# config. Re-read the current file and update just the cookie field.
+replace_exact(
+    "legacy Xiaomi test must not write a stale whole-config snapshot",
+    '                        save_config({**cfg, "xiaomi": {**mi, "cookie_text": cookie_text}})',
+    '''                        latest = load_config()
+                        latest_mi = latest.setdefault("xiaomi", {})
+                        if not latest_mi.get("cookie_text"):
+                            latest_mi["cookie_text"] = cookie_text
+                            save_config(latest)''',
+)
+
+# ──────────────── Revocable, expiring direct-access sessions ────────────────
+replace_exact(
+    "replace fixed replayable session with random server-side sessions",
+    '''ACCESS_TOKEN = _load_or_create_access_token()
+SESSION_VALUE = hmac.new(
+    ACCESS_TOKEN.encode("utf-8"), b"xiaoai-bridge-session-v1", hashlib.sha256
+).hexdigest()
+''',
+    '''ACCESS_TOKEN = _load_or_create_access_token()
+SESSION_TTL_SECONDS = 7 * 24 * 3600
+# Memory-only session registry: process restart invalidates direct browser
+# cookies, while the independent Bearer access token remains unchanged.
+_active_sessions: dict[str, float] = {}
+
+
+def _session_key(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _new_direct_session() -> str:
+    now = time.time()
+    for key, expires in list(_active_sessions.items()):
+        if expires <= now:
+            _active_sessions.pop(key, None)
+    # Avoid unlimited growth if someone repeatedly logs in with a valid token.
+    while len(_active_sessions) >= 128:
+        _active_sessions.pop(next(iter(_active_sessions)))
+    cookie = secrets.token_urlsafe(32)
+    _active_sessions[_session_key(cookie)] = now + SESSION_TTL_SECONDS
+    return cookie
+''',
+)
+replace_exact(
+    "constant session check now validates server registry and TTL",
+    '''def _session_value_match(candidate) -> bool:
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    try:
+        return hmac.compare_digest(candidate.encode("utf-8"), SESSION_VALUE.encode("utf-8"))
+    except (UnicodeError, AttributeError, TypeError):
+        return False
+''',
+    '''def _session_value_match(candidate) -> bool:
+    if not isinstance(candidate, str) or not candidate:
+        return False
+    expires = _active_sessions.get(_session_key(candidate))
+    if expires is None:
+        return False
+    if expires <= time.time():
+        _active_sessions.pop(_session_key(candidate), None)
+        return False
+    return True
+''',
+)
+replace_exact(
+    "generate a fresh opaque session on each login",
+    '''    response.set_cookie(SESSION_COOKIE, SESSION_VALUE, httponly=True,
+                        samesite="strict", max_age=7 * 24 * 3600, path="/")''',
+    '''    response.set_cookie(SESSION_COOKIE, _new_direct_session(), httponly=True,
+                        samesite="strict", max_age=SESSION_TTL_SECONDS, path="/")''',
+)
+replace_exact(
+    "logout revokes the specific submitted cookie on the server",
+    '''@app.post("/api/logout")
+async def destroy_session():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response''',
+    '''@app.post("/api/logout")
+async def destroy_session(request: Request):
+    cookie = (request.cookies.get(SESSION_COOKIE) or "").strip()
+    if cookie:
+        _active_sessions.pop(_session_key(cookie), None)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response''',
+)
+
+# ──────────────── Polling authentication fallback and identity validation ────────────────
+replace_exact(
+    "reject an incomplete cookie_text when there is no token file",
+    '''    if not TOKEN_PATH.exists():
+        if mi_cfg.get("cookie_text"):
+            from http.cookies import SimpleCookie
+            sc = SimpleCookie()
+            sc.load(mi_cfg["cookie_text"])
+            return {k: m.value for k, m in sc.items()}
+        return None
+''',
+    '''    if not TOKEN_PATH.exists():
+        return _valid_saved_cookie_text(mi_cfg)
+''',
+)
+replace_exact(
+    "add validated cookie fallback helper",
+    '''def _get_cookie(cfg: dict) -> dict | None:''',
+    '''def _valid_saved_cookie_text(mi_cfg: dict) -> dict | None:
+    from http.cookies import SimpleCookie
+    raw = str(mi_cfg.get("cookie_text") or "")
+    if not raw:
+        return None
+    try:
+        sc = SimpleCookie()
+        sc.load(raw)
+        parsed = {key: item.value for key, item in sc.items()}
+        if parsed.get("userId") and parsed.get("serviceToken"):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+def _get_cookie(cfg: dict) -> dict | None:''',
+)
+replace_exact(
+    "invalid cached micoapi falls back to validated cookie_text",
+    '''        micoapi = user_data.get("micoapi")
+        if not micoapi:
+            return None
+        service_token = micoapi[1]''',
+    '''        micoapi = user_data.get("micoapi")
+        if not isinstance(micoapi, (list, tuple)) or len(micoapi) < 2 or not micoapi[1]:
+            return _valid_saved_cookie_text(mi_cfg)
+        service_token = micoapi[1]''',
+)
+replace_exact(
+    "unreadable token uses verified cookie_text, never returns half-auth",
+    '''    except Exception as e:
+        log.warning("读取 .mi.token 失败: %s", e)
+        return None
+
+
+async def _get_latest_ask_from_xiaoai''',
+    '''    except Exception as e:
+        log.warning("读取 .mi.token 失败: %s", e)
+        return _valid_saved_cookie_text(mi_cfg)
+
+
+async def _get_latest_ask_from_xiaoai''',
+)
+replace_exact(
+    "reject credential sets with empty deviceId",
+    '''    return [key for key in ("userId", "passToken", "serviceToken") if not creds.get(key)]''',
+    '''    return [key for key in ("userId", "passToken", "serviceToken", "deviceId")
+            if not str(creds.get(key) or "").strip()]''',
+)
+replace_exact(
+    "generate a deviceId even for direct-serviceToken cookie login",
+    '''    device_id = str(cookies.get("deviceId") or "").strip()
+    service_token = str(cookies.get("serviceToken") or "").strip()''',
+    '''    device_id = str(cookies.get("deviceId") or "").strip() or secrets.token_hex(8).upper()
+    service_token = str(cookies.get("serviceToken") or "").strip()''',
+)
+
+# ──────────────── Durable polling watermarks & tracked delayed tasks ────────────────
+replace_exact(
+    "atomic durable timestamp writer",
+    '''async def bridge_loop():''',
+    '''def _write_last_timestamp_atomic(path, value):
+    """Crash-safe, private at-most-once voice-command watermark."""
+    import tempfile
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".last-timestamp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+# Process-local delay tasks are explicitly cancelled on bridge stop.
+# They are not a persistent scheduler; HA automation should be used for that.
+_delayed_tasks: set[asyncio.Task] = set()
+
+
+async def bridge_loop():''',
+)
+replace_exact(
+    "do not silently re-run commands after corrupted dedupe watermark",
+    '''    if LAST_TS_PATH.exists():
+        try:
+            last_timestamp = json.loads(LAST_TS_PATH.read_text())
+        except Exception:
+            last_timestamp = {}
+    log.info("上次记录时间戳: %s", last_timestamp)''',
+    '''    if LAST_TS_PATH.exists():
+        try:
+            last_timestamp = json.loads(LAST_TS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(last_timestamp, dict) or any(
+                not isinstance(key, str) or not isinstance(value, int) or value < 0
+                for key, value in last_timestamp.items()
+            ):
+                raise ValueError("invalid timestamp record")
+        except Exception:
+            log.error("语音去重记录损坏，拒绝重放旧指令；请检查 last_timestamp.json")
+            bridge_state["error"] = "语音去重记录损坏，已停止桥接以避免重复执行旧指令"
+            bridge_state["running"] = False
+            return
+    log.info("上次记录时间戳: %s", last_timestamp)''',
+)
+replace_exact(
+    "atomic watermark write off event loop before executing a command",
+    '''                    LAST_TS_PATH.write_text(json.dumps(last_timestamp, ensure_ascii=False))''',
+    '''                    # Keep at-most-once semantics deliberately: a failed
+                    # HA command is not automatically retried as a new command.
+                    # Use a thread so SD-card fsync cannot block conversation polls.
+                    await asyncio.to_thread(
+                        _write_last_timestamp_atomic, LAST_TS_PATH, dict(last_timestamp)
+                    )''',
+)
+replace_exact(
+    "register delayed task so stop can cancel it",
+    '''                            asyncio.create_task(_delayed_call(
+                                ha, domain, service, action, delay_sec, _bridge_session
+                            ))''',
+    '''                            delayed_task = asyncio.create_task(_delayed_call(
+                                ha, domain, service, action, delay_sec, _bridge_session
+                            ))
+                            _delayed_tasks.add(delayed_task)
+                            delayed_task.add_done_callback(_delayed_tasks.discard)''',
+)
+replace_exact(
+    "cancel and join delayed tasks before closing their HA session",
+    '''    finally:
+        bridge_state["running"] = False
+        bridge_state["connected"] = False
+        if _bridge_session and not _bridge_session.closed:
+            await _bridge_session.close()''',
+    '''    finally:
+        bridge_state["running"] = False
+        bridge_state["connected"] = False
+        if _delayed_tasks:
+            pending_delays = list(_delayed_tasks)
+            for pending_task in pending_delays:
+                pending_task.cancel()
+            await asyncio.gather(*pending_delays, return_exceptions=True)
+            _delayed_tasks.clear()
+            log.info("桥接器停止：已取消 %d 条尚未执行的延迟指令", len(pending_delays))
+        if _bridge_session and not _bridge_session.closed:
+            await _bridge_session.close()''',
+)
+replace_exact(
+    "log cancelled delayed actions explicitly",
+    '''    await asyncio.sleep(delay_sec)
+    try:
+        ok = await ha.call_service(domain, service, data, session)''',
+    '''    try:
+        await asyncio.sleep(delay_sec)
+    except asyncio.CancelledError:
+        log.info("延迟指令已随桥接器停止而取消：%s/%s", domain, service)
+        raise
+    try:
+        ok = await ha.call_service(domain, service, data, session)''',
+)
+replace_exact(
+    "avoid same-second automation IDs overwriting each other",
+    '''    automation_id = f"{_AUTOMATION_PREFIX}{int(time.time())}"''',
+    '''    automation_id = f"{_AUTOMATION_PREFIX}{int(time.time())}_{secrets.token_hex(4)}"''',
+)
+
+# ──────────────── HA target URL hardening ────────────────
+replace_exact(
+    "validate HA test address and disallow metadata endpoints",
+    '''    url = req.url.strip().rstrip("/")
+    if not url:
+        raise ValueError("请先填写 Home Assistant 地址")
+
+    token = req.token.strip()''',
+    '''    url = req.url.strip().rstrip("/")
+    if not url:
+        raise ValueError("请先填写 Home Assistant 地址")
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if (parts.scheme not in ("http", "https") or not parts.hostname
+            or parts.username is not None or parts.password is not None
+            or parts.fragment or parts.query):
+        raise ValueError("HA 地址仅支持没有用户名、查询参数的 http(s) URL")
+    try:
+        _ = parts.port
+    except ValueError:
+        raise ValueError("HA 端口无效") from None
+    try:
+        addr = ipaddress.ip_address(parts.hostname)
+    except ValueError:
+        addr = None
+    if addr is not None and (
+        addr.is_link_local or addr.is_multicast or addr.is_unspecified
+        or addr.is_reserved or addr.is_loopback
+    ):
+        raise ValueError("HA 地址不可指向本机、链路本地或保留 IP")
+    if parts.hostname.lower() in ("localhost", "metadata.google.internal"):
+        raise ValueError("HA 地址不可指向本机或云元数据服务")
+
+    token = req.token.strip()''',
+)
+replace_exact(
+    "HA connection test must never forward token through redirect",
+    '''                f"{self.base}/api/", headers=self.headers, timeout=aiohttp.ClientTimeout(total=5)''',
+    '''                f"{self.base}/api/", headers=self.headers,
+                timeout=aiohttp.ClientTimeout(total=5), allow_redirects=False''',
+)
+replace_exact(
+    "HA service discovery must not follow token-bearing redirect",
+    '''                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:''',
+    '''                timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False
+            ) as r:''',
+)
+
+# Credential pair is updated with rollback, but two renames are not
+# crash-atomic. On the next boot refuse mixed identities instead of silently
+# combining auth.json of one account with .mi.token from another account.
+replace_exact(
+    "reject mismatched saved Xiaomi account identities at startup",
+    '''async def bridge_loop():
+    global _bridge_session
+    cfg = load_config()''',
+    '''def _saved_credential_pair_conflicted() -> bool:
+    if not (AUTH_PATH.exists() and TOKEN_PATH.exists()):
+        return False
+    try:
+        auth = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        token = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+        if not isinstance(auth, dict) or not isinstance(token, dict):
+            return True
+        return any(
+            not auth.get(key) or not token.get(key)
+            or str(auth[key]) != str(token[key])
+            for key in ("userId", "passToken")
+        )
+    except (OSError, ValueError, TypeError):
+        return True
+
+
+async def bridge_loop():
+    global _bridge_session
+    if _saved_credential_pair_conflicted():
+        bridge_state["error"] = "小米登录凭据文件不一致，请在管理页面清除登录后重新认证"
+        bridge_state["running"] = False
+        log.error("auth.json 与 .mi.token 不一致，已拒绝加载混合身份")
+        return
+    cfg = load_config()''',
+)
+
+
+# ──────────────── 定时任务格式：文档允许 HH:MM:SS 与整数星期，上游只接受 HH:MM/字符串 ────────────────
+replace_exact(
+    "normalize schedule automations (HH:MM or HH:MM:SS, weekday names or 1-7 ints)",
+    r'''async def _create_ha_automation(
+    ha: HAClient, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days: str | None,
+    session: aiohttp.ClientSession,
+) -> tuple[str, bool]:
+    """在 HA 中创建定时自动化"""
+    if not re.match(r"^\d{1,2}:\d{2}$", schedule_time):
+        return "", False
+    # 补齐 HH:MM:SS 格式
+    parts = schedule_time.split(":")
+    at_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}:00"
+''',
+    r'''_SCHEDULE_WEEKDAY_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_SCHEDULE_WEEKDAY_ALIASES = {
+    "mon": "mon", "monday": "mon", "周一": "mon", "星期一": "mon",
+    "tue": "tue", "tues": "tue", "tuesday": "tue", "周二": "tue", "星期二": "tue",
+    "wed": "wed", "weds": "wed", "wednesday": "wed", "周三": "wed", "星期三": "wed",
+    "thu": "thu", "thur": "thu", "thurs": "thu", "thursday": "thu", "周四": "thu", "星期四": "thu",
+    "fri": "fri", "friday": "fri", "周五": "fri", "星期五": "fri",
+    "sat": "sat", "saturday": "sat", "周六": "sat", "星期六": "sat",
+    "sun": "sun", "sunday": "sun", "周日": "sun", "周天": "sun", "星期日": "sun", "星期天": "sun",
+}
+
+
+def _normalize_schedule_time(value) -> str:
+    """Normalize HH:MM or HH:MM:SS (24h) to HH:MM:SS; "" when the value is invalid."""
+    raw = str(value if value is not None else "").strip()
+    parts = raw.split(":")
+    if len(parts) not in (2, 3) or any(not part.strip().isdigit() for part in parts):
+        return ""
+    numbers = [int(part) for part in parts]
+    hour, minute = numbers[0], numbers[1]
+    second = numbers[2] if len(numbers) == 3 else 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return ""
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
+def _normalize_schedule_weekdays(value) -> list:
+    """Normalize schedule_days to HA weekday names; [] means every day.
+
+    Accepts None/""/"daily"/"每天", "weekdays"/"工作日", "weekends"/"周末",
+    "mon,wed,fri", Chinese weekday names and integer arrays such as [1,2,3]
+    (1 = Monday ... 7 = Sunday), which is what the rules page documents.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        tokens = list(value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return []
+        lowered = raw.lower()
+        if lowered in ("daily", "每天", "everyday", "all", "*"):
+            return []
+        if lowered in ("weekdays", "工作日"):
+            return ["mon", "tue", "wed", "thu", "fri"]
+        if lowered in ("weekends", "周末"):
+            return ["sat", "sun"]
+        tokens = [part for part in re.split(r"[,，、/\s]+", raw) if part]
+
+    chosen = set()
+    for token in tokens:
+        if isinstance(token, bool):
+            continue
+        if isinstance(token, (int, float)):
+            number = int(token)
+            if 1 <= number <= 7:
+                chosen.add(_SCHEDULE_WEEKDAY_ORDER[number - 1])
+            continue
+        key = str(token).strip().lower()
+        if not key:
+            continue
+        if key.startswith("weekday"):
+            key = key[7:].strip(":： ")
+        if key.isdigit():
+            number = int(key)
+            if 1 <= number <= 7:
+                chosen.add(_SCHEDULE_WEEKDAY_ORDER[number - 1])
+            continue
+        mapped = _SCHEDULE_WEEKDAY_ALIASES.get(key)
+        if mapped:
+            chosen.add(mapped)
+    return [day for day in _SCHEDULE_WEEKDAY_ORDER if day in chosen]
+
+
+async def _create_ha_automation(
+    ha: HAClient, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days=None,
+    session: aiohttp.ClientSession = None,
+) -> tuple[str, bool]:
+    """在 HA 中创建定时自动化（支持 HH:MM / HH:MM:SS 与名称或 1-7 整数星期）"""
+    at_time = _normalize_schedule_time(schedule_time)
+    if not at_time:
+        log.warning("定时任务时间格式无效: %r", schedule_time)
+        return "", False
+''',
+)
+
+replace_exact(
+    "schedule weekdays from the documented integer arrays",
+    r'''    # 星期条件
+    days = (schedule_days or "daily").lower().strip()
+    if days in ("weekdays", "工作日"):
+        config["condition"] = [{"condition": "time", "weekday": ["mon", "tue", "wed", "thu", "fri"]}]
+    elif days in ("weekends", "周末"):
+        config["condition"] = [{"condition": "time", "weekday": ["sat", "sun"]}]
+    elif days not in ("daily", "每天", ""):
+        weekdays = []
+        for d in re.split(r"[,，、\s]+", days):
+            d = d.strip()
+            if d in _WEEKDAY_MAP:
+                weekdays.append(_WEEKDAY_MAP[d])
+        if weekdays:
+            config["condition"] = [{"condition": "time", "weekday": weekdays}]
+''',
+    r'''    # 星期条件：文档允许整数数组（[1..7]），上游只处理字符串，统一通过 helper 归一化
+    weekdays = _normalize_schedule_weekdays(schedule_days)
+    if weekdays:
+        config["condition"] = [{"condition": "time", "weekday": weekdays}]
+''',
+)
+
+# Validate the built Python AST, not the patch source's quoted upstream templates.
+import ast
+_tree = ast.parse(source)
+_unverified = [
+    (getattr(node, 'lineno', '?'), node.func.attr)
+    for node in ast.walk(_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == '_serviceLogin'
+]
+if _unverified:
+    raise SystemExit("Unsafe dependency _serviceLogin calls in built bridge.py: " + repr(_unverified))
 
 path.write_text(source, encoding="utf-8")
 print(f"Patched {path} with validated micoapi token exchange")

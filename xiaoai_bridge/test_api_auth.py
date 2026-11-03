@@ -348,6 +348,145 @@ def main():
         assert saved["homeassistant"]["token"] == FAKE_HA_TOKEN
         ok("cross-site POST is rejected (403) while same-origin save keeps secrets")
 
+        # ── scoped config saves must preserve changes from another tab ──
+        alias_saved = client.post(
+            "/api/aliases", headers=UI_HEADER,
+            json_body={"entity_id": "light.a", "alias": "客厅主灯"},
+        )
+        assert alias_saved.status_code == 200 and alias_saved.json()["ok"] is True
+        scoped = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["rules"],
+                       "config": {
+                "intent_rules": [{"pattern": "开灯", "action": {
+                    "domain": "light", "service": "turn_on",
+                    "entity_id": "light.a", "reply": "好的"}}],
+                "device_aliases": {"light.a": "过期旧别名"},
+                "xiaomi": {"username": FAKE_USER, "cookie_text": ""},
+            }},
+        )
+        assert scoped.status_code == 200 and scoped.json()["ok"] is True, scoped.text
+        cfg_scoped = read_config(root)
+        assert cfg_scoped["device_aliases"]["light.a"] == "客厅主灯", (
+            "saving rules must not roll back a more recently saved device alias"
+        )
+        assert cfg_scoped["xiaomi"]["cookie_text"] == FAKE_COOKIE
+        assert cfg_scoped["intent_rules"][0]["pattern"] == "开灯"
+        ok("scoped rules save preserves device aliases and Xiaomi credentials")
+
+        # A scoped Xiaomi edit must not drop hidden legacy settings that the
+        # modern UI does not render; HA edits must likewise retain extra keys.
+        cfg_before = read_config(root)
+        cfg_before["xiaomi"]["device_id"] = "legacy-speaker-id"
+        cfg_before["homeassistant"]["verify_ssl"] = True
+        bridge.save_config(cfg_before)
+        scoped_xiaomi = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["xiaomi"],
+                       "config": {
+                "xiaomi": {"username": FAKE_USER, "password": bridge.MASKED_VALUE,
+                           "cookie_text": bridge.MASKED_VALUE,
+                           "hardware": "NEW-HARDWARE"}}},
+        )
+        assert scoped_xiaomi.status_code == 200 and scoped_xiaomi.json()["ok"] is True
+        saved_xiaomi = read_config(root)
+        assert saved_xiaomi["xiaomi"]["device_id"] == "legacy-speaker-id"
+        assert saved_xiaomi["xiaomi"]["hardware"] == "NEW-HARDWARE"
+        assert saved_xiaomi["homeassistant"]["verify_ssl"] is True
+        scoped_ha = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha",
+                       "revision": client.get("/api/config").json()["_section_revisions"]["ha"],
+                       "config": {
+                "homeassistant": {"url": "http://homeassistant:80",
+                                  "token": bridge.MASKED_VALUE}}},
+        )
+        assert scoped_ha.status_code == 200 and scoped_ha.json()["ok"] is True
+        assert read_config(root)["homeassistant"]["verify_ssl"] is True
+        assert read_config(root)["homeassistant"]["token"] == FAKE_HA_TOKEN
+        if os.name == "posix":
+            assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
+        ok("scoped Xiaomi/HA saves retain hidden settings and config stays mode 0600")
+
+        # ── real CAS semantics: same section conflicts, other sections do not ──
+        page_a = client.get("/api/config").json()["_section_revisions"].copy()
+        page_b = client.get("/api/config").json()["_section_revisions"].copy()
+        assert all(str(v).startswith("v1:") for v in page_a.values())
+        first = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": page_a["ha"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-a"}}},
+        )
+        assert first.status_code == 200 and first.json()["ok"], first.text
+        assert first.json()["revision"] != page_a["ha"]
+        previous = (root / "config" / "config.yaml").read_bytes()
+        stale = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": page_b["ha"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-b"}}},
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.json()["code"] == "config_conflict"
+        assert (root / "config" / "config.yaml").read_bytes() == previous
+        assert read_config(root)["homeassistant"]["cas_note"] == "tab-a"
+        ok("stale second tab gets 409 and cannot overwrite saved HA changes")
+
+        # The same stale page's rules revision is still current: independent tabs.
+        independent = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "revision": page_b["rules"],
+                       "config": {"intent_rules": cfg_scoped["intent_rules"] + [{
+                           "pattern": "关灯", "action": {
+                               "domain": "light", "service": "turn_off",
+                               "entity_id": "light.a"}}]}},
+        )
+        assert independent.status_code == 200 and independent.json()["ok"], independent.text
+        second = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "ha", "revision": first.json()["revision"],
+                       "config": {"homeassistant": {
+                           "url": "http://homeassistant:80",
+                           "token": masked, "cas_note": "tab-a-second"}}},
+        )
+        assert second.status_code == 200 and second.json()["ok"], second.text
+        assert second.json()["revision"] != first.json()["revision"]
+        assert read_config(root)["homeassistant"]["cas_note"] == "tab-a-second"
+        ok("different sections coexist and fresh CAS tokens allow consecutive saves")
+
+        old_rules = read_config(root)["intent_rules"]
+        absent = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "config": {"intent_rules": []}},
+        )
+        assert absent.status_code == 428 and absent.json()["code"] == "revision_required"
+        assert read_config(root)["intent_rules"] == old_rules
+        stale_rules = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules", "revision": page_a["rules"],
+                       "config": {"intent_rules": []}},
+        )
+        assert stale_rules.status_code == 409
+        assert read_config(root)["intent_rules"] == old_rules
+        ok("CAS is required even for deliberate clear-all and rejects stale rule deletion")
+
+
+        # ── test rules default to pure preview; never trigger HA services ──
+        preview = client.post(
+            "/api/test/rule", headers=UI_HEADER,
+            json_body={"text": "开灯", "rules": cfg_scoped["intent_rules"]},
+        )
+        assert preview.status_code == 200 and preview.json()["matched"] is True, preview.text
+        assert preview.json()["preview"] is True
+        assert preview.json()["executed"] is False
+        assert preview.json()["action"]["entity_id"] == "light.a"
+        ok("rule test is preview-only unless execution is explicitly requested")
+
         # ── forged ingress header from a non-supervisor peer must not authenticate ──
         client.cookies.clear()
         forged = client.get(
@@ -418,16 +557,120 @@ def main():
 
         # ── logout ──
         client.post("/api/session", json_body={"token": token})
+        old_cookie = client.cookies.get(bridge.SESSION_COOKIE)
+        assert old_cookie
         assert client.post("/api/logout", headers=UI_HEADER).status_code == 200
-        client.cookies.clear()
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: old_cookie}).status_code == 401, (
+            "a replay of a logged-out cookie must be refused by the server"
+        )
         assert client.get("/api/status").status_code == 401
-        ok("logout invalidates the direct session")
+        fresh_login = client.post("/api/session", json_body={"token": token})
+        assert fresh_login.status_code == 200
+        fresh_cookie = client.cookies.get(bridge.SESSION_COOKIE)
+        assert fresh_cookie != old_cookie
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: fresh_cookie}).status_code == 200
+        bridge._active_sessions[bridge._session_key(fresh_cookie)] = 1
+        assert client.get("/api/status", cookies={bridge.SESSION_COOKIE: fresh_cookie}).status_code == 401, (
+            "an expired cookie must be invalid even if the browser still sends it"
+        )
+        client.cookies.clear()
+        ok("logout revokes replayed direct cookies, new sessions are unique, expiry is enforced")
 
         # ── E: explicit credential clear removes files and stored cookie ──
         client.post("/api/session", json_body={"token": token})
+
+        # ── clear_login must compare CAS BEFORE any irreversible operation ──
+        auth_file = root / "config" / "auth.json"
+        token_file = root / "config" / ".mi.token"
+        auth_file.write_text('{"userId":"cas-user","passToken":"cas-pass","deviceId":"cas-device"}', encoding="utf-8")
+        token_file.write_text('{"userId":"cas-user","passToken":"cas-pass","deviceId":"cas-device","micoapi":["sec","svc"]}', encoding="utf-8")
+        config_before_clear = read_config(root)
+        config_before_clear["xiaomi"]["password"] = "cas-secret"
+        config_before_clear["xiaomi"]["cookie_text"] = "userId=cas-user; passToken=cas-pass"
+        bridge.save_config(config_before_clear)
+        previous_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+
+        # Another tab modifies the same Xiaomi section.
+        changed = read_config(root)
+        changed["xiaomi"]["hardware"] = "new-hardware"
+        bridge.save_config(changed)
+        old_data = (root / "config" / "config.yaml").read_bytes()
+        old_auth = auth_file.read_bytes()
+        old_token = token_file.read_bytes()
+        stale_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": previous_rev,
+                       "config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert stale_clear.status_code == 409 and stale_clear.json()["code"] == "config_conflict"
+        assert (root / "config" / "config.yaml").read_bytes() == old_data
+        assert auth_file.read_bytes() == old_auth and token_file.read_bytes() == old_token
+        ok("stale CAS clear_login returns 409 without deleting credentials or changing config")
+
+        current_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        fresh_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": current_rev,
+                       "config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert fresh_clear.status_code == 200 and fresh_clear.json()["ok"] is True, fresh_clear.text
+        assert fresh_clear.json()["revision"] == client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        assert not auth_file.exists() and not token_file.exists()
+        assert read_config(root)["xiaomi"]["password"] == ""
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        ok("fresh CAS clear_login succeeds and returns the new Xiaomi revision")
+
+        # Incomplete legacy config writes must preserve unrelated settings.
+        before_legacy = read_config(root)
+        legacy_partial = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"config": {"xiaomi": {"hardware": "legacy-only-change"}}},
+        )
+        assert legacy_partial.status_code == 200 and legacy_partial.json()["ok"], legacy_partial.text
+        after_legacy = read_config(root)
+        assert after_legacy["xiaomi"]["hardware"] == "legacy-only-change"
+        assert after_legacy["homeassistant"] == before_legacy["homeassistant"]
+        assert after_legacy["intent_rules"] == before_legacy["intent_rules"]
+        assert after_legacy["device_aliases"] == before_legacy["device_aliases"]
+        ok("legacy partial save does not erase HA, rules, aliases or other Xiaomi keys")
+
+        auth_file.write_bytes(old_auth)
+        token_file.write_bytes(old_token)
+        restored = read_config(root)
+        restored["xiaomi"]["password"] = "secret-to-clear"
+        restored["xiaomi"]["cookie_text"] = "userId=cas-user; passToken=cas-pass"
+        bridge.save_config(restored)
+        legacy_clear = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"config": {"xiaomi": {"clear_login": True}}},
+        )
+        assert legacy_clear.status_code == 200 and legacy_clear.json()["ok"], legacy_clear.text
+        assert not auth_file.exists() and not token_file.exists()
+        assert read_config(root)["xiaomi"]["password"] == ""
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        assert read_config(root)["intent_rules"] == before_legacy["intent_rules"]
+        assert read_config(root)["homeassistant"] == before_legacy["homeassistant"]
+        ok("legacy partial clear_login clears only login and preserves all unrelated config")
+
+        class FakePendingLogin:
+            closed = False
+
+            async def close(self):
+                self.closed = True
+
+        otp_pending = FakePendingLogin()
+        legacy_pending = FakePendingLogin()
+        bridge._otp_session = otp_pending
+        bridge._otp_login.update({"username": "test", "created_at": 1})
+        bridge._pending_session = legacy_pending
+        bridge._pending_login.update({"username": "test"})
+        bridge._qr_state.update({"ready": True, "lp_url": "https://example.invalid"})
         cleared = client.post("/api/xiaomi/clear-login", headers=UI_HEADER)
         assert cleared.status_code == 200, cleared.text
         assert cleared.json()["ok"] is True
+        assert otp_pending.closed and legacy_pending.closed
+        assert not bridge._otp_login and not bridge._pending_login and not bridge._qr_state
+
         assert not (root / "config" / ".mi.token").exists()
         assert not (root / "config" / "auth.json").exists()
         cfg_after = read_config(root)
@@ -439,6 +682,100 @@ def main():
         assert cfg_final["xiaomi"]["cookie_text"] == ""
         assert not (root / "config" / ".mi.token").exists()
         ok("cleared credentials stay cleared (no silent resurrection)")
+
+        # ── deterministically race a stale authentication request with clear ──
+        async def race_stale_write_against_clear():
+            begun = asyncio.Event()
+            resume = asyncio.Event()
+            identity = {"userId": "stale", "passToken": "stale-pass",
+                        "deviceId": "stale-dev", "ssecurity": "stale-sec",
+                        "serviceToken": "stale-service"}
+
+            async def delayed_authenticated_request():
+                # Middleware captures this generation on request entry.
+                bridge._credential_context.set(bridge._credential_generation)
+                begun.set()
+                await resume.wait()
+                try:
+                    bridge._persist_sms_credentials(identity)
+                except RuntimeError as exc:
+                    return "旧请求" in str(exc)
+                return False
+
+            pending = asyncio.create_task(delayed_authenticated_request())
+            await begun.wait()
+            await bridge.clear_xiaomi_login()
+            resume.set()
+            return await pending
+
+        assert asyncio.run(race_stale_write_against_clear()), (
+            "an in-flight old login must be refused after credential clear"
+        )
+        assert not (root / "config" / ".mi.token").exists()
+        assert not (root / "config" / "auth.json").exists()
+        assert read_config(root)["xiaomi"]["cookie_text"] == ""
+        ok("in-flight authentication cannot resurrect credentials after clear")
+
+        missing_rules = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "rules",
+                           "revision": client.get("/api/config").json()["_section_revisions"]["rules"],
+                           "config": {}},
+        )
+        assert missing_rules.status_code == 422 and missing_rules.json()["ok"] is False
+        assert read_config(root)["intent_rules"][0]["pattern"] == "开灯"
+        ok("omitting intent_rules never erases saved rules")
+
+
+        # ── middleware owns credential context generation, not just a test stub ──
+        from fastapi import Request
+
+        @bridge.app.get("/api/__generation_probe")
+        async def generation_probe(request: Request):
+            return {
+                "captured": bridge._credential_context.get(),
+                "current": bridge._credential_generation,
+                "allowed": bridge._credential_write_allowed(),
+            }
+
+        first_epoch = client.get(
+            "/api/__generation_probe",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert first_epoch.status_code == 200, first_epoch.text
+        assert first_epoch.json()["captured"] == first_epoch.json()["current"]
+        assert first_epoch.json()["allowed"] is True
+        bridge._credential_generation += 2
+        next_epoch = client.get(
+            "/api/__generation_probe",
+            headers={"Authorization": "Bearer " + token},
+        )
+        assert next_epoch.status_code == 200
+        assert next_epoch.json()["captured"] == next_epoch.json()["current"]
+        assert next_epoch.json()["current"] == first_epoch.json()["current"] + 2
+        assert next_epoch.json()["allowed"] is True
+        ok("real HTTP middleware snapshots the credential generation on every request")
+
+        # An administrator may test a private HA address, but never the cloud
+        # metadata service, localhost, credential-bearing or non-HTTP URLs.
+        from types import SimpleNamespace
+        resolve = bridge._resolve_ha_credentials
+        assert resolve(SimpleNamespace(
+            url="http://homeassistant:8123", token="valid-demo-ha-token"
+        )) == ("http://homeassistant:8123", "valid-demo-ha-token")
+        for hostile_url in (
+            "file:///etc/passwd", "http://169.254.169.254/latest/meta-data",
+            "http://localhost:8123", "http://127.0.0.1:8123",
+            "http://user:pass@homeassistant:8123", "http://homeassistant/?token=secret",
+            "http://[::1]:8123",
+        ):
+            try:
+                resolve(SimpleNamespace(url=hostile_url, token="testing"))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("unsafe HA URL was accepted: " + hostile_url)
+        ok("HA connection tests accept private HA while rejecting local metadata and unsafe URLs")
 
         # ── the access token survives a reload (persisted under /data) ──
         reloaded = load_bridge(root)

@@ -94,6 +94,7 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
     token_path = root / "config" / ".mi.token"
     auth_path = root / "config" / "auth.json"
     names = (
+        "_valid_saved_cookie_text",
         "_get_cookie",
         "_poll_auth_cookies",
         "_apply_cookie_to_session",
@@ -241,6 +242,34 @@ def scenario_cookie_only_does_not_send_pass_token(root):
     check("refreshToken" not in cookies and "cUserId" not in cookies,
           f"unknown cookie fields must not be forwarded, got {sorted(cookies)}")
     return "cookie-only poll sends userId+serviceToken+deviceId and never passToken"
+
+
+def scenario_incomplete_micoapi_falls_back_to_complete_cookie(root):
+    cfg = make_data(
+        root, micoapi=(),
+        cookie_text="userId=fallback-user; passToken=login-only; serviceToken=fallback-svc; deviceId=d",
+    )
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    saved = namespace["_get_cookie"](cfg)
+    check(saved is not None and saved.get("serviceToken") == "fallback-svc",
+          f"incomplete .mi.token must fall back to a complete cookie_text: {saved}")
+    session = FakeSession()
+    run_poll(namespace, session)
+    cookies = session.calls[0][1]["cookies"]
+    check(cookies.get("userId") == "fallback-user"
+          and cookies.get("serviceToken") == "fallback-svc",
+          f"poll must use the complete fallback credentials, got {cookies}")
+    return "missing micoapi serviceToken falls back to a complete saved Cookie"
+
+
+def scenario_incomplete_cookie_never_masquerades_as_poll_auth(root):
+    cfg = make_data(root, write_token=False, cookie_text="userId=u; passToken=p")
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    check(namespace["_get_cookie"](cfg) is None,
+          "passToken-only cookie lacks the serviceToken required for polling")
+    return "incomplete Cookie text is not treated as a valid poll authentication"
 
 
 def scenario_no_credentials(root):
@@ -398,6 +427,8 @@ def main():
         scenario_auth_cookies_present,
         scenario_target_device_wins,
         scenario_cookie_only_does_not_send_pass_token,
+        scenario_incomplete_micoapi_falls_back_to_complete_cookie,
+        scenario_incomplete_cookie_never_masquerades_as_poll_auth,
         scenario_no_credentials,
         scenario_redirect_does_not_leak,
         scenario_jar_least_privilege,

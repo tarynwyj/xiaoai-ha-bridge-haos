@@ -161,6 +161,9 @@ NEW_ONLY_FUNCTIONS = (
     "_merge_xiaomi_credentials",
     "_delete_saved_login_files",
     "get_config",
+    "_config_section_revision",
+    "_saved_credential_pair_conflicted",
+    "_write_last_timestamp_atomic",
     "_load_or_create_access_token",
 )
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the
@@ -345,7 +348,15 @@ class FakeStack:
 
     def create_task(self, coro):
         coro.close()
-        return SimpleNamespace(done=lambda: True, cancel=lambda: None)
+
+        class FinishedTask:
+            def done(self):
+                return True
+            def cancel(self):
+                return None
+            def add_done_callback(self, callback):
+                callback(self)
+        return FinishedTask()
 
     async def poll(self, session, device_id, hardware, last_ts):
         records = self.poll_script.pop(0) if self.poll_script else []
@@ -432,7 +443,43 @@ class PatchedApp:
         )
 
         stack = FakeStack(self.log, self.bridge_state, self.sleeps, self.poll_script)
+
+        def persist_synthetic_credentials(creds):
+            identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
+            token = dict(identity)
+            token["micoapi"] = [creds.get("ssecurity", ""), creds.get("serviceToken", "")]
+            self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
+            self.token_path.write_text(json.dumps(token), encoding="utf-8")
+            cfg = self.load_config()
+            cfg.setdefault("xiaomi", {})["cookie_text"] = (
+                "userId=" + identity["userId"] + "; passToken=" + identity["passToken"]
+                + "; serviceToken=" + creds.get("serviceToken", "")
+                + "; deviceId=" + identity["deviceId"]
+            )
+            self.save_config(cfg)
+
+        async def verified_service_login(session, uri, data=None, device_id="",
+                                         token=None, user_agent=""):
+            # Synthetic reply for the *verified* refresh transport, not the
+            # pinned MiService _serviceLogin() implementation (ssl=False).
+            state = token if isinstance(token, dict) else {}
+            return {
+                "code": 0,
+                "location": "https://api2.mina.mi.com/sts",
+                "nonce": "1234567",
+                "ssecurity": "ssecurity-value",
+                "userId": state.get("userId") or "user-1",
+                "passToken": state.get("passToken") or "pass-token-rotated",
+            }
+
+        async def immediate_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
         namespace = {
+            "_delayed_tasks": set(),
+            "_mi_service_login_verified": verified_service_login,
+            "_persist_sms_credentials": persist_synthetic_credentials,
+            "_credential_write_allowed": lambda: True,
             # The add-on resolves these relative to its working directory
             # (/app); here they point at the synthetic /data tree instead.
             "CONFIG_PATH": self.config_path,
@@ -461,6 +508,7 @@ class PatchedApp:
             "asyncio": SimpleNamespace(
                 sleep=stack.sleep,
                 create_task=stack.create_task,
+                to_thread=immediate_thread,
                 CancelledError=real_asyncio.CancelledError,
                 TimeoutError=real_asyncio.TimeoutError,
             ),
@@ -1037,14 +1085,17 @@ def scenario_5_corrupted_data(
     )
 
     app_b.run_loop()
-    assert app_b.bridge_state["error"] is None, f"S5b: {app_b.bridge_state['error']}"
-    assert app_b.log.has("passToken"), app_b.log.messages
-    repaired = app_b.read_json(app_b.token_path)
-    assert repaired["micoapi"][1] == "fresh-service-token", repaired
-    assert repaired["userId"] == "qr-user" and repaired["passToken"] == "qr-pass", repaired
+    # The new credential-pair hardening intentionally refuses a corrupt
+    # .mi.token before attempting a potentially cross-account refresh.
+    assert "凭据文件不一致" in (app_b.bridge_state["error"] or ""), (
+        f"S5b: corrupt token must fail closed: {app_b.bridge_state['error']!r}"
+    )
+    assert (data_b / "config" / ".mi.token").read_bytes() == bad_token, (
+        "S5b: startup must preserve unreadable token for user diagnosis"
+    )
     reporter.ok(
-        "S5b non-JSON .mi.token: 1.0.10 refreshes the passToken and repairs .mi.token "
-        "in place (bridge starts)"
+        "S5b non-JSON .mi.token: startup safely refuses a mismatched credential pair "
+        "without rewriting the user's damaged data"
     )
 
 

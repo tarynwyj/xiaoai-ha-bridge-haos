@@ -66,17 +66,13 @@ jobs:
             xiaoai_bridge/test_poll_auth.py \
             xiaoai_bridge/test_sms_login.py \
             xiaoai_bridge/test_xiaomi_login.py \
+            xiaoai_bridge/test_tls_handshake.py \
+            xiaoai_bridge/test_schedule_automation.py \
+            xiaoai_bridge/test_clear_login_files.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
         run: python xiaoai_bridge/test_workflow_policy.py
-
-      - name: Reject forbidden patterns in the patches
-        run: |
-          set -euo pipefail
-          ! grep -RIn "ssl=False" xiaoai_bridge/patch_auth.py
-          ! grep -RIn "str(TOKEN_PATH)" xiaoai_bridge/patch_auth.py
-          ! grep -RIn "proxy_headers=True" xiaoai_bridge/patch_auth.py
 
       - name: Fetch the pinned upstream sources
         run: |
@@ -97,6 +93,24 @@ jobs:
           python xiaoai_bridge/patch_auth.py /tmp/app/bridge.py
           python xiaoai_bridge/patch_web.py /tmp/app/web/index.html
           python -m py_compile /tmp/app/bridge.py
+
+      - name: Reject forbidden patterns in the patched app
+        # `! grep ...` under `set -e` exits non-zero only for the negated command and
+        # does not fail the step, which let real matches pass silently. Check the
+        # generated bridge.py (the code that actually ships), not the patch templates.
+        run: |
+          set -euo pipefail
+          status=0
+          for pattern in 'ssl=False' 'str(TOKEN_PATH)' 'proxy_headers=True'; do
+            if grep -nE "$pattern" /tmp/app/bridge.py; then
+              echo "::error::forbidden runtime pattern in the built bridge: $pattern"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "The patched app still contains a pattern that must not ship." >&2
+            exit 1
+          fi
 
       - name: Patches must refuse to run twice
         run: |
@@ -129,6 +143,15 @@ jobs:
         run: |
           python xiaoai_bridge/test_xiaomi_login.py /tmp/app/bridge.py \
             --html /tmp/app/web/index.html
+
+      - name: Real local TLS certificate handshake (no Xiaomi network)
+        run: python xiaoai_bridge/test_tls_handshake.py /tmp/app
+
+      - name: Scheduled voice rules build HA automations (HH:MM:SS + weekday arrays)
+        run: python xiaoai_bridge/test_schedule_automation.py /tmp/app/bridge.py
+
+      - name: Clearing the Xiaomi login fails when a credential file survives
+        run: python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
 
       - name: HTTP access control
         run: python xiaoai_bridge/test_api_auth.py /tmp/app

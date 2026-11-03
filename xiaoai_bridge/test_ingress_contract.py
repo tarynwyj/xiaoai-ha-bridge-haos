@@ -1308,8 +1308,8 @@ def check_legacy_config_loads_unchanged(ctx: Context):
         f"{timestamp_path!r}"
     )
     writer_source = ctx.source()
-    assert "LAST_TS_PATH.write_text" in writer_source, (
-        "the poll loop must persist the legacy timestamp file (no silent re-processing)"
+    assert "_write_last_timestamp_atomic" in writer_source and "LAST_TS_PATH" in writer_source, (
+        "the poll loop must atomically persist config/last_timestamp.json without changing its path"
     )
 
 

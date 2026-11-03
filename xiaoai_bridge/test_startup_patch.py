@@ -40,6 +40,9 @@ WANTED_FUNCS = [
     "_set_token",
     "_load_saved_xiaomi_identity",
     "_get_cookie",
+    "_valid_saved_cookie_text",
+    "_write_last_timestamp_atomic",
+    "_saved_credential_pair_conflicted",
     "_refresh_micoapi_token",
     "_token_snapshot",
     "_restore_token",
@@ -251,6 +254,9 @@ class Harness:
             "command_count": 0,
         }
         self.account_hooks = {}
+        self.login_needs_otp = False
+        self.otp_pending = False
+        self.otp_cleanups = 0
         FakeHAClient.state = self.bridge_state
         self.namespace = self._build_namespace()
 
@@ -262,13 +268,27 @@ class Harness:
             if len(sleeps) > 50:
                 raise AssertionError("the poll loop did not terminate within 50 iterations")
 
+        class FinishedTask:
+            def done(self):
+                return True
+
+            def cancel(self):
+                return None
+
+            def add_done_callback(self, callback):
+                callback(self)
+
         def create_task(coro):
             coro.close()
-            return SimpleNamespace(done=lambda: True, cancel=lambda: None)
+            return FinishedTask()
+
+        async def to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
 
         return SimpleNamespace(
             sleep=sleep,
             create_task=create_task,
+            to_thread=to_thread,
             CancelledError=real_asyncio.CancelledError,
             TimeoutError=real_asyncio.TimeoutError,
         )
@@ -290,7 +310,71 @@ class Harness:
         return None
 
     def _build_namespace(self):
+        async def clear_synthetic_login():
+            for p in (self.auth_path, self.token_path):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+            mi = self.cfg.setdefault("xiaomi", {})
+            mi["password"] = ""
+            mi["cookie_text"] = ""
+            return {"ok": True}
+
+        def persist_synthetic_credentials(creds):
+            if not creds.get("userId") or not creds.get("passToken") or not creds.get("serviceToken"):
+                raise ValueError("incomplete")
+            identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
+            token = dict(identity)
+            token["micoapi"] = [creds.get("ssecurity", ""), creds["serviceToken"]]
+            self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
+            self.token_path.write_text(json.dumps(token), encoding="utf-8")
+            self.cfg.setdefault("xiaomi", {})["cookie_text"] = (
+                "userId=" + identity["userId"] + "; passToken=" + identity["passToken"]
+                + "; serviceToken=" + creds["serviceToken"]
+            )
+
+        async def fake_otp_password_login(username, password):
+            if self.login_needs_otp:
+                self.otp_pending = True
+                return {"ok": True, "need_otp": True, "verified": False}
+            from miservice import MiAccount
+            account = MiAccount(FakeSession(), username, password, None)
+            account.token = {"deviceId": "OTPDEVICE", "userId": "user-1",
+                             "passToken": "pass-token-rotated"}
+            account.token["micoapi"] = ("ssecurity-value", "fresh-service-token")
+            persist_synthetic_credentials({
+                "userId": account.token["userId"], "passToken": account.token["passToken"],
+                "deviceId": account.token["deviceId"], "ssecurity": "ssecurity-value",
+                "serviceToken": "fresh-service-token"
+            })
+            return {"ok": True, "verified": True, "devices": [{"deviceID": "speaker-1", "hardware": "L05C"}]}
+
+        async def reset_otp_login():
+            self.otp_pending = False
+            self.otp_cleanups += 1
+
+        async def verified_service_login(session, uri, data=None, device_id="", token=None,
+                                         user_agent=""):
+            # Simulate the TLS-verified transport, not the pinned library's
+            # _serviceLogin implementation (which explicitly disables TLS).
+            if FakeAccount.reject_service_login:
+                return {"code": 70016, "description": "passToken 已失效"}
+            return {
+                "code": 0, "location": "https://api2.mina.mi.com/sts",
+                "nonce": "1234567", "ssecurity": "ssecurity-value",
+                "userId": (token or {}).get("userId", "user-1"),
+                "passToken": "pass-token-rotated",
+            }
+
         namespace = {
+            "_mi_service_login_verified": verified_service_login,
+            "_persist_sms_credentials": persist_synthetic_credentials,
+            "_credential_write_allowed": lambda: True,
+            "_delayed_tasks": set(),
+            "clear_xiaomi_login": clear_synthetic_login,
+            "_otp_password_login": fake_otp_password_login,
+            "_reset_otp_state": reset_otp_login,
             "TOKEN_PATH": self.token_path,
             "AUTH_PATH": self.auth_path,
             "CONFIG_PATH": self.cfg_path,
@@ -563,9 +647,15 @@ def scenario_save_credentials_never_blank(root: Path):
 
     save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2"}))
     updated = harness.read_token()
-    assert updated["userId"] == "user-2" and updated["passToken"] == "pass-2"
-    assert updated["micoapi"][1] == "old-service", "existing micoapi must be preserved"
-    return "_save_auth_and_token never blanks a valid credential"
+    assert updated["userId"] == "user-1", "incomplete account switch must keep previous login"
+    assert updated["micoapi"][1] == "old-service", "do not mix old service token with new user"
+    save(IncompleteAccount({"userId": "user-3"}))
+    assert harness.read_token() == updated, "new identity without a valid service token must not be saved"
+    save(IncompleteAccount({"userId": "user-2", "passToken": "pass-2",
+                            "micoapi": ["sec-2", "svc-2"]}))
+    assert harness.read_token()["userId"] == "user-2"
+    assert harness.read_token()["micoapi"][1] == "svc-2"
+    return "_save_auth_and_token switches account only with complete service credentials"
 
 
 def scenario_post_config_credentials(root: Path):
@@ -609,7 +699,75 @@ def scenario_post_config_credentials(root: Path):
     assert harness.cfg["xiaomi"]["cookie_text"] == ""
     assert not harness.token_path.exists(), "explicit clear must delete .mi.token"
     assert not harness.auth_path.exists(), "explicit clear must delete auth.json"
+    assert "clear_login" not in (harness.cfg.get("xiaomi") or {}), (
+        "the transient clear_login flag must never be persisted into config.yaml"
+    )
     return "post_config keeps secrets unless the user explicitly clears them"
+
+
+def scenario_background_otp_must_not_count_as_login(root: Path):
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["username"] = "someone"
+    harness.cfg["xiaomi"]["password"] = "test-password"
+    harness.login_needs_otp = True
+    harness.run()
+    assert harness.otp_cleanups == 1, "background login requiring OTP must close pending verification"
+    assert not harness.otp_pending, "pending OTP state may not survive a failed background login"
+    assert not harness.bridge_state["connected"], "need_otp is not verified login"
+    assert not harness.auth_path.exists() and not harness.token_path.exists(), (
+        "OTP pending may not persist a new credential set"
+    )
+    return "background startup requiring OTP refuses false success and closes its session"
+
+
+def scenario_atomic_timestamp_and_corruption(root: Path):
+    harness = Harness(root)
+    harness.write_token({
+        "userId": "user-1", "passToken": "pass-1", "deviceId": "account-device",
+        "micoapi": ["ssecurity-value", "valid-service"],
+    })
+    harness.write_auth({
+        "userId": "user-1", "passToken": "pass-1", "deviceId": "account-device",
+    })
+    path = harness.cfg_path.parent / "last_timestamp.json"
+    writer = harness.namespace["_write_last_timestamp_atomic"]
+    writer(path, {"speaker-1": 123456})
+    assert json.loads(path.read_text(encoding="utf-8")) == {"speaker-1": 123456}
+    writer(path, {"speaker-1": 123457, "speaker-2": 42})
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "speaker-1": 123457, "speaker-2": 42
+    }
+    assert not list(path.parent.glob(".last-timestamp-*")), "atomic writer left temporary files"
+    if __import__("os").name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+    path.write_text("{BROKEN", encoding="utf-8")
+    harness.run()
+    assert harness.bridge_state["running"] is False
+    assert "损坏" in str(harness.bridge_state["error"])
+    assert path.read_text(encoding="utf-8") == "{BROKEN", (
+        "corrupted timestamps may not be silently reset, or old commands could replay"
+    )
+    return "timestamps use atomic private writes and fail closed on corruption"
+
+
+def scenario_mixed_credential_pair_is_rejected(root: Path):
+    harness = Harness(root)
+    harness.write_auth({
+        "userId": "account-A", "passToken": "pass-A", "deviceId": "a",
+    })
+    harness.write_token({
+        "userId": "account-B", "passToken": "pass-B", "deviceId": "b",
+        "micoapi": ["sec-B", "svc-B"],
+    })
+    original_auth = harness.auth_path.read_bytes()
+    original_token = harness.token_path.read_bytes()
+    harness.run()
+    assert harness.bridge_state["running"] is False
+    assert harness.bridge_state["connected"] is False
+    assert "不一致" in str(harness.bridge_state["error"])
+    assert harness.auth_path.read_bytes() == original_auth
+    assert harness.token_path.read_bytes() == original_token
+    return "startup refuses mixed or interrupted Xiaomi credential identities"
 
 
 def scenario_multi_entity_rules():
@@ -648,6 +806,9 @@ def main():
         scenario_runtime_refresh_failure,
         scenario_save_credentials_never_blank,
         scenario_post_config_credentials,
+        scenario_background_otp_must_not_count_as_login,
+        scenario_atomic_timestamp_and_corruption,
+        scenario_mixed_credential_pair_is_rejected,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

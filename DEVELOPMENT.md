@@ -28,6 +28,10 @@ xiaoai_bridge/
 ├── test_xiaomi_login.py   # 1.0.12：密码/验证码同会话登录 + 手动 Cookie 登录（假 aiohttp）
 ├── test_web_patch.py      # 规则页 JS 行为回归（Node + DOM stub）
 ├── test_upgrade_data.py   # 1.0.9 ⇄ 1.0.10 的 /data 升级与回退往返
+├── test_tls_handshake.py  # 真实 TLS 握手：自签证书拒绝、可信证书通过（需 openssl）
+├── test_schedule_automation.py  # 定时规则 → HA 自动化（HH:MM:SS + 1-7 整数星期）
+├── test_clear_login_files.py    # 凭据文件删不掉时清除登录必须失败
+├── test_rules_browser.py  # 规则页真实 Chromium 回归（Playwright + 本地 http.server）
 └── test_workflow_policy.py   # 把「CI 不发布 / 发布仅手动」写成断言
 ```
 

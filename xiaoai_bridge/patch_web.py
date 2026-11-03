@@ -66,7 +66,17 @@ async function clearXiaomiLogin(){
     const r=await fetch('/api/xiaomi/clear-login',{method:'POST'});
     const d=await r.json();
     showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+(d.msg||''));
-    if(d.ok){await loadConfig();}
+    if(d.ok){
+      try{
+        const fresh=await (await fetch('/api/config')).json();
+        cfg.xiaomi=(fresh&&fresh.xiaomi)||{};
+        if(d.revision)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:d.revision};
+        else if(fresh&&fresh._section_revisions)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:fresh._section_revisions.xiaomi};
+        safeSet('mi-username',(cfg.xiaomi||{}).username||'');
+        safeSet('mi-password',(cfg.xiaomi||{}).password||'');
+        safeSet('mi-cookie-text',(cfg.xiaomi||{}).cookie_text||'');
+      }catch(e){}
+    }
   }catch(e){showAlert(a,'err','✗ '+e.message);}
 }""",
 )
@@ -272,6 +282,29 @@ function clearEntities(btn){
   visibleEntityOptions(picker).forEach(row=>{const box=row.querySelector('.r-e');if(box)box.checked=false});
   return updateEntityCount(picker);
 }
+function parseRuleExtra(raw){
+  // "其他(JSON)" is merged into the action. A typo used to be swallowed silently
+  // and a JSON key could even override the visible form fields; both are refused
+  // here so a rule can never be saved with a different action than the UI shows.
+  const reserved=['domain','service','entity_id','reply'];
+  const value=String(raw||'').trim();
+  if(!value)return {ok:true,value:{}};
+  let parsed;
+  try{parsed=JSON.parse(value)}catch(e){return {ok:false,error:'不是合法 JSON：'+e.message}}
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return {ok:false,error:'必须是 JSON 对象'};
+  const conflicts=Object.keys(parsed).filter(key=>reserved.indexOf(key)>=0);
+  if(conflicts.length)return {ok:false,error:'不能覆盖界面字段：'+conflicts.join(', ')};
+  return {ok:true,value:parsed};
+}
+function ruleExtraIssue(row){
+  return (row&&row.dataset&&row.dataset.extraError)?row.dataset.extraError:'';
+}
+function firstRuleExtraIssue(){
+  const rows=document.querySelectorAll('#rule-list .rule-item');
+  for(const row of rows){const issue=ruleExtraIssue(row);if(issue)return {row:row,issue:issue}}
+  return null;
+}
+function ruleSignature(draft){try{return JSON.stringify(draft||{})}catch(e){return String(Date.now())}}
 function ruleDraftFromRow(row){
   const ids=entityIdsOf(row);
   const action={
@@ -282,7 +315,9 @@ function ruleDraftFromRow(row){
   };
   row.querySelectorAll('.r-xk').forEach(inp=>{const v=(inp.value||'').trim();if(v)action[inp.dataset.key]=v});
   const extra=((row.querySelector('.r-j')||{}).value||'').trim();
-  if(extra){try{Object.assign(action,JSON.parse(extra))}catch(e){}}
+  const parsedExtra=parseRuleExtra(extra);
+  if(parsedExtra.ok){Object.assign(action,parsedExtra.value);delete row.dataset.extraError}
+  else{row.dataset.extraError=parsedExtra.error}
   const rule={pattern:((row.querySelector('.r-p')||{}).value||'').trim(),action};
   const name=((row.querySelector('.r-n')||{}).value||'').trim();
   if(name)rule.name=name;
@@ -400,7 +435,38 @@ function persistRules(mergedRules){
   return saveCfg('rules');
 }
 
-async function saveOneRule(i){if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);const alerts=document.getElementById('rules-alert');if(ruleBulkPending){showAlert(alerts,'err','✗ 已导入新的规则列表，请先点「保存全部」');return false}if(ruleDeleted.length>0){showAlert(alerts,'err','✗ 有规则等待删除，请先点「保存全部」');return false}const rows=document.querySelectorAll('#rule-list .rule-item');const row=rows[i];const state=ruleState[i];if(!row||!state)return false;state.draft=ruleDraftFromRow(row);const merged=ruleBaseline.map(entry=>cloneRule(entry.rule));const pos=ruleBaseline.findIndex(entry=>entry.uid===state.uid);if(pos>=0)merged[pos]=cloneRule(state.draft);else merged.push(cloneRule(state.draft));const ok=await persistRules(merged);if(ok){if(pos>=0)ruleBaseline[pos].rule=cloneRule(state.draft);else ruleBaseline.push({uid:state.uid,rule:cloneRule(state.draft)});state.base=true;state.dirty=false;state.open=true;cfg.intent_rules=merged;renderRuleHead(row,state,i);setRulesDirty(anyRuleDirty());showAlert(alerts,'ok','✓ 已保存：'+escHtml(ruleName(state.draft)||state.draft.pattern||('规则 #'+(i+1))))}else{state.dirty=true;setRulesDirty(true)}return ok}
+async function saveOneRule(i){
+  if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);
+  const alerts=document.getElementById('rules-alert');
+  if(ruleBulkPending){showAlert(alerts,'err','✗ 已导入新的规则列表，请先点「保存全部」');return false}
+  if(ruleDeleted.length>0){showAlert(alerts,'err','✗ 有规则等待删除，请先点「保存全部」');return false}
+  const rows=document.querySelectorAll('#rule-list .rule-item');
+  const row=rows[i];const state=ruleState[i];
+  if(!row||!state)return false;
+  const extraIssue=ruleExtraIssue(row);
+  if(extraIssue){showAlert(alerts,'err','✗ 其他(JSON) 有误：'+escHtml(extraIssue));return false}
+  state.draft=ruleDraftFromRow(row);
+  const snapshot=cloneRule(state.draft);
+  const signature=ruleSignature(snapshot);
+  const merged=ruleBaseline.map(entry=>cloneRule(entry.rule));
+  const pos=ruleBaseline.findIndex(entry=>entry.uid===state.uid);
+  if(pos>=0)merged[pos]=cloneRule(snapshot);else merged.push(cloneRule(snapshot));
+  const ok=await persistRules(merged);
+  if(!ok){state.dirty=true;setRulesDirty(true);return false}
+  if(pos>=0)ruleBaseline[pos].rule=cloneRule(snapshot);
+  else ruleBaseline.push({uid:state.uid,rule:cloneRule(snapshot)});
+  state.base=true;state.open=true;
+  const live=row.isConnected?ruleDraftFromRow(row):state.draft;
+  state.draft=live;
+  state.dirty=ruleSignature(live)!==signature;
+  cfg.intent_rules=merged;
+  if(row.isConnected)renderRuleHead(row,state,i);
+  setRulesDirty(anyRuleDirty());
+  if(state.dirty)showAlert(alerts,'ok','✓ 已保存，但保存期间产生的新修改尚未保存');
+  else showAlert(alerts,'ok','✓ 已保存：'+escHtml(ruleName(state.draft)||state.draft.pattern||('规则 #'+(i+1))));
+  return true;
+}
+
 
 // ═══════════ DOMAIN INFO ═══════════""",
 )
@@ -414,7 +480,7 @@ replace_exact(
 replace_exact(
     'rule row with checkbox picker and per-rule save',
     r'''function buildRule(rule,i){const a=rule.action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const div=document.createElement('div');div.className='rule-item';div.dataset.idx=i;let h='<div class="rule-head"><span class="rule-num">#'+(i+1)+'</span><button class="rule-del" onclick="deleteRule('+i+')">✕</button></div><div class="rule-grid"><div class="field full"><label>你说的话</label><input type="text" class="r-p" value="'+escHtml(rule.pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field"><label>实体ID</label><input type="text" class="r-e" value="'+escHtml(a.entity_id||'')+'" placeholder="climate.xxx"></div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'" placeholder=\'{"brightness_pct":"{0}"}\'></div></div>';div.innerHTML=h;return div}''',
-    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label>'+entityPickerHtml(d,ids)+'</div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
+    r"""function buildRule(rule,index,state){const a=(rule||{}).action||{};const d=a.domain||'light';const info=DINFO[d]||DINFO.light;const skip=new Set(['domain','service','entity_id','reply','temperature','brightness_pct','delay_minutes','hvac_mode']);const ids=ruleEntityIds(rule);const div=document.createElement('div');div.className='rule-item'+(state&&state.open?'':' collapsed');div.dataset.idx=index;if(state)div.dataset.uid=state.uid;div.dataset.search=ruleSearchText(rule);let h='<div class="rule-head"><span class="rule-num">#'+(index+1)+'</span><div class="rule-summary-wrap"><div class="rule-title">'+escHtml(ruleTitle(rule,index))+'</div><div class="rule-summary">'+ruleSummaryHtml(rule)+'</div></div><span class="rule-chip"'+(state&&state.dirty?'':' style="display:none"')+'>未保存</span><span class="rule-actions"><button class="rule-expand" onclick="toggleRule(this)">'+(state&&state.open?'收起':'编辑')+'</button><button class="rule-save" onclick="saveOneRule('+index+')">保存</button><button class="rule-del" onclick="deleteRule('+index+')">删除</button></span></div><div class="rule-grid"><div class="field full"><label>规则名称（可选）</label><input type="text" class="r-n" value="'+escHtml(ruleName(rule))+'" placeholder="客厅灯组开灯"></div><div class="field full"><label>触发语句（支持匹配表达式）</label><input type="text" class="r-p" value="'+escHtml((rule||{}).pattern||'')+'" placeholder="打开客厅灯"></div><div class="field" style="grid-column:1/-1"><label>设备类型</label><div class="domain-select">';Object.entries(DINFO).forEach(([k,v])=>{h+='<button class="domain-btn '+(k===d?'active':'')+'" onclick="switchD(this,\''+k+'\')"><span class="domain-icon">'+v.icon+'</span>'+v.name+'</button>'});h+='</div><input type="hidden" class="r-d" value="'+escHtml(d)+'"></div><div class="field"><label>操作</label><select class="r-s" onchange="updX(this)">';Object.entries(info.s).forEach(([k,v])=>{h+='<option value="'+k+'" '+(a.service===k?'selected':'')+'>'+v+'</option>'});h+='</select></div><div class="field full"><label>实体 ID（可多选）</label>'+entityPickerHtml(d,ids)+'</div><div class="extra-fields">';info.x.forEach(x=>{h+='<div class="field"><label>'+x.l+'</label><input type="text" class="r-xk" data-key="'+x.k+'" value="'+escHtml(a[x.k]||'')+'" placeholder="'+(x.p||'')+'"></div>'});h+='</div><div class="field full"><label>回复</label><input type="text" class="r-r" value="'+escHtml(a.reply||'好的')+'" placeholder="好的"></div><div class="field full"><label>其他(JSON)</label><input type="text" class="r-j" value="'+escHtml(extraJ(a,skip))+'"></div></div>';div.innerHTML=h;return div}""",
 )
 
 replace_exact(
@@ -444,7 +510,42 @@ replace_exact(
 replace_exact(
     'save all rules from drafts',
     r'''async function saveRules(){collectRulesFromUI();await saveCfg('rules')}''',
-    r"""async function saveRules(){if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);collectRuleDrafts();const merged=[];ruleBaseline.forEach(entry=>{if(ruleDeleted.indexOf(entry.uid)>=0)return;const state=ruleState[ruleIndexByUid(entry.uid)];merged.push(cloneRule(state?state.draft:entry.rule))});ruleState.forEach(state=>{if(!state.base)merged.push(cloneRule(state.draft))});const ok=await persistRules(merged);if(ok){ruleStateInit(merged);cfg.intent_rules=merged;renderRules();setRulesDirty(false);showAlert(document.getElementById('rules-alert'),'ok','✓ 已保存全部规则')}return ok}""",
+    r"""async function saveRules(){
+  if(!ruleStateReady)ruleStateInit(cfg.intent_rules||[]);
+  const alerts=document.getElementById('rules-alert');
+  const issue=firstRuleExtraIssue();
+  if(issue){showAlert(alerts,'err','✗ 其他(JSON) 有误：'+escHtml(issue.issue));return false}
+  collectRuleDrafts();
+  const savedUids=[];
+  const snapshot=[];
+  ruleBaseline.forEach(entry=>{
+    if(ruleDeleted.indexOf(entry.uid)>=0)return;
+    const state=ruleState[ruleIndexByUid(entry.uid)];
+    savedUids.push(entry.uid);
+    snapshot.push(cloneRule(state?state.draft:entry.rule));
+  });
+  ruleState.forEach(state=>{
+    if(!state.base){savedUids.push(state.uid);snapshot.push(cloneRule(state.draft))}
+  });
+  const ok=await persistRules(snapshot);
+  if(!ok){setRulesDirty(true);return false}
+  ruleBaseline=savedUids.map((uid,index)=>({uid:uid,rule:cloneRule(snapshot[index])}));
+  ruleDeleted=[];ruleBulkPending=false;
+  ruleState.forEach(state=>{
+    const saved=ruleBaseline.find(entry=>entry.uid===state.uid);
+    state.base=!!saved;
+    state.dirty=!saved||ruleSignature(state.draft)!==ruleSignature(saved.rule);
+  });
+  cfg.intent_rules=snapshot;
+  document.querySelectorAll('#rule-list .rule-item').forEach((row,index)=>{
+    if(ruleState[index])renderRuleHead(row,ruleState[index],index);
+  });
+  const pending=anyRuleDirty();
+  setRulesDirty(pending);
+  showAlert(alerts,'ok',pending?'✓ 已保存，但保存期间产生的新修改尚未保存':'✓ 已保存全部规则');
+  return true;
+}
+""",
 )
 
 replace_exact(

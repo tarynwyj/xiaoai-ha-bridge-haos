@@ -981,16 +981,25 @@ async def reveal_direct_token(request: Request):
     return {"ok": True, "token": ACCESS_TOKEN, "path": str(AUTH_TOKEN_PATH)}
 
 
-def _delete_saved_login_files() -> list:
+def _delete_saved_login_files() -> tuple:
+    """Delete auth.json and .mi.token; return (removed, failures).
+
+    A failed unlink used to be a warning only, which let /api/xiaomi/clear-login
+    report success while a credential file survived on disk. Callers must treat a
+    non-empty failure list (or a file that still exists) as an error.
+    """
     removed = []
+    failures = []
     for saved_path in (AUTH_PATH, TOKEN_PATH):
         try:
             if saved_path.exists():
                 saved_path.unlink()
                 removed.append(saved_path.name)
+            if saved_path.exists():
+                failures.append(f"{saved_path.name} 删除后仍存在")
         except Exception as e:
-            log.warning("删除 %s 失败: %s", saved_path.name, e)
-    return removed
+            failures.append(f"{saved_path.name}: {e}")
+    return removed, failures
 
 
 def _merge_xiaomi_credentials(cfg: dict, existing: dict, masked: str) -> None:
@@ -1099,7 +1108,7 @@ async def clear_xiaomi_login():
             await _close_pending_session()
             _clear_pending_login()
             _qr_state.clear()
-            removed = _delete_saved_login_files()
+            removed, delete_failures = _delete_saved_login_files()
             cfg = load_config()
             mi_cfg = cfg.setdefault("xiaomi", {})
             if mi_cfg.get("cookie_text"):
@@ -1112,11 +1121,22 @@ async def clear_xiaomi_login():
     finally:
         _credential_generation += 1
         _credential_clearing = False
+    leftovers = [name for name, saved_path in (("auth.json", AUTH_PATH), (".mi.token", TOKEN_PATH))
+                 if saved_path.exists()]
+    if delete_failures or leftovers:
+        detail = "；".join(delete_failures + [f"{name} 仍存在" for name in leftovers])
+        log.error("清除登录凭据未完成：%s", detail)
+        return JSONResponse(
+            {"ok": False, "removed": removed,
+             "msg": "未能删除全部登录凭据文件，请检查 /data/config 权限后重试：" + detail},
+            status_code=500,
+        )
     bridge_state["error"] = None
     log.info("已清除已保存的小米登录凭据: %s", ", ".join(removed) or "无")
     return {
         "ok": True,
         "removed": removed,
+        "revision": _config_section_revision(load_config(), "xiaomi"),
         "msg": "已清除已保存的小米登录凭据，请重新扫码登录",
     }
 ''',
@@ -4161,6 +4181,134 @@ async def bridge_loop():
         log.error("auth.json 与 .mi.token 不一致，已拒绝加载混合身份")
         return
     cfg = load_config()''',
+)
+
+
+# ──────────────── 定时任务格式：文档允许 HH:MM:SS 与整数星期，上游只接受 HH:MM/字符串 ────────────────
+replace_exact(
+    "normalize schedule automations (HH:MM or HH:MM:SS, weekday names or 1-7 ints)",
+    r'''async def _create_ha_automation(
+    ha: HAClient, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days: str | None,
+    session: aiohttp.ClientSession,
+) -> tuple[str, bool]:
+    """在 HA 中创建定时自动化"""
+    if not re.match(r"^\d{1,2}:\d{2}$", schedule_time):
+        return "", False
+    # 补齐 HH:MM:SS 格式
+    parts = schedule_time.split(":")
+    at_time = f"{int(parts[0]):02d}:{int(parts[1]):02d}:00"
+''',
+    r'''_SCHEDULE_WEEKDAY_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_SCHEDULE_WEEKDAY_ALIASES = {
+    "mon": "mon", "monday": "mon", "周一": "mon", "星期一": "mon",
+    "tue": "tue", "tues": "tue", "tuesday": "tue", "周二": "tue", "星期二": "tue",
+    "wed": "wed", "weds": "wed", "wednesday": "wed", "周三": "wed", "星期三": "wed",
+    "thu": "thu", "thur": "thu", "thurs": "thu", "thursday": "thu", "周四": "thu", "星期四": "thu",
+    "fri": "fri", "friday": "fri", "周五": "fri", "星期五": "fri",
+    "sat": "sat", "saturday": "sat", "周六": "sat", "星期六": "sat",
+    "sun": "sun", "sunday": "sun", "周日": "sun", "周天": "sun", "星期日": "sun", "星期天": "sun",
+}
+
+
+def _normalize_schedule_time(value) -> str:
+    """Normalize HH:MM or HH:MM:SS (24h) to HH:MM:SS; "" when the value is invalid."""
+    raw = str(value if value is not None else "").strip()
+    parts = raw.split(":")
+    if len(parts) not in (2, 3) or any(not part.strip().isdigit() for part in parts):
+        return ""
+    numbers = [int(part) for part in parts]
+    hour, minute = numbers[0], numbers[1]
+    second = numbers[2] if len(numbers) == 3 else 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= second <= 59):
+        return ""
+    return f"{hour:02d}:{minute:02d}:{second:02d}"
+
+
+def _normalize_schedule_weekdays(value) -> list:
+    """Normalize schedule_days to HA weekday names; [] means every day.
+
+    Accepts None/""/"daily"/"每天", "weekdays"/"工作日", "weekends"/"周末",
+    "mon,wed,fri", Chinese weekday names and integer arrays such as [1,2,3]
+    (1 = Monday ... 7 = Sunday), which is what the rules page documents.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        tokens = list(value)
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return []
+        lowered = raw.lower()
+        if lowered in ("daily", "每天", "everyday", "all", "*"):
+            return []
+        if lowered in ("weekdays", "工作日"):
+            return ["mon", "tue", "wed", "thu", "fri"]
+        if lowered in ("weekends", "周末"):
+            return ["sat", "sun"]
+        tokens = [part for part in re.split(r"[,，、/\s]+", raw) if part]
+
+    chosen = set()
+    for token in tokens:
+        if isinstance(token, bool):
+            continue
+        if isinstance(token, (int, float)):
+            number = int(token)
+            if 1 <= number <= 7:
+                chosen.add(_SCHEDULE_WEEKDAY_ORDER[number - 1])
+            continue
+        key = str(token).strip().lower()
+        if not key:
+            continue
+        if key.startswith("weekday"):
+            key = key[7:].strip(":： ")
+        if key.isdigit():
+            number = int(key)
+            if 1 <= number <= 7:
+                chosen.add(_SCHEDULE_WEEKDAY_ORDER[number - 1])
+            continue
+        mapped = _SCHEDULE_WEEKDAY_ALIASES.get(key)
+        if mapped:
+            chosen.add(mapped)
+    return [day for day in _SCHEDULE_WEEKDAY_ORDER if day in chosen]
+
+
+async def _create_ha_automation(
+    ha: HAClient, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days=None,
+    session: aiohttp.ClientSession = None,
+) -> tuple[str, bool]:
+    """在 HA 中创建定时自动化（支持 HH:MM / HH:MM:SS 与名称或 1-7 整数星期）"""
+    at_time = _normalize_schedule_time(schedule_time)
+    if not at_time:
+        log.warning("定时任务时间格式无效: %r", schedule_time)
+        return "", False
+''',
+)
+
+replace_exact(
+    "schedule weekdays from the documented integer arrays",
+    r'''    # 星期条件
+    days = (schedule_days or "daily").lower().strip()
+    if days in ("weekdays", "工作日"):
+        config["condition"] = [{"condition": "time", "weekday": ["mon", "tue", "wed", "thu", "fri"]}]
+    elif days in ("weekends", "周末"):
+        config["condition"] = [{"condition": "time", "weekday": ["sat", "sun"]}]
+    elif days not in ("daily", "每天", ""):
+        weekdays = []
+        for d in re.split(r"[,，、\s]+", days):
+            d = d.strip()
+            if d in _WEEKDAY_MAP:
+                weekdays.append(_WEEKDAY_MAP[d])
+        if weekdays:
+            config["condition"] = [{"condition": "time", "weekday": weekdays}]
+''',
+    r'''    # 星期条件：文档允许整数数组（[1..7]），上游只处理字符串，统一通过 helper 归一化
+    weekdays = _normalize_schedule_weekdays(schedule_days)
+    if weekdays:
+        config["condition"] = [{"condition": "time", "weekday": weekdays}]
+''',
 )
 
 # Validate the built Python AST, not the patch source's quoted upstream templates.

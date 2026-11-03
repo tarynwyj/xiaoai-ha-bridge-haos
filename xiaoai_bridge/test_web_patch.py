@@ -61,6 +61,10 @@ EXTRACT_FUNCTIONS = [
     "entityPickerHtml",
     "entityPickerOf",
     "entityOptionsSig",
+    "parseRuleExtra",
+    "ruleExtraIssue",
+    "firstRuleExtraIssue",
+    "ruleSignature",
     "entityPickerMarkup",
     "entityIdsOf",
     "setEntitySelection",
@@ -1360,9 +1364,9 @@ test('saveRules posts every draft and replaces the baseline', async () => {
   const posted = postedRules();
   checkEq('both drafts are posted', posted.map(rule => rule.pattern), ['A2', 'B2']);
   checkEq('baseline replaced by the drafts', ruleBaseline.map(entry => entry.rule.pattern), ['A2', 'B2']);
-  checkEq('successful save-all re-renders once', __renderCount - before, 1);
+  checkEq('successful save-all keeps the rows (no destructive re-render)', __renderCount - before, 0);
   checkEq('unsaved marker cleared', document.getElementById('rules-dirty').style.display, 'none');
-  checkEq('rows re-rendered from the saved drafts',
+  checkEq('rows still show the saved drafts',
     rows().map(row => row.querySelector('.r-p').value), ['A2', 'B2']);
   checkEq('chips hidden after save-all',
     rows().map(row => chipOf(row).style.display), ['none', 'none']);

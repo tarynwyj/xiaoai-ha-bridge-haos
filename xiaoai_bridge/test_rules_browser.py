@@ -138,6 +138,8 @@ def main() -> int:
         posted: list[dict] = []
         seen: dict[str, list] = {"tests": []}
         state = {
+            "hold": False,
+            "held": [],
             "config": json.loads(json.dumps(CONFIG)),
             "revisions": {key: "fixture-" + key + "-0"
                           for key in ("xiaomi", "ha", "rules", "adv")},
@@ -170,6 +172,17 @@ def main() -> int:
                     path = route.request.url.split("://", 1)[-1]
                     path = "/" + path.split("/", 1)[1] if "/" in path else "/"
                     body = route.request.post_data
+                    if path.startswith("/api/xiaomi/clear-login"):
+                        route.fulfill(status=200, content_type="application/json",
+                                      body=json.dumps({"ok": True, "revision": "clear-rev",
+                                                       "msg": "已清除"}))
+                        return
+                    if (path.startswith("/api/config") and route.request.method == "POST"
+                            and state.get("hold")):
+                        data = json.loads(body or "{}")
+                        posted.append(data)
+                        state["held"].append(route)
+                        return
                     if path.startswith("/api/config"):
                         if route.request.method == "POST":
                             data = json.loads(body or "{}")
@@ -634,6 +647,91 @@ def main() -> int:
                                  and state["revisions"]["xiaomi"] != after)
 
                 result.check("the test result contains no undefined", "undefined" not in test_text)
+
+                # ---------- 18. edits made while a save is in flight survive ----------
+                reload_rules()
+                state["hold"] = True
+                state["held"].clear()
+                expand(0)
+                rows().nth(0).locator(".r-p").fill("保存前的内容")
+                posted.clear()
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(300)
+                result.eq("the save request is still pending", len(state["held"]), 1)
+                rows().nth(0).locator(".r-p").fill("保存期间的新修改")
+                state["held"].pop().fulfill(status=200, content_type="application/json",
+                                            body=json.dumps({"ok": True}))
+                page.wait_for_timeout(300)
+                result.eq("the request carried the pre-edit snapshot",
+                          posted[-1]["config"]["intent_rules"][0]["pattern"], "保存前的内容")
+                result.eq("the edit made during the request stays in the DOM",
+                          rows().nth(0).locator(".r-p").input_value(), "保存期间的新修改")
+                result.check("the row still shows 未保存",
+                             rows().nth(0).locator(".rule-chip").is_visible())
+                result.check("the page still shows the unsaved marker",
+                             page.locator("#rules-dirty").is_visible())
+                result.check("the chip and marker prove the newer edit is unsaved",
+                             rows().nth(0).locator(".rule-chip").is_visible()
+                             and page.locator("#rules-dirty").is_visible())
+                state["hold"] = False
+                page.evaluate("() => document.querySelector('#rules-alert').classList.remove('show')")
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(400)
+                result.eq("the second save persists the newer edit",
+                          posted[-1]["config"]["intent_rules"][0]["pattern"], "保存期间的新修改")
+
+                # ---------- 19. save-all keeps rules added while it is in flight ----------
+                reload_rules()
+                state["hold"] = True
+                state["held"].clear()
+                page.get_by_role("button", name="保存全部").click()
+                page.wait_for_timeout(300)
+                result.eq("save-all request is pending", len(state["held"]), 1)
+                page.get_by_role("button", name="+新增").click()
+                expand(0)
+                rows().nth(0).locator(".r-p").fill("保存全部期间改的")
+                state["held"].pop().fulfill(status=200, content_type="application/json",
+                                            body=json.dumps({"ok": True}))
+                page.wait_for_timeout(400)
+                state["hold"] = False
+                result.eq("the rule added during save-all is still there", rows().count(), 4)
+                result.eq("the edit made during save-all stays in the DOM",
+                          rows().nth(0).locator(".r-p").input_value(), "保存全部期间改的")
+                result.check("save-all leaves the newer work marked unsaved",
+                             page.locator("#rules-dirty").is_visible())
+
+                # ---------- 20. invalid 其他(JSON) blocks the save ----------
+                reload_rules()
+                expand(0)
+                posted.clear()
+                rows().nth(0).locator(".r-j").fill("{这不是 JSON")
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(250)
+                result.eq("invalid JSON refuses to save", len(posted), 0)
+                result.check("the alert names 其他(JSON)",
+                             "其他(JSON)" in page.evaluate(
+                                 "document.querySelector('#rules-alert').textContent"))
+                rows().nth(0).locator(".r-j").fill('{"entity_id":"light.zzz"}')
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(250)
+                result.eq("JSON may not override the entity picked in the form", len(posted), 0)
+                rows().nth(0).locator(".r-j").fill('{"delay_minutes": 5}')
+                rows().nth(0).locator(".rule-save").click()
+                page.wait_for_timeout(400)
+                result.eq("a valid extra JSON still saves", len(posted), 1)
+                result.eq("the extra key reaches the action",
+                          posted[-1]["config"]["intent_rules"][0]["action"].get("delay_minutes"), 5)
+
+                # ---------- 21. clearing the Xiaomi login keeps other tabs' edits ----------
+                page.on("dialog", lambda dialog: dialog.accept())
+                page.evaluate("() => { const el=document.getElementById('adv-interval'); if(el) el.value='99'; }")
+                page.click('[data-page="xiaomi"]')
+                page.wait_for_selector("#page-xiaomi.active")
+                page.evaluate("() => document.querySelector('#xiaomi-alert').classList.remove('show')")
+                page.click("#page-xiaomi button:has-text('清除')")
+                page.wait_for_timeout(500)
+                result.eq("the unrelated advanced input survives the clear-login refresh",
+                          page.evaluate("(document.getElementById('adv-interval')||{}).value"), "99")
 
                 # ---------- 18. browser errors -----------
                 pending = unhandled()

@@ -35,7 +35,7 @@ FUNCTIONS = (
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
           "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
-          "_SCHEDULE_CROSS_DOMAIN_ALLOWED")
+          "_SCHEDULE_CROSS_DOMAIN_ALLOWED", "_SCHEDULE_RESERVED_DATA_KEYS")
 
 CURRENT_CONFIG = {"homeassistant": {"url": "http://ha.local:8123", "token": "ha-token"}}
 CREATED_HA = []
@@ -317,6 +317,14 @@ def main() -> int:
     check("bad data key refused", data == {} and "参数名" in error)
     data, error = form_data("nope")
     check("non-object service data refused", data == {} and "JSON 对象" in error)
+    data, error = form_data({"entity_id": "switch.plug_1"})
+    check("service data cannot retarget entity_id",
+          data == {} and "不能写 entity_id" in error, error)
+    data, error = form_data({"target": {"entity_id": "switch.plug_1"}})
+    check("service data cannot carry a target", data == {} and "不能写 target" in error, error)
+    data, error = form_data({"area_id": "kitchen"})
+    check("service data cannot carry an area target",
+          data == {} and "不能写 area_id" in error, error)
 
     # ── the schedules-page form: POST /api/automations ──
     def call(req):
@@ -363,11 +371,15 @@ def main() -> int:
                  "必须填写实体")
     expect_error(form("07:30", entity="switch.plug_1"),
                  "form endpoint refuses a service/entity domain mismatch", "不能作用于", 400)
+    expect_error(form("07:30", data={"entity_id": "switch.plug_1"}),
+                 "form endpoint refuses a data-supplied target", "不能写 entity_id", 400)
 
     # audit P2-3: the target is checked against HA's own service/entity lists
     ROUTES["http://ha.local:8123/api/services"] = (
         200, [{"domain": "light", "services": {"turn_on": {}, "turn_off": {}}},
               {"domain": "switch", "services": {"turn_on": {}}},
+              {"domain": "homeassistant",
+               "services": {"update_entity": {"fields": {"entity_id": {"required": True}}}}},
               {"domain": "select", "services": {
                   "select_option": {"fields": {"option": {"required": True}}}}}])
     expect_error(form("07:30", service="turn_onn", entity="light.a"),
@@ -389,6 +401,16 @@ def main() -> int:
     check("form passes service data into the action", response.get("ok") is True, response)
     eq("service data lands in the created action",
        CREATED_HA[-1].created[-1]["action"][0].get("data"), {"option": "Heat"})
+
+    # an entity is only "provided" when the dedicated field actually has one
+    ROUTES["http://ha.local:8123/api/states/switch.plug_1"] = (200, {"entity_id": "switch.plug_1"})
+    expect_error(form("07:30", domain="homeassistant", service="update_entity", entity=""),
+                 "an empty target does not satisfy a required entity_id",
+                 "还需要参数", 400)
+    response = call(form("07:30", domain="homeassistant", service="update_entity",
+                         entity="switch.plug_1"))
+    check("an explicit entity satisfies the required entity_id",
+          response.get("ok") is True, response)
 
     # audit P2-4: created but reload failed must not be reported as "not created"
     ROUTES["http://ha.local:8123/api/config/automation/config/"] = (200, {"alias": "x"})
@@ -450,11 +472,25 @@ def main() -> int:
     finally:
         FakeHA.reload_ok = True
     FakeHA.delete_ok = False
+    ROUTES["http://ha.local:8123/api/config/automation/config/"] = (200, {"alias": "x"})
     try:
         expect_delete_error("xiaoai_bridge_delete_me",
                             "a failed delete returns 500", "删除失败", 500)
     finally:
         FakeHA.delete_ok = True
+    ROUTES["http://ha.local:8123/api/config/automation/config/"] = (404, None)
+    FakeHA.delete_ok = False
+    try:
+        response = delete("xiaoai_bridge_gone")
+        check("a lost delete response with a vanished config counts as deleted",
+              response.get("ok") is True and response.get("reloaded") is True, response)
+        ROUTES["http://ha.local:8123/api/config/automation/config/"] = (500, None)
+        expect_delete_error("xiaoai_bridge_unknown",
+                            "an unconfirmable delete returns 504 with a check message",
+                            "无法确认", 504)
+    finally:
+        FakeHA.delete_ok = True
+        ROUTES.pop("http://ha.local:8123/api/config/automation/config/", None)
     expect_delete_error("automation.foreign",
                         "delete refuses automations from elsewhere", "只能删除", 403)
 

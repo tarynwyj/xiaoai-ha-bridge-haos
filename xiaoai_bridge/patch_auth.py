@@ -4477,6 +4477,8 @@ replace_exact(
     '@app.delete("/api/automations/{automation_id}")',
     r'''_SCHEDULE_TARGET_OPTIONAL_DOMAINS = {"homeassistant", "notify", "persistent_notification"}
 _SCHEDULE_CROSS_DOMAIN_ALLOWED = {"homeassistant"}
+_SCHEDULE_RESERVED_DATA_KEYS = {"entity_id", "target", "device_id", "area_id",
+                                "floor_id", "label_id"}
 _SCHEDULE_DAY_WORDS = {"daily", "每天", "everyday", "all", "*",
                        "weekdays", "工作日", "weekends", "周末"}
 
@@ -4561,6 +4563,11 @@ def _schedule_form_data(value) -> tuple[dict, str]:
     form has no dedicated input for; a small JSON object keeps them reachable
     without turning the page into a full action editor. Only flat scalar values and
     HA-looking field names are accepted.
+
+    Target fields are reserved: the target may only come from the dedicated
+    entity_id input (which is the value the cross-domain check validated), so
+    ``{"entity_id": "switch.x"}`` cannot quietly retarget a ``light.turn_on``
+    automation behind the validation's back.
     """
     if value is None or value == "":
         return {}, ""
@@ -4571,6 +4578,9 @@ def _schedule_form_data(value) -> tuple[dict, str]:
         name = str(key or "").strip()
         if not re.fullmatch(r"[a-z0-9_]+", name):
             return {}, "服务参数名只能是英文小写字母/数字/下划线: " + name
+        if name in _SCHEDULE_RESERVED_DATA_KEYS:
+            return {}, ("服务参数里不能写 " + name
+                        + "；目标实体请填在上方的 entity_id 输入框")
         if isinstance(item, bool) or isinstance(item, (int, float)):
             data[name] = item
         elif isinstance(item, str) and len(item) <= 200:
@@ -4613,7 +4623,8 @@ async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
             if isinstance(fields, dict):
                 required = {str(name) for name, field in fields.items()
                             if isinstance(field, dict) and field.get("required")}
-            required.discard("entity_id")
+            if str((action or {}).get("entity_id") or "").strip():
+                required.discard("entity_id")
             known[domain_name][str(service_name)] = required
     if known:
         if domain not in known:
@@ -4690,6 +4701,9 @@ async def create_automation(req: ScheduleAutomationRequest):
     if error:
         raise HTTPException(400, error)
     action.update(extra_data)
+    if action.get("entity_id") and str(action["entity_id"]).strip() != str(
+            getattr(req, "entity_id", "") or "").strip():
+        raise HTTPException(400, "服务参数不能改写目标实体")
     ha = HAClient(ha_cfg["url"], ha_cfg["token"])
     async with aiohttp.ClientSession() as s:
         target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
@@ -4733,7 +4747,20 @@ replace_exact(
     return {"ok": True}''',
     r'''    async with aiohttp.ClientSession() as s:
         ok = await ha.delete_automation(automation_id, s)
-        reloaded = await ha.reload_automations(s) if ok else False
+        reloaded = False
+        if ok:
+            reloaded = await ha.reload_automations(s)
+        else:
+            # 删除请求本身失败也可能是“响应在网络上丢了，配置其实已删掉”：
+            # 复用创建侧的配置状态查询，区分 missing / created / unknown。
+            config_state = await _automation_config_state(ha, automation_id, s)
+            if config_state == "missing":
+                ok = True
+                reloaded = await ha.reload_automations(s)
+            elif config_state == "unknown":
+                raise HTTPException(
+                    504, "删除结果暂时无法确认：HA 没有返回明确结果。"
+                         "请先在 HA 的「自动化」里核对是否还存在，再决定是否重试。")
     if not ok:
         raise HTTPException(500, "删除失败")
     if not reloaded:

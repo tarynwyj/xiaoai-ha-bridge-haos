@@ -69,6 +69,13 @@
 - **服务参数支持**：表单新增「服务参数（JSON，可留空）」；后端只接受扁平标量对象，并按 HA
   `/api/services` 的 `fields.required` 校验必填参数（如 `select.select_option` 的 `option`），
   缺参数直接 400 并在消息里点名，避免建出运行必然失败的自动化。
+- **服务参数不能改写目标**：`entity_id` / `target` / `device_id` / `area_id` / `floor_id` /
+  `label_id` 在服务参数里一律拒绝（目标只能来自独立实体输入框，也就是跨域校验用的那个值）；
+  合并参数后还会再做一次不变量检查。
+- **必填 `entity_id` 不再被无条件忽略**：只有独立实体字段确实有值时才认为满足
+  `fields.required` 里的 `entity_id`；例如 `homeassistant.update_entity` 留空目标会 400。
+- **删除请求本身结果未知**：删除请求失败时复用配置状态查询区分「配置已不存在（视为已删除）」、
+  「配置仍在（500）」与「无法确认（504，提示先去 HA 核对）」，与创建路径同构。
 - CI：Docker 镜像内回归清单补上 `test_schedule_automation.py`（此前只在主机阶段跑）。
 
 ### 测试

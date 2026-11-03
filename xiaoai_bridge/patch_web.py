@@ -1087,6 +1087,17 @@ replace_exact(
     "if(d.ok&&!d.need_verify)await refreshXiaomiRevision();if(d.ok&&d.devices&&d.devices.length>0)renderDeviceList(d.devices)}catch(e){showAlert(a,'err','✗ '+e.message)}}",
 )
 
+replace_exact(
+    "schedules list deletes by the HA config id",
+    "const id=s.entity_id.replace('automation.','');",
+    "const id=(s.config_id||'').trim()||s.entity_id.replace('automation.','');",
+)
+replace_exact(
+    "schedules empty state mentions the new-task form",
+    '<span style="font-size:11px">对小爱说「每天七点半打开热水器」</span>',
+    '<span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span>',
+)
+
 # ════════════════ 定时任务：页面表单创建（与语音路径共用 _create_ha_automation） ════════════════
 replace_exact(
     "schedules page: new-task form",
@@ -1118,14 +1129,17 @@ async function createSchedule(){
   const a=document.getElementById('schedules-alert');const st=document.getElementById('sch-status');const btn=document.getElementById('sch-create');
   const val=function(id){const el=document.getElementById(id);return el?String(el.value||'').trim():'';};
   const time=val('sch-time');const domain=val('sch-domain');const service=val('sch-service');const entity=val('sch-entity');
+  const daysSel=document.getElementById('sch-days');const daysRaw=scheduleDaysValue();
+  if(daysSel&&daysSel.value==='custom'&&!daysRaw){showAlert(a,'err','✗ 自定义重复必须填写星期（如 1,3,5 或 mon,wed）');return;}
   if(!/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)){showAlert(a,'err','✗ 时间格式无效，请用 HH:MM（24 小时制）');return;}
+  if(!entity&&['light','switch','climate','fan','cover','media_player','scene','script','input_boolean'].indexOf(domain)>=0){showAlert(a,'err','✗ 这个服务必须填写实体 entity_id');return;}
   if(btn)btn.disabled=true;if(st)st.textContent='⟳ 正在创建...';
   try{
-    const r=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({time:time,days:scheduleDaysValue(),domain:domain,service:service,entity_id:entity})});
+    const r=await fetch('/api/automations',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({time:time,days:daysRaw,domain:domain,service:service,entity_id:entity})});
     const d=await r.json().catch(function(){return {};});
     if(!r.ok)throw new Error((d&&d.detail)||('HTTP '+r.status));
     if(st)st.textContent='';
-    showAlert(a,'ok','✓ '+(d.msg||'已创建定时任务'));
+    showAlert(a,d.reloaded===false?'warn':'ok',(d.reloaded===false?'⚠ ':'✓ ')+(d.msg||'已创建定时任务'));
     scheduleFormToggle();loadSchedules();
   }catch(e){if(st)st.textContent='✗ '+e.message;showAlert(a,'err','✗ 创建失败: '+e.message);}
   finally{if(btn)btn.disabled=false;}

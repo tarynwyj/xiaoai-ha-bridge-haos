@@ -26,14 +26,34 @@
 
 ### 定时任务（页面新建）
 - 定时任务页新增「＋ 新建定时任务」表单：时间（24 小时制，`HH:MM`）、重复（每天 / 工作日 /
-  周末 / 自定义星期）、`domain` / `service`、`entity_id`（可留空），点「创建」即可生成 HA 自动化。
+  周末 / 自定义星期）、`domain` / `service`、`entity_id`，点「创建」即可生成 HA 自动化。
   之前该页只读，只能靠语音「每天七点半打开热水器」创建。
 - 新增 `POST /api/automations`：与语音路径**共用** `_create_ha_automation()`，因此 id 前缀
   （`xiaoai_bridge_`）、别名「小爱桥接-HH:MM 实体」、星期归一化（名称或 1–7 整数）与创建后的
-  HA reload 完全一致；创建出来会立即出现在页面列表里（列表仍只显示 `automation.xiaoai_bridge_*`）。
-- 输入校验前置：时间格式、`domain`/`service` 只接受 HA 英文名（如 `light` / `turn_on`）、
-  `entity_id` 必须形如 `light.xiaomi_xxx`；HA 未配置返回 400，创建失败返回 500，页面显示具体原因。
-  校验函数 `_schedule_form_action()` 与端点分离，便于回归。
+  HA reload 完全一致。
+- 输入校验前置：时间格式、`domain`/`service` 只接受 HA 英文名（如 `light` / `turn_on`），
+  并核对 HA 自己的服务列表与实体列表；`entity_id` 必须形如 `light.xiaomi_xxx`，设备类服务没有
+  实体会被拒绝，只有 `homeassistant` / `notify` / `persistent_notification` 允许留空且不再
+  生成空 `target`；HA 未配置返回 400，创建失败返回 500。
+
+### 审计修复（PR #10 review 反馈）
+- **配置 ID 与实体 ID 分离**：HA 的自动化实体 `entity_id` 由别名生成（中文别名会变成
+  `automation.xiao_ai_qiao_jie_...`），不能拿 `automation.xiaoai_bridge_` 前缀判断归属。
+  列表改为读取实体 `attributes.id`（真正的配置 ID，也是删除接口要的 ID），返回新增的
+  `config_id` 字段，页面删除按钮改用它；只显示本插件创建的自动化。
+- **同一秒的两次创建不再合并**：`int(time.time())` 只有秒级精度，同一秒内建两条会互相覆盖；
+  配置 ID 现带 `secrets.token_hex(4)` 随机后缀（已加并发创建回归证明不重复）。
+- **星期严格校验**：表单里非法星期（如 `8`、`1,8`、拼错的英文名）返回 400，不再静默退化成
+  「每天」；自定义重复留空由页面直接拦下。语音路径保持原有宽松规则。
+- **服务/实体存在性校验**：创建前读取 HA 的 `/api/services` 与 `/api/states/<entity>`，服务名
+  写错或实体不存在会 400 并给出具体原因；HA 读不到时跳过校验（创建本身会报连接错误）。
+- **reload 失败不再谎报「创建失败」**：HA 已保存配置但 `automation/reload` 失败时返回
+  `ok: true, reloaded: false` 并提示手动重载，避免用户重复提交；确实没保存才返回 500。
+- **OTP CookieJar 按 resume URL 过滤**：Cookie 的 `Path` 也是作用域（`Path=/pass` 的
+  `passToken` 在根路径过滤下不可见），恢复登录前改按
+  `https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true` 读取。
+- **小米错误短语脱敏后入日志**：去掉控制字符、掩码 cookie 键值对与长随机串后再记录。
+- CI：Docker 镜像内回归清单补上 `test_schedule_automation.py`（此前只在主机阶段跑）。
 
 ### 测试
 - `test_xiaomi_login.py`：把「没有 passToken 时发送空 passToken」的断言改为「不发送该
@@ -42,8 +62,11 @@
   清空 OTP 状态）；Cookie 场景改为「换取优先」，并新增「换取失败才兜底」与「兜底也失败
   不写盘」。
 - `test_schedule_automation.py`：新增表单校验与 `POST /api/automations` 端点场景（合法请求生成
-  与语音一致的 automation、时间/域/服务/实体非法与 HA 未配置均被拒）；`test_web_patch.py`
-  新增表单结构与 `POST /api/automations` 接线断言。
+  与语音一致的 automation、时间/域/服务/实体/星期非法、HA 未配置、服务或实体不存在、reload
+  失败、并发创建不重复均覆盖）；新增配置 ID/实体 ID 列表映射与「无实体不生成空 target」断言；
+  `test_web_patch.py` 新增表单结构、`config_id` 删除与 reload 警告断言。
+- `test_xiaomi_login.py`：新增真实 `aiohttp.CookieJar` 的 `Path=/pass` 作用域场景（断言按 resume
+  URL 读取可见、按根路径不可见）与错误短语脱敏场景。
 
 ## 1.0.13
 

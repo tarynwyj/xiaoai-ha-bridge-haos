@@ -109,12 +109,14 @@ class _ResponseContext:
 class FakeJar:
     def __init__(self):
         self.cookie = {}
+        self.filter_urls = []
 
     def update_cookies(self, cookies, url=None):
         self.cookie.update(dict(cookies or {}))
 
     def filter_cookies(self, url=None):
         '''What a real aiohttp CookieJar returns for account.xiaomi.com.'''
+        self.filter_urls.append(str(url))
         from http.cookies import SimpleCookie
         jar = SimpleCookie()
         for key, value in self.cookie.items():
@@ -328,6 +330,7 @@ FUNCTIONS = (
     "_otp_field",
     "_otp_json",
     "_otp_session_identity",
+    "_safe_otp_description",
     "_mi_service_login_verified",
     "_otp_age_seconds",
     "_otp_is_fresh",
@@ -848,6 +851,9 @@ def scenario_verify_success():
               "the log must record whether the resume had session credentials")
         check("jar-pass" not in h.log.joined() and "jar-user" not in h.log.joined(),
               "the session credentials must never be logged")
+        check(any("/pass/serviceLogin" in str(url) for url in session.jar.filter_urls),
+              "the resume identity must be read for the resume URL (Cookie Path), got "
+              f"{session.jar.filter_urls}")
 
         if not check(h.auth_path.exists() and h.token_path.exists(),
                      "a verified OTP login must persist both credential files"):
@@ -2619,6 +2625,60 @@ def scenario_real_293_contracts():
         h.cleanup()
 
 
+# ─────────────── 6. audit fixes: Cookie Path scoping and log sanitisation ───────────────
+def scenario_otp_cookie_path_scope():
+    h = Harness()
+    try:
+        try:
+            import aiohttp as real_aiohttp
+            from yarl import URL as RealURL
+        except Exception as exc:  # pragma: no cover - environment without aiohttp
+            ok(f"[skip] real aiohttp CookieJar unavailable: {exc}")
+            return
+
+        async def run():
+            jar = real_aiohttp.CookieJar()
+            jar.update_cookies_from_headers(
+                ["passToken=PT-VALUE; Path=/pass; Domain=account.xiaomi.com"],
+                RealURL("https://account.xiaomi.com/pass/identity/list"))
+
+            class _Session:
+                cookie_jar = jar
+
+            identity = h.ns["_otp_session_identity"](_Session())
+            root_only = jar.filter_cookies(RealURL("https://account.xiaomi.com/"))
+            return identity, root_only
+
+        identity, root_only = asyncio.run(run())
+        check(identity.get("passToken") == "PT-VALUE",
+              "a Path=/pass cookie must be found via the resume URL, got " + repr(identity))
+        check("passToken" not in root_only,
+              "the fixture must actually be path-scoped (a root filter must miss it)")
+        ok("[audit] resume identity reads the CookieJar with the resume URL "
+           "(Path=/pass cookies are visible; the root URL alone would miss them)")
+    finally:
+        h.cleanup()
+
+
+def scenario_provider_error_is_sanitised():
+    h = Harness()
+    try:
+        safe = h.ns["_safe_otp_description"]
+        raw = ("登录参数不合法 passToken=abc123def456\n控制符\x07 serviceToken="
+               + "A" * 40)
+        text = safe(raw)
+        check("\x07" not in text and "\n" not in text,
+              "control characters must never reach the log, got " + repr(text))
+        check("abc123def456" not in text and "A" * 40 not in text,
+              "credential-like values must be masked, got " + repr(text))
+        check("登录参数不合法" in text,
+              "the human-readable meaning must survive, got " + repr(text))
+        ok("[audit] provider error phrases are masked before logging "
+           "(cookie pairs and long opaque runs never reach the log)")
+    finally:
+        h.cleanup()
+
+
 def main():
     probe = Harness()
     probe.cleanup()
@@ -2653,6 +2713,8 @@ def main():
         scenario_cookie_login_clears_otp,
         scenario_legacy_message,
         scenario_secrets_not_logged,
+        scenario_otp_cookie_path_scope,
+        scenario_provider_error_is_sanitised,
         scenario_failures_leave_data_untouched,
         scenario_compatibility,
         scenario_verified_transport,

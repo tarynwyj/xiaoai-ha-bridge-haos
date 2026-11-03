@@ -424,6 +424,22 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             and 'id="sch-days-custom"' in html,
             "weekday presets / custom weekday input missing",
         ),
+        (
+            "schedules list deletes by the HA config id",
+            "(s.config_id||'').trim()" in html
+            and "deleteSchedule(\\''+escAttr(id)+'\\')" in html,
+            "the list must use the HA config id (not the entity id) for delete",
+        ),
+        (
+            "schedules form warns when HA saved but reload failed",
+            "d.reloaded===false" in html,
+            "reload-failure warning missing",
+        ),
+        (
+            "schedules form refuses an empty custom weekday",
+            "自定义重复必须填写星期" in html,
+            "empty custom weekday must be refused in the page",
+        ),
     ]
 
 

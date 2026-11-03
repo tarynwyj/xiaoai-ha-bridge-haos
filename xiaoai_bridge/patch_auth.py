@@ -4361,10 +4361,123 @@ replace_exact(
 )
 
 # ──────────────── 定时任务：页面表单创建（与语音路径共用 _create_ha_automation） ────────────────
+
+# 审计修复①：HA 的「配置 ID」与「实体 ID」不是同一个东西。列表原先按实体 ID 前缀过滤，
+# 但别名是中文，创建出来的 entity_id 永远对不上（会显示“暂无”）；删除又把实体 ID 当配置 ID。
+replace_exact(
+    "automation list keyed by the HA config id",
+    'class HAClient:',
+    r'''def _automation_entries(states) -> list:
+    """Automations created by this bridge, keyed by their HA config id.
+
+    HA derives the entity_id from the alias, so an entity_id prefix filter never
+    matched our Chinese aliases ("小爱桥接-07:30 light.a" becomes something like
+    automation.xiao_ai_qiao_jie_0730_light_a). The automation state carries the
+    config id in attributes["id"], and that id — not the entity_id — is what the
+    config API and the delete call expect. Only entries created by this bridge
+    (the _AUTOMATION_PREFIX) are returned; automations from elsewhere are ignored.
+    """
+    entries = []
+    for state in states or []:
+        if not isinstance(state, dict):
+            continue
+        entity_id = str(state.get("entity_id") or "")
+        if not entity_id.startswith("automation."):
+            continue
+        attributes = state.get("attributes") or {}
+        if not isinstance(attributes, dict):
+            continue
+        config_id = str(attributes.get("id") or "").strip()
+        if not config_id.startswith(_AUTOMATION_PREFIX):
+            continue
+        entries.append({
+            "entity_id": entity_id,
+            "config_id": config_id,
+            "state": state.get("state", ""),
+            "alias": attributes.get("friendly_name", ""),
+            "last_triggered": attributes.get("last_triggered"),
+        })
+    return entries
+
+
+class HAClient:''',
+)
+replace_exact(
+    "automation list delegates to the config-id helper",
+    r'''                return [
+                    {
+                        "entity_id": s["entity_id"],
+                        "state": s.get("state", ""),
+                        "alias": s.get("attributes", {}).get("friendly_name", ""),
+                        "last_triggered": s.get("attributes", {}).get("last_triggered"),
+                    }
+                    for s in states
+                    if s.get("entity_id", "").startswith("automation.xiaoai_bridge_")
+                ]''',
+    '                return _automation_entries(states)',
+)
+
+# 审计修复②：没有实体时不要生成空 target（HA 只认真实 entity_id / all / none）。
+replace_exact(
+    "omit an empty target instead of sending an empty entity_id",
+    r'''    # 构建 action
+    action_item = {"service": f"{domain}.{service}", "target": {"entity_id": entity_id}}''',
+    r'''    # 构建 action：没有实体时不要生成空 target（HA 只认真实 entity_id / all / none）
+    action_item = {"service": f"{domain}.{service}"}
+    if entity_id:
+        action_item["target"] = {"entity_id": entity_id}''',
+)
+
+# 审计修复③：Cookie 的 Path 也是作用域的一部分。只看 https://account.xiaomi.com/ 会漏掉
+# Path=/pass 的 Cookie，必须按真正要发送的 resume 地址过滤。
+replace_exact(
+    "OTP session cookies are read for the resume URL",
+    '        jar = session.cookie_jar.filter_cookies(URL(OTP_ACCOUNT_BASE))',
+    r'''        # Cookie Path 也是作用域的一部分：按真正要发送的 resume 地址过滤，才能看到
+        # Path=/pass 的 Cookie（aiohttp 按 RFC 6265 只发路径前缀匹配的 Cookie）。
+        jar = session.cookie_jar.filter_cookies(
+            URL(OTP_ACCOUNT_BASE + "/pass/serviceLogin?sid=micoapi&_json=true"))''',
+)
+
+# 审计修复④：小米返回的错误短语不直接进日志，先清洗再记。
+replace_exact(
+    "sanitise the provider error phrase before logging it",
+    'def _otp_session_identity(session) -> dict:',
+    r'''_CREDENTIALISH_TOKEN_RE = re.compile(r"[A-Za-z0-9+/_\-]{24,}")
+_COOKIE_PAIR_RE = re.compile(
+    r"(?i)\b(passToken|serviceToken|ssecurity|cUserId|userId|cookie)\s*=\s*[^;,\s]*")
+
+
+def _safe_otp_description(value) -> str:
+    """Turn a provider error phrase into a short, credential-free log string.
+
+    The description comes from Xiaomi and must not be trusted: control characters
+    are dropped, cookie pairs are masked and long opaque runs (potential tokens)
+    are replaced before the value reaches the log.
+    """
+    text = "".join(ch for ch in str(value or "") if ch.isprintable())
+    text = _COOKIE_PAIR_RE.sub(r"\1=***", text)
+    text = _CREDENTIALISH_TOKEN_RE.sub("***", text)
+    return text.strip()[:80]
+
+
+def _otp_session_identity(session) -> dict:''',
+)
+replace_exact(
+    "resume rejection logs the sanitised description",
+    '        description = str(resp.get("description") or resp.get("desc") or "").strip()[:80]',
+    '        description = _safe_otp_description(resp.get("description") or resp.get("desc"))',
+)
+
 replace_exact(
     "schedules page: create one automation from the form",
     '@app.delete("/api/automations/{automation_id}")',
-    r'''class ScheduleAutomationRequest(BaseModel):
+    r'''_SCHEDULE_TARGET_OPTIONAL_DOMAINS = {"homeassistant", "notify", "persistent_notification"}
+_SCHEDULE_DAY_WORDS = {"daily", "每天", "everyday", "all", "*",
+                       "weekdays", "工作日", "weekends", "周末"}
+
+
+class ScheduleAutomationRequest(BaseModel):
     time: str
     days: str | None = None
     domain: str = "light"
@@ -4372,12 +4485,48 @@ replace_exact(
     entity_id: str = ""
 
 
+def _schedule_form_days(value) -> tuple:
+    """Strict weekday parsing for the manual form.
+
+    Returns (days, error). days is None for "every day" (no condition) or the HA
+    weekday names; an unknown/invalid token is refused instead of silently falling
+    back to "every day" (the voice path keeps the permissive legacy normaliser).
+    """
+    if value is None:
+        return None, ""
+    if isinstance(value, (list, tuple, set)):
+        tokens = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        text = str(value).strip()
+        if not text:
+            return None, ""
+        lowered = text.lower()
+        if lowered in _SCHEDULE_DAY_WORDS:
+            return (_normalize_schedule_weekdays(text) or None), ""
+        tokens = [part for part in re.split(r"[,，、/\s]+", text) if part]
+    if not tokens:
+        return None, ""
+    chosen = set()
+    for token in tokens:
+        key = token.strip().lower()
+        mapped = _SCHEDULE_WEEKDAY_ALIASES.get(key)
+        if not mapped and key.isdigit() and 1 <= int(key) <= 7:
+            mapped = _SCHEDULE_WEEKDAY_ORDER[int(key) - 1]
+        if not mapped:
+            return None, ("重复规则里的 `" + token + "` 不是有效星期；"
+                          "请用 1-7（1=周一）或 mon…sun")
+        chosen.add(mapped)
+    return ([day for day in _SCHEDULE_WEEKDAY_ORDER if day in chosen] or None), ""
+
+
 def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     """Validate the schedules-page form and build the action payload.
 
     Only HA service names (``light`` / ``turn_on``) and a normal entity_id are
     accepted: the endpoint writes an automation that later runs inside HA, so a
-    typo must be refused before anything is created. Returns (data, error).
+    typo must be refused before anything is created. A device-style service needs a
+    real entity; the few domains that act without one may omit it, and then the
+    action carries no ``target`` at all instead of an empty entity_id.
     """
     domain_text = str(domain or "").strip().lower()
     service_text = str(service or "").strip().lower()
@@ -4391,7 +4540,66 @@ def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     data = {}
     if entity_text:
         data["entity_id"] = entity_text
+    elif domain_text not in _SCHEDULE_TARGET_OPTIONAL_DOMAINS:
+        return {}, "这个服务必须填写实体 entity_id（如 light.xiaomi_xxx）"
     return data, ""
+
+
+async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
+                                    session) -> str:
+    """Best-effort check of the target against HA's own service and entity lists.
+
+    Returns a user-facing problem string, or "" when the target looks usable. A HA
+    that cannot be read returns "" (the creation call surfaces connectivity
+    problems itself); only a definite mismatch is refused here.
+    """
+    base = str(getattr(ha, "base", "") or "")
+    headers = getattr(ha, "headers", {}) or {}
+    if not base or session is None or not hasattr(session, "get"):
+        return ""
+    try:
+        async with session.get(base + "/api/services", headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if getattr(r, "status", 0) != 200:
+                return ""
+            payload = await r.json()
+    except Exception:
+        return ""
+    known = {}
+    for item in payload or []:
+        if isinstance(item, dict) and item.get("domain"):
+            known[str(item["domain"])] = set((item.get("services") or {}).keys())
+    if known:
+        if domain not in known:
+            return "HA 里没有这个域(domain): " + domain
+        if service not in known.get(domain, set()):
+            return "HA 里没有这个服务: " + domain + "." + service
+    entity_id = str((action or {}).get("entity_id") or "").strip()
+    if not entity_id:
+        return ""
+    try:
+        async with session.get(base + "/api/states/" + entity_id, headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if getattr(r, "status", 0) == 404:
+                return "HA 里找不到实体: " + entity_id
+    except Exception:
+        return ""
+    return ""
+
+
+async def _automation_config_exists(ha, automation_id: str, session) -> bool:
+    """True when HA already stores that automation config (reload-failed case)."""
+    base = str(getattr(ha, "base", "") or "")
+    headers = getattr(ha, "headers", {}) or {}
+    if not automation_id or not base or session is None or not hasattr(session, "get"):
+        return False
+    try:
+        async with session.get(base + "/api/config/automation/config/" + automation_id,
+                               headers=headers,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            return getattr(r, "status", 0) == 200
+    except Exception:
+        return False
 
 
 @app.post("/api/automations")
@@ -4409,6 +4617,9 @@ async def create_automation(req: ScheduleAutomationRequest):
     schedule_time = _normalize_schedule_time(getattr(req, "time", ""))
     if not schedule_time:
         raise HTTPException(400, "时间格式无效，请用 HH:MM（24 小时制）")
+    days, days_error = _schedule_form_days(getattr(req, "days", None))
+    if days_error:
+        raise HTTPException(400, days_error)
     domain = str(getattr(req, "domain", "") or "").strip().lower()
     service = str(getattr(req, "service", "") or "").strip().lower()
     action, error = _schedule_form_action(domain, service, getattr(req, "entity_id", ""))
@@ -4416,14 +4627,22 @@ async def create_automation(req: ScheduleAutomationRequest):
         raise HTTPException(400, error)
     ha = HAClient(ha_cfg["url"], ha_cfg["token"])
     async with aiohttp.ClientSession() as s:
+        target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
+        if target_error:
+            raise HTTPException(400, target_error)
         automation_id, ok = await _create_ha_automation(
-            ha, domain, service, action, schedule_time,
-            getattr(req, "days", None), s,
+            ha, domain, service, action, schedule_time, days, s,
         )
+        if not ok and not await _automation_config_exists(ha, automation_id, s):
+            raise HTTPException(500, "创建失败，请检查 HA 连接与实体 ID")
     if not ok:
-        raise HTTPException(500, "创建失败，请检查 HA 连接与实体 ID")
+        # HA 已保存配置，只是 automation/reload 没成功：不能谎报“创建失败”，
+        # 否则用户会重复提交并制造重复任务。
+        log.warning("定时任务 %s 已写入 HA，但重新加载自动化失败", automation_id)
+        return {"ok": True, "automation_id": automation_id, "reloaded": False,
+                "msg": "已创建定时任务，但 HA 重新加载失败；稍后可在 HA 里重载或重启"}
     log.info("已创建定时任务 %s（手动）", automation_id)
-    return {"ok": True, "automation_id": automation_id,
+    return {"ok": True, "automation_id": automation_id, "reloaded": True,
             "msg": "已创建定时任务 " + schedule_time[:5]}
 
 

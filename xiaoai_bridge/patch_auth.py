@@ -4372,10 +4372,13 @@ replace_exact(
 
     HA derives the entity_id from the alias, so an entity_id prefix filter never
     matched our Chinese aliases ("小爱桥接-07:30 light.a" becomes something like
-    automation.xiao_ai_qiao_jie_0730_light_a). The automation state carries the
-    config id in attributes["id"], and that id — not the entity_id — is what the
-    config API and the delete call expect. Only entries created by this bridge
-    (the _AUTOMATION_PREFIX) are returned; automations from elsewhere are ignored.
+    automation.xiao_ai_qiao_jie_0730_light_a). The config id is exposed as a
+    *capability* attribute, not in extra_state_attributes: automation/entity.py
+    returns {AutomationEntityCapabilityAttribute.ID: self.unique_id} from
+    capability_attributes(), and automation/util.py passes the config's CONF_ID as
+    the unique_id. config/automation.py always writes {"id": config_key} for
+    API-created automations, so /api/states carries the config id for every task
+    this bridge creates. Only entries with the _AUTOMATION_PREFIX are returned.
     """
     entries = []
     for state in states or []:
@@ -4473,6 +4476,7 @@ replace_exact(
     "schedules page: create one automation from the form",
     '@app.delete("/api/automations/{automation_id}")',
     r'''_SCHEDULE_TARGET_OPTIONAL_DOMAINS = {"homeassistant", "notify", "persistent_notification"}
+_SCHEDULE_CROSS_DOMAIN_ALLOWED = {"homeassistant"}
 _SCHEDULE_DAY_WORDS = {"daily", "每天", "everyday", "all", "*",
                        "weekdays", "工作日", "weekends", "周末"}
 
@@ -4540,6 +4544,10 @@ def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     data = {}
     if entity_text:
         data["entity_id"] = entity_text
+        entity_domain = entity_text.split(".", 1)[0]
+        if domain_text not in _SCHEDULE_CROSS_DOMAIN_ALLOWED and entity_domain != domain_text:
+            return {}, ("服务 " + domain_text + "." + service_text + " 不能作用于 "
+                        + entity_text + "（实体域是 " + entity_domain + "）")
     elif domain_text not in _SCHEDULE_TARGET_OPTIONAL_DOMAINS:
         return {}, "这个服务必须填写实体 entity_id（如 light.xiaomi_xxx）"
     return data, ""
@@ -4587,19 +4595,30 @@ async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
     return ""
 
 
-async def _automation_config_exists(ha, automation_id: str, session) -> bool:
-    """True when HA already stores that automation config (reload-failed case)."""
+async def _automation_config_state(ha, automation_id: str, session) -> str:
+    """Storage state of one automation config: created / missing / unknown.
+
+    "cannot confirm" must never be treated as "not created": a 200 means HA has the
+    config, a 404 means it does not, anything else (timeout, 5xx, no session) is
+    unknown and the caller has to tell the user to check instead of inviting a
+    duplicate retry.
+    """
     base = str(getattr(ha, "base", "") or "")
     headers = getattr(ha, "headers", {}) or {}
     if not automation_id or not base or session is None or not hasattr(session, "get"):
-        return False
+        return "unknown"
     try:
         async with session.get(base + "/api/config/automation/config/" + automation_id,
                                headers=headers,
                                timeout=aiohttp.ClientTimeout(total=10)) as r:
-            return getattr(r, "status", 0) == 200
+            status = getattr(r, "status", 0)
     except Exception:
-        return False
+        return "unknown"
+    if status == 200:
+        return "created"
+    if status == 404:
+        return "missing"
+    return "unknown"
 
 
 @app.post("/api/automations")
@@ -4633,9 +4652,16 @@ async def create_automation(req: ScheduleAutomationRequest):
         automation_id, ok = await _create_ha_automation(
             ha, domain, service, action, schedule_time, days, s,
         )
-        if not ok and not await _automation_config_exists(ha, automation_id, s):
-            raise HTTPException(500, "创建失败，请检查 HA 连接与实体 ID")
+        config_state = "created"
+        if not ok:
+            config_state = await _automation_config_state(ha, automation_id, s)
     if not ok:
+        if config_state == "missing":
+            raise HTTPException(500, "创建失败，请检查 HA 连接与实体 ID")
+        if config_state == "unknown":
+            raise HTTPException(
+                504, "创建结果暂时无法确认：HA 没有返回明确结果。"
+                     "请先在 HA 的「自动化」里看有没有「小爱桥接-…」，确认后再决定是否重试。")
         # HA 已保存配置，只是 automation/reload 没成功：不能谎报“创建失败”，
         # 否则用户会重复提交并制造重复任务。
         log.warning("定时任务 %s 已写入 HA，但重新加载自动化失败", automation_id)

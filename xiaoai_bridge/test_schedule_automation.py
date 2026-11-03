@@ -27,12 +27,13 @@ FUNCTIONS = (
     "_schedule_form_action",
     "_automation_entries",
     "_schedule_ha_target_error",
-    "_automation_config_exists",
+    "_automation_config_state",
     "_create_ha_automation",
     "create_automation",
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
-          "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS")
+          "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
+          "_SCHEDULE_CROSS_DOMAIN_ALLOWED")
 
 CURRENT_CONFIG = {"homeassistant": {"url": "http://ha.local:8123", "token": "ha-token"}}
 CREATED_HA = []
@@ -231,12 +232,13 @@ def main() -> int:
     _, ok, created = asyncio.run(run("25:00", None))
     check("invalid time is refused", not ok and not created)
 
-    # audit P1-2: two tasks created in the same second must not share a config id
+    # audit P1-2: rapid (sequential) creations in the same second must not share a
+    # config id; this is a uniqueness check, not a concurrency stress test.
     ids = set()
     for _ in range(25):
         same_second_id, _ok, _created = asyncio.run(run("07:30", None))
         ids.add(same_second_id)
-    check("concurrent creations get unique config ids", len(ids) == 25, len(ids))
+    check("rapid sequential creations get unique config ids", len(ids) == 25, len(ids))
 
     # audit P2-1: no entity -> no empty target
     _, ok, created = asyncio.run(run("07:30", None, domain="notify", service="notify", data={}))
@@ -261,6 +263,9 @@ def main() -> int:
     eq("list keeps the real entity id", entries[0]["entity_id"],
        "automation.xiao_ai_qiao_jie_0730_light_a")
     eq("list keeps the alias", entries[0]["alias"], "小爱桥接-07:30 light.a")
+    eq("states without attributes.id are ignored", automation_entries([
+        {"entity_id": "automation.no_id", "state": "on",
+         "attributes": {"last_triggered": None, "mode": "single", "current": 0}}]), [])
 
     # ── the schedules-page form: validation helper ──
     data, error = form_action("light", "turn_on", "light.a")
@@ -279,6 +284,11 @@ def main() -> int:
     check("device domain without an entity is refused", data == {} and "必须填写实体" in error)
     data, error = form_action("notify", "notify", "")
     check("notify may omit the entity", error == "" and data == {})
+    data, error = form_action("light", "turn_on", "switch.plug_1")
+    check("a service cannot target another domain", data == {} and "不能作用于" in error)
+    data, error = form_action("homeassistant", "turn_on", "switch.plug_1")
+    check("homeassistant may target any domain",
+          error == "" and data == {"entity_id": "switch.plug_1"}, error)
 
     # ── the schedules-page form: POST /api/automations ──
     def call(req):
@@ -323,6 +333,8 @@ def main() -> int:
     expect_error(form("07:30", entity="light"), "form refuses a bad entity", "实体")
     expect_error(form("07:30", entity=""), "form refuses a device service without an entity",
                  "必须填写实体")
+    expect_error(form("07:30", entity="switch.plug_1"),
+                 "form endpoint refuses a service/entity domain mismatch", "不能作用于", 400)
 
     # audit P2-3: the target is checked against HA's own service/entity lists
     ROUTES["http://ha.local:8123/api/services"] = (
@@ -354,6 +366,17 @@ def main() -> int:
                      "a failed creation without a saved config returns 500", "创建失败", 500)
     finally:
         FakeHA.reload_ok = True
+
+    # audit P2-4 / P2-B: an unconfirmable result must not be reported as "not created"
+    ROUTES["http://ha.local:8123/api/config/automation/config/"] = (500, None)
+    FakeHA.reload_ok = False
+    try:
+        expect_error(form("07:30", entity="light.a"),
+                     "an unconfirmable creation returns 504 with a check message",
+                     "无法确认", 504)
+    finally:
+        FakeHA.reload_ok = True
+    ROUTES.pop("http://ha.local:8123/api/config/automation/config/", None)
 
     CURRENT_CONFIG["homeassistant"] = {"url": "", "token": ""}
     expect_error(form("07:30"), "form refuses when HA is not configured", "HA 未配置", 400)

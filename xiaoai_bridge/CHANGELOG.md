@@ -53,6 +53,15 @@
   `passToken` 在根路径过滤下不可见），恢复登录前改按
   `https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true` 读取。
 - **小米错误短语脱敏后入日志**：去掉控制字符、掩码 cookie 键值对与长随机串后再记录。
+- **服务与目标域匹配校验**：`light.turn_on` 指到 `switch.x` 这类组合直接 400（`homeassistant.*`
+  等跨域服务保留），避免「服务存在、实体存在、但两者不匹配」的自动化被创建。
+- **创建结果三态化**：写入后区分 `created`（已保存、仅 reload 失败 → `reloaded:false`）、
+  `missing`（确实没创建 → 500）、`unknown`（查询失败/超时 → **504 并提示先去 HA 核对**），
+  不再把「无法确认」当作「肯定没创建」。
+- **列表使用 `attributes.id` 的依据**：HA 的 `automation/entity.py` 把配置 ID 放在
+  `capability_attributes()`（`{id: unique_id}`），它会出现在 `/api/states` 的 attributes 里；
+  `config/automation.py` 的 `_write_value` 又固定写入 `{"id": config_key}`，`automation/util.py`
+  再把它作为实体的 `unique_id`。回归里额外断言「没有 `attributes.id` 的状态被忽略」。
 - CI：Docker 镜像内回归清单补上 `test_schedule_automation.py`（此前只在主机阶段跑）。
 
 ### 测试

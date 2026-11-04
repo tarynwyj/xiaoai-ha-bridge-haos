@@ -276,6 +276,9 @@ def main():
         assert "XiaoAI HA Bridge" in root_page.text
         assert 'type="password"' in root_page.text, "the login page needs a token input"
         assert "api/session" in root_page.text, "the login page must post to api/session"
+        assert "「高级设置」页" in root_page.text, "token help must name the real settings page"
+        assert "小米登录 &rarr; 高级选项" not in root_page.text
+        assert "令牌只在本次运行内有效" in root_page.text
         assert 'id="page-rules"' not in root_page.text, "login page must not leak the app UI"
         ok("unauthenticated GET / serves a login page only")
 

@@ -240,6 +240,7 @@ FUNCTIONS = (
     "_probe_devices_with_token",
     "_persist_sms_credentials",
     "_restore_credential_files",
+    "_restore_private_file",
     "_write_private_file",
     "_finish_sms_verification",
     "_finish_cookie_login",
@@ -668,17 +669,23 @@ def scenario_persistence_rollback():
                                 encoding="utf-8")
         before = h.snapshot_data()
         real_os = h.ns["os"]
-        state = {"calls": 0}
+        state = {"calls": 0, "failed": False, "unlinked": []}
 
         def flaky_replace(src, dst):
             state["calls"] += 1
-            if state["calls"] == 2:
+            if not state["failed"] and str(dst) == str(h.token_path):
+                state["failed"] = True
                 raise OSError("simulated rename failure")
             return real_os.replace(src, dst)
+
+        def guard_unlink(target, *args, **kwargs):
+            state["unlinked"].append(str(target))
+            return real_os.unlink(target, *args, **kwargs)
 
         proxy = types.SimpleNamespace(**{name: getattr(real_os, name)
                                          for name in dir(real_os) if not name.startswith("_")})
         proxy.replace = flaky_replace
+        proxy.unlink = guard_unlink
         h.ns["os"] = proxy
         try:
             h.ns["_persist_sms_credentials"]({
@@ -691,10 +698,34 @@ def scenario_persistence_rollback():
         finally:
             h.ns["os"] = real_os
 
-        check(state["calls"] == 2, f"expected two rename attempts, saw {state['calls']}")
+        check(state["failed"] is True, "the simulated rename failure must have fired")
         check(h.snapshot_data() == before,
               f"a half applied write must be rolled back; files now: {sorted(h.snapshot_data())}")
         check(not list(h.root.rglob("*.tmp")), "temporary files must not be left behind")
+        # 回滚本身不能再删一次 live 文件：写失败时用户的旧凭据必须原样还在
+        touched = [item for item in state["unlinked"]
+                   if item in (str(h.auth_path), str(h.token_path))]
+        check(touched == [],
+              f"rolling back must never unlink the live credential files, saw {touched}")
+
+        # If rollback itself cannot replace the live file, keep its current bytes
+        # instead of losing the only surviving credential copy.
+        def refuse_restore(src, dst):
+            raise OSError("simulated rollback rename failure")
+
+        proxy.replace = refuse_restore
+        h.ns["os"] = proxy
+        try:
+            h.ns["_restore_private_file"](h.auth_path, b'{"userId":"snapshot"}')
+            check(False, "a failed rollback rename must raise")
+        except OSError:
+            pass
+        finally:
+            h.ns["os"] = real_os
+        check(h.snapshot_data() == before,
+              "failed rollback must preserve the live credential bytes")
+        check(not list(h.root.rglob("*.restore")),
+              "failed rollback must remove its temporary file")
 
         # the normal path still writes both files and leaves no temporaries
         h.ns["_persist_sms_credentials"]({

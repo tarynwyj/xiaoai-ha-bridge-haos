@@ -769,7 +769,9 @@ def _load_or_create_access_token() -> str:
             f.write(token + "\\n")
         log.info("已生成直连访问令牌并保存到 %s", AUTH_TOKEN_PATH)
     except Exception as e:
-        log.warning("保存访问令牌失败: %s", e)
+        log.error("保存访问令牌失败（/data 可能只读或已满）: %s；"
+                  "本次只在内存里使用该令牌，可在 Ingress 面板点「显示直连令牌」取到，"
+                  "重启后会变化", e)
     return token
 
 
@@ -877,7 +879,8 @@ font-size:14px;font-weight:600;cursor:pointer}
 <h1>XiaoAI HA Bridge</h1>
 <p>推荐从 <b>Home Assistant 侧边栏</b>打开本插件（Ingress 面板，无需令牌）。</p>
 <p class="hint">直连访问需要令牌，文件位于容器内 <code>/data/config/.access_token</code>；
-也可用 <code>ha addons log xiaoai_bridge</code> 查看启动日志。</p>
+也可以在 Home Assistant 侧边栏面板的「高级设置」页点「显示直连令牌」直接取。
+若启动日志提示无法写入该文件（只读挂载或磁盘已满），令牌只在本次运行内有效，重启后会变化。</p>
 <input id="tk" type="password" autocomplete="current-password" placeholder="直连访问令牌">
 <button id="go">登录</button>
 <div id="err"></div>
@@ -1933,6 +1936,41 @@ def _write_private_file(path, payload: str) -> None:
         raise
 
 
+def _restore_private_file(path, content: bytes) -> None:
+    '''Rewrite one file from its snapshot without ever deleting the live copy.
+
+    _write_private_file starts by unlinking its target, which is right for a fresh
+    temporary but wrong for a rollback: a failing write would then leave neither
+    the old nor the new file. Write a sibling and rename over the target instead,
+    so the previous bytes survive unless the rename itself succeeds.
+    '''
+    tmp = path.with_name(path.name + ".restore")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    handle = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        try:
+            os.fchmod(handle, 0o600)
+        except (AttributeError, OSError):
+            pass
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(content.decode("utf-8"))
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.replace(str(tmp), str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _restore_credential_files(previous: dict) -> None:
     '''Put the previous credential files back after a half applied write.'''
     for path, content in previous.items():
@@ -1941,7 +1979,7 @@ def _restore_credential_files(previous: dict) -> None:
                 if path.exists():
                     path.unlink()
             else:
-                _write_private_file(path, content.decode("utf-8"))
+                _restore_private_file(path, content)
         except OSError as e:
             log.warning("回滚凭据文件失败 (%s)", type(e).__name__)
         except Exception as e:
@@ -3170,7 +3208,13 @@ async def _otp_start(req) -> dict:
     if await _drop_expired_otp():
         log.info("OTP 登录：上一次验证会话已过期并已清理")
     if _otp_is_fresh():
-        return _otp_pending_payload()
+        # 一个待验证会话只对一个账号有效：用户先对 A 触发验证码、再改成 B 点登录时，
+        # 直接返回 A 的载荷会让后面的验证码提交用 A 的会话完成登录并落盘 A 的凭据。
+        pending_user = str(_otp_login.get("username") or "").strip()
+        if not pending_user or pending_user == username:
+            return _otp_pending_payload()
+        log.info("OTP 登录：提交的账号与待验证会话不一致，已丢弃旧会话重新开始")
+        await _reset_otp_state()
     await _reset_otp_state()
     return await _otp_password_login(username, password)
 

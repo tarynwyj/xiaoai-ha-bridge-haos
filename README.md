@@ -40,7 +40,34 @@
 | 定时任务 | 由语音创建的自动化列表 |
 | 高级设置 | 轮询间隔、AI 托管、显示直连令牌 |
 
-> 界面截图待补充（管理面板 / 规则编辑 / 设备列表）。欢迎提 issue 或 PR 提供截图。
+以下为实际界面截图，已裁剪并遮挡账号数字、设备标识及部分私人名称；运行状态和数量仅反映截图时刻。
+
+**仪表盘**：查看桥接器状态、运行时长与 HA 连接。
+
+![仪表盘：运行状态、指令计数与 Home Assistant 连接](docs/images/panel-dashboard.png)
+
+<details>
+<summary>意图规则：语音匹配、多设备选择与分条保存</summary>
+
+![意图规则编辑器：测试区、多实体选择与保存按钮，设备标识已脱敏](docs/images/panel-rules.png)
+
+</details>
+
+<details>
+<summary>设备管理：设备列表与别名设置</summary>
+
+![设备管理：设备列表和别名输入框，私人名称及实体 ID 已脱敏](docs/images/panel-devices.png)
+
+</details>
+
+<details>
+<summary>定时任务：新建入口与空列表状态</summary>
+
+截图时尚未创建定时任务，展示的是空列表及“新建定时任务”入口。
+
+![定时任务：新建按钮与空列表提示](docs/images/panel-schedules.png)
+
+</details>
 
 ## 快速安装
 

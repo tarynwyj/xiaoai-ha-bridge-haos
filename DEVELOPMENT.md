@@ -154,3 +154,14 @@ python xiaoai_bridge/test_upgrade_data.py --pristine-bridge /tmp/pinned/bridge.p
 改代码时如果改了用户可见行为（按钮、文案、默认值、权限模型），**同一个 PR 里**同步
 `DOCS.md` 与 `CHANGELOG.md`；纯内部重构不必写。
 
+
+## 7. 许可证维护
+
+根目录 `LICENSE` 与 `THIRD_PARTY_NOTICES.md` 是授权及来源说明；
+`xiaoai_bridge/` 下的同名文件是 Docker 构建副本，修改时须同步。
+CI 和发布流程会逐字节比较副本，并检查构建镜像里的文件与根目录一致。
+
+Dockerfile 将这两个文件放入 `/usr/share/licenses/xiaoai-ha-bridge-haos/`，
+并将固定提交的上游 README 原样复制到
+`/usr/share/licenses/xiaoai-ha-bridge/README.md`，保留其许可声明。
+更新 `UPSTREAM_REF` 时须核对上游许可与版权信息，并同步更新第三方说明。

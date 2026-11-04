@@ -125,6 +125,8 @@
 | 语音文本 | 发往小米（对话记录由小米提供）与本机；若你**主动启用**「AI 托管」，还会发给你配置的第三方 AI 接口 | 默认关闭，仅在开启后生效 |
 | 直连令牌 | 留在 `/data/config/.access_token` | 只用于直连端口鉴权 |
 
+使用本加载项时，请遵守小米账号及相关服务条款。
+
 安全要求：
 
 - 面板走 HAOS Ingress，只有 Home Assistant 管理员能打开；直连端口 47521 需要访问令牌，
@@ -138,7 +140,7 @@
 ## 与上游项目的关系
 
 本项目是 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge) 的
-Home Assistant OS 加载项封装：构建时拉取固定 commit 的上游代码，再由本仓库的补丁脚本
+Home Assistant OS 适配与增强版：构建时拉取固定 commit 的上游代码，再由本仓库的补丁脚本
 加上鉴权、界面与稳定性修复。核心桥接逻辑的功劳属于上游作者。
 
 ## 鸣谢
@@ -151,13 +153,13 @@ Home Assistant OS 加载项封装：构建时拉取固定 commit 的上游代码
 
 ## License
 
-**当前状态：本仓库与上游仓库都没有 LICENSE 文件，也都没有声明开源许可证。**
-因此这里不声称 MIT / Apache-2.0 或任何其它许可证，也不表示本项目已经获得某种开源授权：
-在许可证明确之前，请勿再分发本仓库代码或用于商业用途。
+本仓库中由维护者拥有版权的原创 HAOS 适配、补丁脚本、测试、构建配置与文档采用
+MIT License，详见 [LICENSE](LICENSE)。
 
-- 待办（单独处理）：为封装层（补丁脚本、测试、构建配置）选定并添加许可证，同时确认上游
-  [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge) 的授权方式；
-- 无论许可证如何，请遵守小米账号服务条款，不要把本加载项暴露到公网。
+本项目基于 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge)，
+其构建所用固定提交的 README 声明采用 MIT License。
+上游来源、固定提交、授权范围及第三方依赖说明见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；第三方代码遵循各自许可证。
 
 ---
 

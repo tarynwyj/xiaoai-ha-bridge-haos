@@ -1,5 +1,31 @@
 # Changelog
 
+## 未发布（1.0.15：短信登录「恢复登录」中间态修复）
+
+### 登录（账号密码 + 验证码）
+- 修复真机「登录响应缺少必要字段（ssecurity/location/nonce），无法完成登录；请改用扫码登录」。
+  `serviceLogin` 的 `code == 0` 只代表「这一步小米认了」，不代表 micoapi 的票发完了：未登录时
+  返回 `code=70016`（失败体同样带 `location`，指向登录页），而验证码提交本身就是 `code 0 +
+  location`。旧代码把 resume 的 `code 0` 当成登录完成，并硬性要求同一条响应里带三件套，于是把
+  「再验一次 / 预登录挑战 / 停在登录页」这类正常中间态报成畸形响应，且不写任何日志。
+- 新增 resume 形态分类（`_otp_recover_incomplete_login`）：响应带 `notificationUrl` 时在同一
+  会话重开一轮验证（面板保留，需重新「获取验证码」）；CookieJar 里已有验证后的 `passToken` /
+  `userId` 时改用一个干净会话做一次 passToken 换取（与手动 Cookie 登录同一段协议），成功即继续
+  换 serviceToken；两者都不成立才显式失败 `resume_incomplete`，文案逐字段说明缺了哪几项。
+- 该分支补日志 `OTP 登录：resume 响应不完整 (code=…, result=…, missing=…, keys=…)`：只有业务码
+  与键名，绝不含凭据值，真机下一轮可直接定性。
+- 顺带修一个相邻缺陷：首个 `serviceLogin` 响应缺 `code` 时（预登录挑战包，只有 `qs`/`_sign`/
+  `callback`），旧代码用默认值 0 判断「已登录」从而跳过 `serviceLoginAuth2`，等于跳过密码校验；
+  现在缺 `code` 一律走 auth2（与 `miservice 3.0.1` 的 `resp.get('code') != 0` 一致）。
+- `resume_incomplete` 计入 `OTP_STATE_BREAKING_ERRORS`：只有确实无法补救时才丢弃验证会话。
+
+### 测试
+- `test_xiaomi_login.py` 新增 4 个场景：resume 要求再验一轮、干净会话凭据兜底、不可补救时显式
+  失败并逐字段报缺、首个 serviceLogin 为无 `code` 挑战包时仍走 auth2；STS 终点场景的断言由
+  `resume_failed` 改为 `resume_incomplete`。本地 613 checks / 47 场景全绿（原 574 / 43）。
+- 本机未执行（由 CI 覆盖）：`test_tls_handshake.py`（沙箱无法启动 cygwin openssl）、
+  `test_rules_browser.py`（本机无 playwright）。
+
 ## 1.0.14：真机登录修复 + 定时任务表单
 
 ### 登录（账号密码 + 验证码）

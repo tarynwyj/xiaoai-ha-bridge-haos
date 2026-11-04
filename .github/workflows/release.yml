@@ -68,6 +68,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify license copies in the Docker build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp LICENSE xiaoai_bridge/LICENSE
+          cmp THIRD_PARTY_NOTICES.md xiaoai_bridge/THIRD_PARTY_NOTICES.md
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -175,6 +182,19 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=XiaoAI to Home Assistant bridge for HAOS
+
+      - name: Verify distributed license notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.app.outputs.image }}:${{ steps.app.outputs.version }}"
+          for notice in LICENSE THIRD_PARTY_NOTICES.md; do
+            docker run --rm --entrypoint cat "$IMAGE" \
+              "/usr/share/licenses/xiaoai-ha-bridge-haos/$notice" | cmp - "$notice"
+          done
+          docker run --rm --entrypoint cat "$IMAGE" \
+            /usr/share/licenses/xiaoai-ha-bridge/README.md > /tmp/upstream-license-readme.md
+          grep -F 'MIT License' /tmp/upstream-license-readme.md
 
       - name: Smoke-test the release candidate
         shell: bash

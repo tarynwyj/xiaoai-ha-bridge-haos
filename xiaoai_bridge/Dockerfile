@@ -80,6 +80,12 @@ RUN rm -rf /app/config /app/logs \
     && ln -s /data/config /app/config \
     && ln -s /data/logs /app/logs
 
+# Keep this add-on's license separate from the upstream copyright and preserve
+# the upstream README's original MIT declaration in the distributed image.
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/licenses/xiaoai-ha-bridge-haos/
+RUN mkdir -p /usr/share/licenses/xiaoai-ha-bridge \
+    && cp /app/README.md /usr/share/licenses/xiaoai-ha-bridge/README.md
+
 EXPOSE 47521
 
 LABEL org.opencontainers.image.source="https://github.com/tarynwyj/xiaoai-ha-bridge-haos" \

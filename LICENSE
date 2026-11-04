@@ -1,21 +1,65 @@
-MIT License
+XiaoAI HAOS 非商业使用许可协议 1.0
+标识：LicenseRef-XiaoAI-HAOS-Noncommercial-1.0
 
 Copyright (c) 2026 tarynwyj
+除本协议明确授予的权限外，保留所有权利。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. 适用范围
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+本协议仅适用于本仓库中由 tarynwyj 拥有版权并有权许可的原创代码与文档，
+包括原创 HAOS 适配、补丁、测试和构建配置（下称“本软件”）。
+本协议不适用于上游代码、其他权利人的贡献或第三方依赖；
+这些部分遵循其各自的许可证。具体来源见 THIRD_PARTY_NOTICES.md。
+许可人仅在其拥有或获授权的权利范围内授予本协议所述许可。
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. 免费的非商业许可
+
+在遵守本协议的前提下，允许免费获取、运行、学习、复制和修改本软件，
+用于个人、家庭、教学、研究或其他非商业目的。
+允许为非商业目的免费再分发本软件及其修改版本，包括源代码和构建镜像。
+
+再分发时须保留版权声明、本协议全文及适用的第三方许可声明；
+修改版本须明确注明已作修改，不得冒充原维护者发布的官方版本。
+包含本软件的修改版本，在本软件及其衍生部分的范围内仍受本协议约束；
+独立的第三方作品不因与本软件一同分发而自动受本协议约束。
+接收者可依据本协议直接获得相同的非商业许可。
+
+3. 商业使用须事先取得书面授权
+
+未经许可人事先书面授权，不得为商业目的使用、复制、修改或分发本软件。
+商业使用包括但不限于：
+- 出售、出租或有偿许可本软件、修改版本、插件或镜像；
+- 将本软件或其修改版本作为收费硬件、软件包、订阅或其他付费产品的组成部分、
+  附赠内容或促销权益提供；
+- 使用本软件向客户提供收费的托管、部署、安装、维护或其他相关服务；
+- 在企业或其他组织的营利业务中部署本软件。
+
+以服务费、会员费、必须支付的“捐赠”或其他名称收费，不改变上述性质。
+不包含本软件及其受保护表达、独立开发的作品不受本条限制。
+
+4. 商业授权与销售分成
+
+商业授权须与许可人另行达成书面协议后方可生效。
+可通过项目仓库 https://github.com/tarynwyj/xiaoai-ha-bridge-haos 联系维护者协商。
+授权范围、销售渠道、期限、授权费或销售分成比例、收入计算口径、
+退款扣除、报表核对及结算周期等，以双方签署的书面协议为准。
+本协议不预设分成比例，也不授予“先销售、后自行支付分成”的权限。
+公开源码、注明来源、提交修改或单方面支付费用均不替代商业授权。
+
+5. 既有许可与第三方权利
+
+本协议不撤销接收者根据先前有效许可已合法取得的权利。
+特别是，不追溯撤销此前已按 MIT License 提供的本软件副本所附带的许可。
+本协议亦不限制上游代码在其原 MIT License 下允许的使用、修改或商业分发；
+仅使用上游代码而不使用本软件受保护部分的行为，不受本协议商业限制。
+本协议不限制适用法律赋予且不得通过合同排除的权利。
+
+6. 免责声明与终止
+
+在适用法律允许的最大范围内，本软件按现状提供，不作任何明示或默示担保；
+许可人不承担因使用本软件产生的损失或责任。
+本协议不授予使用作者姓名或项目标识进行背书的权利。
+违反本协议条件时，本协议授予的权限终止；适用的第三方许可与既有合法授权不受影响。
+超出本协议许可范围的使用，须另行取得相关权利人的授权。
+
+本协议是自定义的源码可见许可，含商业用途限制，不属于 OSI 定义的开源许可证。

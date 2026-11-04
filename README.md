@@ -153,13 +153,15 @@ Home Assistant OS 适配与增强版：构建时拉取固定 commit 的上游代
 
 ## License
 
-本仓库中由维护者拥有版权的原创 HAOS 适配、补丁脚本、测试、构建配置与文档采用
-MIT License，详见 [LICENSE](LICENSE)。
+本仓库中由维护者拥有版权并有权许可的原创代码与文档采用
+[自定义非商业使用许可协议](LICENSE)：**非商业使用免费；商业使用、销售、付费打包或
+收费部署服务须事先取得书面授权，授权费或销售分成另行签约。**
+这是一份含商业限制的源码可见许可，不属于 OSI 定义的开源许可证。
 
 本项目基于 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge)，
-其构建所用固定提交的 README 声明采用 MIT License。
-上游来源、固定提交、授权范围及第三方依赖说明见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；第三方代码遵循各自许可证。
+其构建所用固定提交的 README 声明采用 MIT License；上游代码仍遵循原许可。
+授权范围、上游来源与固定提交见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；
+第三方代码遵循各自许可证，先前有效许可已授予的权利不因本次调整而追溯撤销。
 
 ---
 

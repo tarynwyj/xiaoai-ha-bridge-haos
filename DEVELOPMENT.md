@@ -165,3 +165,7 @@ Dockerfile 将这两个文件放入 `/usr/share/licenses/xiaoai-ha-bridge-haos/`
 并将固定提交的上游 README 原样复制到
 `/usr/share/licenses/xiaoai-ha-bridge/README.md`，保留其许可声明。
 更新 `UPSTREAM_REF` 时须核对上游许可与版权信息，并同步更新第三方说明。
+
+本仓库维护者有权许可的原创部分采用自定义非商业许可，上游部分保留其 MIT 声明；
+文档和镜像元数据不得将整个项目标为 MIT 或 OSI 开源软件。
+商业授权与分成须另行签署协议，仓库内不预设比例；新许可不追溯撤销先前有效授权。

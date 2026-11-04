@@ -606,7 +606,8 @@ def main() -> int:
                 reload_rules()
                 page.click('[data-page="xiaomi"]')
                 rev_before_login = page.evaluate("sectionRevisions.xiaomi")
-                page.evaluate("document.getElementById('mi-cookie-text').value='userId=u; passToken=p'")
+                page.evaluate("document.getElementById('mi-cookie-userid').value='u'")
+                page.evaluate("document.getElementById('mi-cookie-passtoken').value='p'")
                 page.evaluate("verifyCookieLogin()")
                 rev_after_login = page.evaluate("sectionRevisions.xiaomi")
                 result.check("login obtains latest Xiaomi revision without refreshing all drafts",

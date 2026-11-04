@@ -708,6 +708,25 @@ def scenario_persistence_rollback():
         check(touched == [],
               f"rolling back must never unlink the live credential files, saw {touched}")
 
+        # If rollback itself cannot replace the live file, keep its current bytes
+        # instead of losing the only surviving credential copy.
+        def refuse_restore(src, dst):
+            raise OSError("simulated rollback rename failure")
+
+        proxy.replace = refuse_restore
+        h.ns["os"] = proxy
+        try:
+            h.ns["_restore_private_file"](h.auth_path, b'{"userId":"snapshot"}')
+            check(False, "a failed rollback rename must raise")
+        except OSError:
+            pass
+        finally:
+            h.ns["os"] = real_os
+        check(h.snapshot_data() == before,
+              "failed rollback must preserve the live credential bytes")
+        check(not list(h.root.rglob("*.restore")),
+              "failed rollback must remove its temporary file")
+
         # the normal path still writes both files and leaves no temporaries
         h.ns["_persist_sms_credentials"]({
             "userId": "new-user", "passToken": "new-pass",

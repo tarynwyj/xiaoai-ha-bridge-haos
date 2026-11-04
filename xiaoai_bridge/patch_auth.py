@@ -879,7 +879,7 @@ font-size:14px;font-weight:600;cursor:pointer}
 <h1>XiaoAI HA Bridge</h1>
 <p>推荐从 <b>Home Assistant 侧边栏</b>打开本插件（Ingress 面板，无需令牌）。</p>
 <p class="hint">直连访问需要令牌，文件位于容器内 <code>/data/config/.access_token</code>；
-也可以在 Home Assistant 面板的「小米登录 &rarr; 高级选项」里点「显示直连令牌」直接取。
+也可以在 Home Assistant 侧边栏面板的「高级设置」页点「显示直连令牌」直接取。
 若启动日志提示无法写入该文件（只读挂载或磁盘已满），令牌只在本次运行内有效，重启后会变化。</p>
 <input id="tk" type="password" autocomplete="current-password" placeholder="直连访问令牌">
 <button id="go">登录</button>

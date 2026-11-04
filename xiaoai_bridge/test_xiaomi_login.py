@@ -2370,7 +2370,8 @@ def scenario_frontend_structure():
         check(f'onclick="{handler}"' in html, f"no button is wired to {handler}")
     for element_id in ("mi-username", "mi-password", "mi-otp-code", "mi-otp-send",
                        "mi-otp-verify", "mi-otp-restart", "mi-otp-status", "mi-otp-method",
-                       "mi-cookie-text", "mi-cookie-submit", "mi-cookie-status",
+                       "mi-cookie-text", "mi-cookie-userid", "mi-cookie-passtoken",
+                       "mi-cookie-submit", "mi-cookie-status",
                        "qr-img", "qr-msg", "qr-status", "mi-sts-url", "mi-sts-submit"):
         check(f'id="{element_id}"' in html, f"missing element #{element_id}")
     check('id="qr-area"' in html and 'id="qr-area" style="display:none' in html,
@@ -2477,6 +2478,8 @@ def scenario_frontend_behaviour():
         "mi-otp-send": {"disabled": False, "textContent": "获取验证码"},
         "mi-otp-verify": {"disabled": False},
         "mi-cookie-text": {"value": ""},
+        "mi-cookie-userid": {"value": ""},
+        "mi-cookie-passtoken": {"value": ""},
         "mi-cookie-submit": {"disabled": False},
         "mi-cookie-status": {"textContent": ""},
     }
@@ -2634,7 +2637,8 @@ def scenario_frontend_behaviour():
 
     # (f) cookie login works while _otp.state is 'pending'
     elements = json.loads(json.dumps(base_elements))
-    elements["mi-cookie-text"]["value"] = "userId=u; passToken=p"
+    elements["mi-cookie-userid"]["value"] = "u"
+    elements["mi-cookie-passtoken"]["value"] = "p"
     payload = _run_node(
         script_source,
         {"ok": True, "verified": True, "devices": [{"deviceID": "d1"}],
@@ -2659,7 +2663,7 @@ def scenario_frontend_behaviour():
         ok("frontend cookie: works while _otp.state is pending (not gated), closes the panel")
 
     elements = json.loads(json.dumps(base_elements))
-    elements["mi-cookie-text"]["value"] = "userId=u"
+    elements["mi-cookie-userid"]["value"] = "u"
     payload = _run_node(
         script_source,
         {"ok": False, "action": "fix_cookie",
@@ -2668,9 +2672,9 @@ def scenario_frontend_behaviour():
     )
     if payload:
         check("Cookie" in payload["cookieStatus"] or "检查" in payload["cookieStatus"],
-              f"a parse error must point at the Cookie text, got {payload['cookieStatus']!r}")
-        check("passToken" in payload["alert"], "the backend message must be surfaced")
-        ok("frontend cookie: fix_cookie is surfaced with the backend explanation")
+              f"a missing field must point at the two inputs, got {payload['cookieStatus']!r}")
+        check("passToken" in payload["alert"], "the missing field must be named")
+        ok("frontend cookie: a missing userId/passToken field is named without calling Xiaomi")
     return "frontend behaviour verified"
 
 

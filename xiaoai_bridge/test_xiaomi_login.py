@@ -1119,6 +1119,45 @@ def scenario_resume_second_round_capped():
         h.cleanup()
 
 
+def scenario_otp_start_other_account():
+    """A pending verification belongs to one account; a new account must not reuse it."""
+    h = Harness()
+    try:
+        session = _drive_verify(h)
+        check(h.otp_state().get("username") == "13800000000",
+              f"the pending state must remember its account, got {h.otp_state().get('username')}")
+
+        # the same page now submits another account while the first one is pending
+        CURRENT["login_script"] = [{
+            "code": 0,
+            "securityStatus": 16,
+            "notificationUrl": AUTH_START.replace("ctx-123", "ctx-999"),
+            "userId": "login-user",
+            "passToken": "login-pass",
+        }]
+        CURRENT["identity"] = {"flag": 4, "maskedPhone": "13912345678"}
+        CURRENT["response_script"] = [
+            response(200, raw=b"<html>auth start 2</html>"),
+            response(200, CURRENT["identity"]),
+        ]
+        data = start(h, username="13900000000", password="pw2")
+
+        check(data.get("ok") is True and data.get("need_otp") is True,
+              f"the new account must get its own verification session, got {data}")
+        check(data.get("phone_hint") == "139****5678",
+              f"the panel must describe the new account, got {data.get('phone_hint')}")
+        check(h.otp_state().get("username") == "13900000000",
+              f"the state must follow the new account, got {h.otp_state().get('username')}")
+        check(session.closed is True,
+              "the previous account's verification session must be closed")
+        check("提交的账号与待验证会话不一致" in h.log.joined(),
+              f"the discard must be logged: {h.log.joined()}")
+        ok("otp start: a different account discards the pending session instead of "
+           "completing the previous account's login")
+    finally:
+        h.cleanup()
+
+
 def scenario_resume_location_hop():
     """A resume that only answers a location must be completed like a browser."""
     h = Harness()
@@ -2391,6 +2430,18 @@ def scenario_frontend_structure():
     check("扫码登录（推荐）" in html, "the QR card must be labelled as recommended")
     check("账号密码登录" in html, "the password card must be labelled")
     check("高级选项：手动 Cookie 登录" in html, "the cookie card must be labelled as advanced")
+    # clear-login rewrites the xiaomi section server-side: the client must refresh
+    # the revision that saveCfg actually reads, or the next save is a false 409.
+    clear_start = html.find("async function clearXiaomiLogin()")
+    check(clear_start > 0, "the clear-login function must exist")
+    clear_end = html.find("async function ", clear_start + 10)
+    clear_block = html[clear_start:clear_end if clear_end > 0 else len(html)]
+    compact = clear_block.replace(" ", "").replace("\n", "")
+    check("sectionRevisions.xiaomi=revision" in compact,
+          "clear-login must sync sectionRevisions.xiaomi after clearing credentials")
+    check("cfg._section_revisions" not in clear_block,
+          "clear-login must not write the dead cfg._section_revisions property")
+
     ok("frontend structure: 3 entries, hidden OTP panel, honest legacy block, badge removed")
     return "frontend structure verified"
 
@@ -3028,6 +3079,7 @@ def main():
         scenario_resume_second_round,
         scenario_resume_fresh_session_recovery,
         scenario_resume_location_hop,
+        scenario_otp_start_other_account,
         scenario_resume_incomplete_is_explicit,
         scenario_resume_second_round_capped,
         scenario_resume_identity_mismatch,

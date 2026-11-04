@@ -70,8 +70,10 @@ async function clearXiaomiLogin(){
       try{
         const fresh=await (await fetch('/api/config')).json();
         cfg.xiaomi=(fresh&&fresh.xiaomi)||{};
-        if(d.revision)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:d.revision};
-        else if(fresh&&fresh._section_revisions)cfg._section_revisions={...(cfg._section_revisions||{}),xiaomi:fresh._section_revisions.xiaomi};
+        // 清除凭据会改写 xiaomi 分区，服务端版本随之变化；必须同步到 saveCfg 真正读取的
+        // sectionRevisions，否则下一次保存会被 CAS 判成「另一窗口修改」并 409。
+        const revision=fresh&&fresh._section_revisions&&fresh._section_revisions.xiaomi;
+        if(revision)sectionRevisions.xiaomi=revision;
         safeSet('mi-username',(cfg.xiaomi||{}).username||'');
         safeSet('mi-password',(cfg.xiaomi||{}).password||'');
         safeSet('mi-cookie-text',(cfg.xiaomi||{}).cookie_text||'');

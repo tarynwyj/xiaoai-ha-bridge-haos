@@ -1119,6 +1119,40 @@ def scenario_resume_second_round_capped():
         h.cleanup()
 
 
+def scenario_resume_location_hop():
+    """A resume that only answers a location must be completed like a browser."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        CURRENT["login_script"] = [
+            # code 0 + only a location: no ssecurity/nonce in this answer
+            {"code": 0, "location": "https://account.xiaomi.com/pass/verify/accepted?token=hop"},
+            {"code": 0, "userId": "jar-user", "passToken": "login-pass",
+             "deviceId": "login-device", "ssecurity": "hop-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=hop", "nonce": "hop-nonce"},
+        ]
+        session.responses.append(response(200, raw=b"<html>hop</html>"))
+        data = verify(h, "123456")
+
+        check(data.get("ok") is True and data.get("verified") is True,
+              f"opening the resume location must finish the login, got {data}")
+        urls = session.urls()
+        check(any("/pass/verify/accepted?token=hop" in url for url in urls),
+              f"the resume location must be opened exactly once, got {urls}")
+        log_text = h.log.joined()
+        check("stage=resume_hop" in log_text and "source=resume_hop" in log_text,
+              f"the hop and its result must be logged: {log_text}")
+        check(CURRENT["security_calls"]
+              and CURRENT["security_calls"][-1][1] == "https://api2.mina.mi.com/sts?sign=hop",
+              f"the token must come from the retried resume, got {CURRENT['security_calls']}")
+        check(h.otp_state() == {} and h.otp_session() is None,
+              "a completed hop login must clear the OTP state")
+        ok("resume: an answer with only a location is completed by opening it once, "
+           "then re-running the resume")
+    finally:
+        h.cleanup()
+
+
 def scenario_resume_identity_mismatch():
     """The clean-session fallback must never persist a different account."""
     h = Harness()
@@ -2336,7 +2370,8 @@ def scenario_frontend_structure():
         check(f'onclick="{handler}"' in html, f"no button is wired to {handler}")
     for element_id in ("mi-username", "mi-password", "mi-otp-code", "mi-otp-send",
                        "mi-otp-verify", "mi-otp-restart", "mi-otp-status", "mi-otp-method",
-                       "mi-cookie-text", "mi-cookie-submit", "mi-cookie-status",
+                       "mi-cookie-text", "mi-cookie-userid", "mi-cookie-passtoken",
+                       "mi-cookie-submit", "mi-cookie-status",
                        "qr-img", "qr-msg", "qr-status", "mi-sts-url", "mi-sts-submit"):
         check(f'id="{element_id}"' in html, f"missing element #{element_id}")
     check('id="qr-area"' in html and 'id="qr-area" style="display:none' in html,
@@ -2443,6 +2478,8 @@ def scenario_frontend_behaviour():
         "mi-otp-send": {"disabled": False, "textContent": "获取验证码"},
         "mi-otp-verify": {"disabled": False},
         "mi-cookie-text": {"value": ""},
+        "mi-cookie-userid": {"value": ""},
+        "mi-cookie-passtoken": {"value": ""},
         "mi-cookie-submit": {"disabled": False},
         "mi-cookie-status": {"textContent": ""},
     }
@@ -2600,7 +2637,8 @@ def scenario_frontend_behaviour():
 
     # (f) cookie login works while _otp.state is 'pending'
     elements = json.loads(json.dumps(base_elements))
-    elements["mi-cookie-text"]["value"] = "userId=u; passToken=p"
+    elements["mi-cookie-userid"]["value"] = "u"
+    elements["mi-cookie-passtoken"]["value"] = "p"
     payload = _run_node(
         script_source,
         {"ok": True, "verified": True, "devices": [{"deviceID": "d1"}],
@@ -2625,7 +2663,7 @@ def scenario_frontend_behaviour():
         ok("frontend cookie: works while _otp.state is pending (not gated), closes the panel")
 
     elements = json.loads(json.dumps(base_elements))
-    elements["mi-cookie-text"]["value"] = "userId=u"
+    elements["mi-cookie-userid"]["value"] = "u"
     payload = _run_node(
         script_source,
         {"ok": False, "action": "fix_cookie",
@@ -2634,9 +2672,9 @@ def scenario_frontend_behaviour():
     )
     if payload:
         check("Cookie" in payload["cookieStatus"] or "检查" in payload["cookieStatus"],
-              f"a parse error must point at the Cookie text, got {payload['cookieStatus']!r}")
-        check("passToken" in payload["alert"], "the backend message must be surfaced")
-        ok("frontend cookie: fix_cookie is surfaced with the backend explanation")
+              f"a missing field must point at the two inputs, got {payload['cookieStatus']!r}")
+        check("passToken" in payload["alert"], "the missing field must be named")
+        ok("frontend cookie: a missing userId/passToken field is named without calling Xiaomi")
     return "frontend behaviour verified"
 
 
@@ -2989,6 +3027,7 @@ def main():
         scenario_resume_rejected,
         scenario_resume_second_round,
         scenario_resume_fresh_session_recovery,
+        scenario_resume_location_hop,
         scenario_resume_incomplete_is_explicit,
         scenario_resume_second_round_capped,
         scenario_resume_identity_mismatch,

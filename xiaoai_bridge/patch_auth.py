@@ -2917,7 +2917,47 @@ async def _otp_recover_incomplete_login(session, account, device_id: str, resp: 
         payload["msg"] = "小米要求再验证一次：请点击「获取验证码」，收到后提交新的验证码"
         payload["second_round"] = True
         return None, payload
-    # 2) 已经拿到验证后的 passToken/userId：换一个干净会话再换一次票。
+    # 2) 只给了跳转地址、没给票：真机遇到的就是这一种。浏览器验证完会打开这个地址，
+    #    再回到同一会话登录；这里补走一跳，然后用新的会话 Cookie 重试一次 resume。
+    location = str(resp.get("location") or "").strip()
+    if location:
+        sts = _otp_sts_target(location)
+        if sts:
+            _otp_login["sts_location"] = sts
+            log.info("OTP 登录：resume 只给了 STS 地址，缺 ssecurity/nonce "
+                     "(stage=resume_sts_only)")
+        else:
+            try:
+                hop_target = _otp_normalize_location(location)
+            except OtpFlowError as e:
+                log.warning("OTP 登录：resume 的跳转地址被拒绝 (code=%s)", e.code)
+                hop_target = ""
+            if hop_target:
+                log.info("OTP 登录：按 resume 给的地址补走一跳 (stage=resume_hop)")
+                try:
+                    await _otp_follow_auth_chain(
+                        session, hop_target, {"User-Agent": OTP_USER_AGENT},
+                        {"deviceId": str(device_id)}, "resume_hop"
+                    )
+                except OtpFlowError as e:
+                    log.warning("OTP 登录：补走一跳失败 (code=%s)", e.code)
+                else:
+                    identity = _otp_session_identity(session)
+                    retry_resp = await _mi_service_login_verified(
+                        session, "serviceLogin?sid=micoapi&_json=true",
+                        device_id=device_id,
+                        token={"deviceId": device_id,
+                               "passToken": str(identity.get("passToken") or ""),
+                               "userId": str(identity.get("userId") or "")},
+                        user_agent=str(getattr(account, "now_ua", "") or ""),
+                    )
+                    if _otp_login_complete(retry_resp):
+                        log.info("OTP 登录：补走一跳后登录完成 (source=resume_hop)")
+                        return retry_resp, None
+                    log.warning("OTP 登录：补走一跳后仍不完整 (code=%s, missing=%s)",
+                                _otp_int(retry_resp.get("code"), -1),
+                                ",".join(_otp_missing_login_fields(retry_resp)))
+    # 3) 已经拿到验证后的 passToken/userId：换一个干净会话再换一次票。
     identity = _otp_session_identity(session)
     pass_token = str(identity.get("passToken") or "")
     user_id = str(identity.get("userId") or "")

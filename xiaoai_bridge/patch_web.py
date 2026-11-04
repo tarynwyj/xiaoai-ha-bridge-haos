@@ -674,9 +674,11 @@ replace_exact(
           ① 打开 <a href="https://account.xiaomi.com" target="_blank" style="color:var(--accent)">account.xiaomi.com</a> 并登录<br>
           ② <b style="color:var(--txt-secondary)">F12</b> &rarr; <b style="color:var(--txt-secondary)">Application</b> &rarr; <b style="color:var(--txt-secondary)">Cookies</b><br>
           ③ 复制 <b style="color:var(--txt-secondary)">userId</b> 与 <b style="color:var(--txt-secondary)">passToken</b> 两行；<b>不要</b>复制 serviceToken（浏览器里那个属于网页登录，粘进来会导致校验失败）<br>
-          ④ 粘贴到下面 &rarr; 点「验证 Cookie」
+          ④ 把这两行分别填到下面两个框里（不用写 userId= 这种前缀）&rarr; 点「验证 Cookie」
         </div>
-        <div class="field"><label>Cookie 文本</label><textarea id="mi-cookie-text" rows="3" placeholder="userId=xxx; passToken=xxx"></textarea></div>
+        <div class="field"><label>userId</label><input id="mi-cookie-userid" placeholder="数字，例如 1234567890" autocomplete="off" oninput="syncCookieText()"></div>
+        <div class="field" style="margin-top:8px"><label>passToken</label><input id="mi-cookie-passtoken" placeholder="V1: 开头的那一串" autocomplete="off" oninput="syncCookieText()"></div>
+        <textarea id="mi-cookie-text" style="display:none"></textarea>
         <div class="input-row" style="margin-top:8px">
           <button class="btn btn-primary" id="mi-cookie-submit" onclick="verifyCookieLogin()">&#10003; 验证 Cookie</button>
           <span id="mi-cookie-status" style="font-size:11px;color:var(--txt-muted)"></span>
@@ -864,11 +866,50 @@ async function restartOtp(){
   const password=otpEl('mi-password');if(password)password.value='';
   showAlert(alertBox,'warn','已重新开始，请重新点击「登录」获取新的验证码');
 }
+function cookieFieldValue(id,key){
+  const el=otpEl(id);let v=String((el&&el.value)||'').trim();
+  if(!v)return '';
+  const m=v.match(new RegExp(key+'\\s*=\\s*([^;\\s]+)','i'));
+  if(m)v=m[1];
+  return v.replace(/^["']|["']$/g,'').trim();
+}
+function syncCookieText(){
+  const user=cookieFieldValue('mi-cookie-userid','userId');
+  const token=cookieFieldValue('mi-cookie-passtoken','passToken');
+  const box=otpEl('mi-cookie-text');
+  if(box)box.value=(user&&token)?('userId='+user+'; passToken='+token):'';
+}
+function prefillCookieFields(){
+  try{
+    const box=otpEl('mi-cookie-text');
+    if(!box)return;
+    const text=String(box.value||'');
+    const user=(text.match(/userId\s*=\s*([^;\s]+)/)||[])[1]||'';
+    const token=(text.match(/passToken\s*=\s*([^;\s]+)/)||[])[1]||'';
+    const userInput=otpEl('mi-cookie-userid');
+    const tokenInput=otpEl('mi-cookie-passtoken');
+    if(userInput&&!userInput.value)userInput.value=user;
+    if(tokenInput&&!tokenInput.value)tokenInput.value=token;
+  }catch(e){}
+}
+function bindCookiePrefill(){
+  try{
+    const card=otpEl('mi-advanced-card');
+    if(card&&typeof card.addEventListener==='function')card.addEventListener('toggle',prefillCookieFields);
+    prefillCookieFields();
+  }catch(e){}
+}
+if(typeof document!=='undefined')bindCookiePrefill();
 async function verifyCookieLogin(){
   const alertBox=otpEl('xiaomi-alert');
-  const box=otpEl('mi-cookie-text');
-  const text=String((box&&box.value)||'').trim();
-  if(!text){showAlert(alertBox,'err','✗ 先粘贴小米 Cookie（至少包含 userId 与 passToken）');return;}
+  const user=cookieFieldValue('mi-cookie-userid','userId');
+  const token=cookieFieldValue('mi-cookie-passtoken','passToken');
+  if(!user||!token){
+    otpText('mi-cookie-status','✗ 请检查 userId 与 passToken 两个输入框');
+    showAlert(alertBox,'err','✗ 请分别填写 userId 与 passToken（userId 与 passToken 都是必需的）');
+    return;
+  }
+  const text='userId='+user+'; passToken='+token;
   otpText('mi-cookie-status','⟳ 正在校验 Cookie...');
   const btn=otpEl('mi-cookie-submit');if(btn)btn.disabled=true;
   try{
@@ -876,13 +917,15 @@ async function verifyCookieLogin(){
     const d=await r.json();
     if(d&&d.ok){
       otpReset();
-      if(box)box.value='';
+      const userInput=otpEl('mi-cookie-userid');if(userInput)userInput.value='';
+      const tokenInput=otpEl('mi-cookie-passtoken');if(tokenInput)tokenInput.value='';
+      const box=otpEl('mi-cookie-text');if(box)box.value='';
       otpText('mi-cookie-status','');
       showAlert(alertBox,'ok','✓ '+(d.msg||'Cookie 登录成功'));
       if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
       return;
     }
-    otpText('mi-cookie-status','✗ '+((d&&d.action==='fix_cookie')?'请检查 Cookie 文本':'Cookie 可能已过期，可重试'));
+    otpText('mi-cookie-status','✗ '+((d&&d.action==='fix_cookie')?'请检查 userId 与 passToken':'Cookie 可能已过期，可重试'));
     showAlert(alertBox,'err','✗ '+((d&&d.msg)||'Cookie 登录失败'));
   }catch(e){
     otpText('mi-cookie-status','✗ '+e.message);
@@ -1049,11 +1092,11 @@ replace_exact(
     "successful Cookie login refreshes Xiaomi CAS only",
     """    if(d&&d.ok){
       otpReset();
-      if(box)box.value='';""",
+      const userInput=otpEl('mi-cookie-userid');if(userInput)userInput.value='';""",
     """    if(d&&d.ok){
       otpReset();
       await refreshXiaomiRevision();
-      if(box)box.value='';""",
+      const userInput=otpEl('mi-cookie-userid');if(userInput)userInput.value='';""",
 )
 replace_exact(
     "successful QR polling refreshes Xiaomi CAS only",

@@ -154,37 +154,3 @@ python xiaoai_bridge/test_upgrade_data.py --pristine-bridge /tmp/pinned/bridge.p
 改代码时如果改了用户可见行为（按钮、文案、默认值、权限模型），**同一个 PR 里**同步
 `DOCS.md` 与 `CHANGELOG.md`；纯内部重构不必写。
 
-## 7. 已知限制与待办
-
-- **账号密码 + 验证码：1.0.12 重写为「同会话 8 步协议」**（`/api/test/xiaomi/otp/{start,send,verify,restart}`：
-  authStart → identity/list → 用户点「获取验证码」后 sendPhoneTicket → verify<Method> → 同一会话跟随
-  `location` → 重跑 serviceLogin → clientSign 换 serviceToken → 设备列表通过后才原子保存）。
-  只跟随 HTTPS 且主机为 `account.xiaomi.com` 的 location；60 秒发送冷却、300 秒会话 TTL、
-  5 次错误上限；失败/重试不自动重发短信。由 `test_xiaomi_login.py` 覆盖（309 检查 / 31 场景，
-  含 6 个变异体验证）。**真实小米验证码流程尚未实机验证**：小米线上是否仍按此返回
-  `flag` / `location` 需要在一台真实 HAOS 上用隔离账号走一遍；邮箱验证码（`flag=8`）只识别不发送。
-- **手动 Cookie 登录（1.0.12）**：`/api/test/xiaomi/cookie-login` 解析 `userId`/`passToken`，
-  缺 `serviceToken` 时用 `MiAccount.login('micoapi')` 换取；同样必须通过设备列表校验才写盘。
-  它不再是主路径，界面里折叠到「高级选项」。
-- **粘贴浏览器跳转地址（1.0.11 的 STS 路径）只是兼容项**：该地址与浏览器会话绑定，插件会话
-  无法复用，实测稳定 401；1.0.12 已把误导性的「链接可能已过期」改成如实说明，并降级为
-  高级选项里的子块。1.0.11 的严格校验与原子保存逻辑保持不变（`test_sms_login.py` 覆盖）。
-- **许可证未定**：本仓库与上游均无 LICENSE 文件，未声明任何许可证；需单独决定并补上
-  （见根 `README.md` 的 License 一节）。
-- `config.yaml` 内容损坏（非法 YAML）时 `load_config()` 会抛异常导致启动失败
-  （1.0.9 同款行为），计划在后续版本改为「备份坏文件 + 明确报错」。
-- 界面仍从 `fonts.googleapis.com` 加载字体（上游自带）；离线环境会退回系统字体。
-- **写入原子性的边界（不要夸大）**：`auth.json` / `.mi.token` 走「临时文件（创建即 `0600`）
-  → 两次重命名」，两次重命名之间失败会回滚；但它**不是崩溃安全的完整事务** —— 进程在两次
-  重命名之间被强杀，仍可能留下新旧混合的一对文件。`config.yaml` 更是上游 `save_config()`
-  的普通覆盖写（先截断再写），写到一半断电可能留下截断文件；1.0.11 / 1.0.12 没有改它。
-- 界面截图尚未补；`docs/images/` 目录留给后续截图。
-
-## 8. 贡献
-
-1. Fork 后从 `main` 拉分支，改动尽量小而聚焦；
-2. 本地跑完 §3 的全部测试，且新增行为要有对应测试；
-3. 提交信息用祈使句描述「做了什么」；
-4. 提交身份请使用 GitHub 的 noreply 邮箱（`<ID>+<user>@users.noreply.github.com`），
-   不要提交私人邮箱；
-5. 行为变更请同步更新 `DOCS.md` / `CHANGELOG.md`。

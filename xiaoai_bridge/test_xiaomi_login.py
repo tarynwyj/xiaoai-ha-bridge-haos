@@ -991,7 +991,9 @@ def scenario_resume_fresh_session_recovery():
         session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
         CURRENT["login_script"] = [
             CHALLENGE_ANSWER,
-            {"code": 0, "userId": "login-user", "passToken": "login-pass",
+            # the same account as the verification session: the fallback must not
+            # switch identity, and its answer still has to carry the full ticket
+            {"code": 0, "userId": "jar-user", "passToken": "login-pass",
              "deviceId": "login-device", "ssecurity": "fresh-ssecurity",
              "location": "https://api2.mina.mi.com/sts?sign=fresh", "nonce": "fresh-nonce"},
         ]
@@ -1066,6 +1068,105 @@ def scenario_resume_incomplete_is_explicit():
               "the dropped verification session must be closed")
         ok("resume: an answer that cannot be completed is named field by field, logged "
            "with code/result/missing, and drops the session explicitly")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_second_round_capped():
+    """Xiaomi may keep demanding another code; the loop must be bounded."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        second = {"code": 0, "securityStatus": 16,
+                  "notificationUrl": AUTH_START.replace("ctx-123", "ctx-201")}
+        CURRENT["login_script"] = [second]
+        CURRENT["identity"] = {"flag": 4, "maskedPhone": "13900002222"}
+        session.responses = [
+            response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+            response(200, raw=b"<html>ok</html>"),
+            response(200, raw=b"<html>auth start 2</html>"),
+            response(200, CURRENT["identity"]),
+        ]
+        first = verify(h, "123456")
+        check(first.get("ok") is True and first.get("second_round") is True,
+              f"the first extra round must be offered, got {first}")
+        check(h.otp_state().get("rounds") == 2,
+              f"the state must count the rounds, got {h.otp_state().get('rounds')}")
+
+        # a second extra round would be round 3: refuse instead of sending more SMS
+        CURRENT["login_script"] = [{
+            "code": 0, "securityStatus": 16,
+            "notificationUrl": AUTH_START.replace("ctx-123", "ctx-202"),
+        }]
+        session.responses = [
+            response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+            response(200, raw=b"<html>ok</html>"),
+        ]
+        before = h.snapshot_data()
+        tickets_before = [url for url in session.urls() if "sendPhoneTicket" in url]
+        data = verify(h, "654321")
+        check(data.get("ok") is False and data.get("code") == "too_many_rounds",
+              f"a third verification round must be refused, got {data}")
+        check("扫码登录" in str(data.get("msg") or ""),
+              f"the refusal must point at QR login: {data.get('msg')}")
+        check(h.otp_state() == {},
+              "too_many_rounds is a breaking error: the OTP state must be dropped")
+        check(h.snapshot_data() == before, "a refused round must not write any credential file")
+        check([url for url in session.urls() if "sendPhoneTicket" in url] == tickets_before,
+              "a refused round must not send an SMS")
+        ok("resume: repeated 'verify again' answers are capped (no endless SMS loop)")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_identity_mismatch():
+    """The clean-session fallback must never persist a different account."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        CURRENT["login_script"] = [
+            CHALLENGE_ANSWER,
+            {"code": 0, "userId": "someone-else", "passToken": "other-pass",
+             "deviceId": "login-device", "ssecurity": "other-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=other", "nonce": "other-nonce"},
+        ]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is False and data.get("code") == "resume_incomplete",
+              f"a foreign identity must be refused, got {data}")
+        check("身份与验证会话不一致" in h.log.joined(),
+              f"the refusal must be logged without ids: {h.log.joined()}")
+        check("jar-user" not in h.log.joined() and "someone-else" not in h.log.joined(),
+              "neither identity may appear in the log")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "a foreign identity must not reach the token exchange")
+        check(h.snapshot_data() == before,
+              "a foreign identity must never be persisted")
+        check(h.otp_state() == {}, "the rejected verification state must be dropped")
+        ok("resume: the clean-session fallback refuses a different account identity")
+    finally:
+        h.cleanup()
+
+
+def scenario_missing_field_detection():
+    h = Harness()
+    try:
+        missing = h.ns["_otp_missing_login_fields"]
+        check(missing({"ssecurity": "s", "location": "l", "nonce": 0}) == [],
+              "an integer 0 nonce is a present field, not a missing one")
+        check(missing({"ssecurity": "s", "location": "l", "nonce": ""}) == ["nonce"],
+              "an empty nonce must be reported as missing")
+        check(missing({"ssecurity": "s", "location": "l"}) == ["nonce"],
+              "an absent nonce must be reported as missing")
+        check(missing({"ssecurity": "s", "nonce": "n"}) == ["location"],
+              "an absent location must be reported as missing")
+        check(missing("not-a-dict") == ["ssecurity", "location", "nonce"],
+              "a non-object answer must report all three fields")
+        check(h.ns["_otp_login_complete"]({"ssecurity": "s", "location": "l", "nonce": "n"}) is True,
+              "a complete answer must be recognised")
+        ok("classification: missing-field detection is explicit about None vs empty")
     finally:
         h.cleanup()
 
@@ -2889,6 +2990,9 @@ def main():
         scenario_resume_second_round,
         scenario_resume_fresh_session_recovery,
         scenario_resume_incomplete_is_explicit,
+        scenario_resume_second_round_capped,
+        scenario_resume_identity_mismatch,
+        scenario_missing_field_detection,
         scenario_password_login_challenge_without_code,
         scenario_wrong_code,
         scenario_otp_device_probe_gates_writes,

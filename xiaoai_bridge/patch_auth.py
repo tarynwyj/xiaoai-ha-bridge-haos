@@ -2181,6 +2181,7 @@ OTP_TTL_SECONDS = 300            # 一次验证会话的有效期（秒）
 OTP_RESEND_COOLDOWN = 60         # 「获取验证码」的冷却时间（秒）
 OTP_MAX_ATTEMPTS = 5             # 一个验证会话最多允许输错几次
 OTP_MAX_REDIRECTS = 5            # 验证码通过后最多手动跟随几次跳转（逐跳校验）
+OTP_MAX_ROUNDS = 2               # 同一次登录最多重开几轮验证（防止无限循环发短信）
 # 两个信任集合的语义不同，不能合并成「小米域名都能跟」：
 #   OTP_TRUSTED_AUTH_HOSTS：小米「账号验证」页面（https + 443）。验证码通过后，
 #     这些页面的跳转可以在同一会话里继续 GET，属于账号验证链本身。
@@ -2204,6 +2205,7 @@ OTP_USER_AGENT = (
 OTP_STATE_BREAKING_ERRORS = frozenset({
     "bad_json", "no_location", "unsafe_location", "location_http",
     "resume_failed", "resume_incomplete", "missing_credentials", "no_service_token",
+    "too_many_rounds",
     "verify_http", "bad_notification_url", "no_notification_url",
     "no_context", "no_flag", "auth_start_http", "identity_list_http",
     "unsafe_redirect", "too_many_redirects", "no_redirect_target",
@@ -2831,7 +2833,10 @@ def _otp_missing_login_fields(resp) -> list:
         return ["ssecurity", "location", "nonce"]
     missing = []
     for key in ("ssecurity", "location", "nonce"):
-        if not str(resp.get(key) or "").strip():
+        # 显式判 None/空串：`x or ""` 会把整数 0（或 False）当成缺失，
+        # 而小米的 nonce 是数字字段，未来真出现 0 时不该误报成"缺字段"。
+        value = resp.get(key)
+        if value is None or str(value).strip() == "":
             missing.append(key)
     return missing
 
@@ -2865,6 +2870,12 @@ async def _otp_resume_with_identity(device_id: str, pass_token: str, user_id: st
             log.warning("OTP 登录：新会话换取仍未完成 (code=%s, result=%s, missing=%s)",
                         code, resp.get("result"),
                         ",".join(_otp_missing_login_fields(resp)))
+            return {}
+        # 这条兜底换了会话，必须确认回来的还是同一个账号：否则会把另一个身份的
+        # 凭据落盘（_otp_finish_login 用的是响应里的 userId/passToken）。
+        returned_user = str(resp.get("userId") or "").strip()
+        if returned_user and returned_user != str(user_id):
+            log.warning("OTP 登录：新会话返回的身份与验证会话不一致，已丢弃该响应")
             return {}
         log.info("OTP 登录：新会话凭据换取成功 (source=fresh_session)")
         return resp
@@ -2935,6 +2946,15 @@ async def _otp_open_verification(session, account, device_id: str, resp: dict,
             "小米要求额外验证但没有返回验证链接，无法在本页面完成；请改用扫码登录",
         )
     ntf_url = _otp_normalize_notification_url(notification)
+    # 小米有时会连续要求重新验证；每轮都要用户再收一条短信，所以必须有上限，
+    # 否则服务端一直回「再验一次」时界面就能无限重发（真机遇到过）。
+    rounds = _otp_int(_otp_login.get("rounds"), 0) + 1
+    if rounds > OTP_MAX_ROUNDS:
+        log.warning("OTP 登录：小米连续要求验证，已超过本轮上限 (rounds=%s)", rounds - 1)
+        raise OtpFlowError(
+            "unsupported", "too_many_rounds",
+            "小米已连续 " + str(rounds - 1) + " 次要求重新验证，本次登录已停止；请改用扫码登录",
+        )
     query = parse_qs(urlsplit(ntf_url).query)
     context = str((query.get("context") or [""])[0] or "").strip()
     sid = str((query.get("sid") or ["micoapi"])[0] or "micoapi").strip() or "micoapi"
@@ -2982,6 +3002,7 @@ async def _otp_open_verification(session, account, device_id: str, resp: dict,
         "device_id": device_id,
         "phone_hint": _otp_mask_hint(identity),
         "created_at": time.time(),
+        "rounds": rounds,
         "attempts": 0,
         "sent": False,
         "cooldown_until": 0.0,

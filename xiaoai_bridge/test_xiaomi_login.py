@@ -1119,6 +1119,40 @@ def scenario_resume_second_round_capped():
         h.cleanup()
 
 
+def scenario_resume_location_hop():
+    """A resume that only answers a location must be completed like a browser."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        CURRENT["login_script"] = [
+            # code 0 + only a location: no ssecurity/nonce in this answer
+            {"code": 0, "location": "https://account.xiaomi.com/pass/verify/accepted?token=hop"},
+            {"code": 0, "userId": "jar-user", "passToken": "login-pass",
+             "deviceId": "login-device", "ssecurity": "hop-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=hop", "nonce": "hop-nonce"},
+        ]
+        session.responses.append(response(200, raw=b"<html>hop</html>"))
+        data = verify(h, "123456")
+
+        check(data.get("ok") is True and data.get("verified") is True,
+              f"opening the resume location must finish the login, got {data}")
+        urls = session.urls()
+        check(any("/pass/verify/accepted?token=hop" in url for url in urls),
+              f"the resume location must be opened exactly once, got {urls}")
+        log_text = h.log.joined()
+        check("stage=resume_hop" in log_text and "source=resume_hop" in log_text,
+              f"the hop and its result must be logged: {log_text}")
+        check(CURRENT["security_calls"]
+              and CURRENT["security_calls"][-1][1] == "https://api2.mina.mi.com/sts?sign=hop",
+              f"the token must come from the retried resume, got {CURRENT['security_calls']}")
+        check(h.otp_state() == {} and h.otp_session() is None,
+              "a completed hop login must clear the OTP state")
+        ok("resume: an answer with only a location is completed by opening it once, "
+           "then re-running the resume")
+    finally:
+        h.cleanup()
+
+
 def scenario_resume_identity_mismatch():
     """The clean-session fallback must never persist a different account."""
     h = Harness()
@@ -2989,6 +3023,7 @@ def main():
         scenario_resume_rejected,
         scenario_resume_second_round,
         scenario_resume_fresh_session_recovery,
+        scenario_resume_location_hop,
         scenario_resume_incomplete_is_explicit,
         scenario_resume_second_round_capped,
         scenario_resume_identity_mismatch,

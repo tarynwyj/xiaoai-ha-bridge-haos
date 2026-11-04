@@ -7,7 +7,7 @@
 
 [![CI](https://github.com/tarynwyj/xiaoai-ha-bridge-haos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tarynwyj/xiaoai-ha-bridge-haos/actions/workflows/ci.yml)
 
-> 当前版本 **1.0.15**，变更记录见 [CHANGELOG](xiaoai_bridge/CHANGELOG.md)。
+> 当前版本 **1.0.16**，变更记录见 [CHANGELOG](xiaoai_bridge/CHANGELOG.md)。
 
 ---
 

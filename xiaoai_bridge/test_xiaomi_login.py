@@ -354,6 +354,10 @@ FUNCTIONS = (
     "_otp_follow_auth_chain",
     "_otp_request_json",
     "_otp_finish_login",
+    "_otp_missing_login_fields",
+    "_otp_login_complete",
+    "_otp_resume_with_identity",
+    "_otp_recover_incomplete_login",
     "_otp_open_verification",
     "_otp_password_login",
     "_otp_start",
@@ -913,6 +917,290 @@ def scenario_resume_rejected():
               "a rejected resume must clear the OTP state so a new code can be requested")
         ok("resume rejected: the Xiaomi code/description reach the log and the message, "
            "no credential does")
+    finally:
+        h.cleanup()
+
+
+# ─────────────── 5c. an incomplete resume is classified, not reported as malformed ───────
+def _drive_resume(h, jar=None):
+    '''Verify up to the resume answer: code submission accepted, location followed.'''
+    session = _drive_verify(h)
+    if jar:
+        session.jar.cookie.update(jar)
+    session.responses = [
+        response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+        response(200, raw=b"<html>ok</html>"),
+    ]
+    return session
+
+
+CHALLENGE_ANSWER = {"code": 0, "qs": "%3Fsid%3Dmicoapi", "_sign": "CHALLENGE-SIG-VALUE",
+                    "sid": "micoapi", "callback": "https://api2.mina.mi.com/sts"}
+
+
+def scenario_resume_second_round():
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        # code 0 + a fresh notificationUrl: Xiaomi wants another verification round,
+        # which is a normal step answer, not a malformed login
+        CURRENT["login_script"] = [{
+            "code": 0, "securityStatus": 16,
+            "notificationUrl": AUTH_START.replace("ctx-123", "ctx-456"),
+        }]
+        CURRENT["identity"] = {"flag": 4, "maskedPhone": "13900001111"}
+        session.responses += [
+            response(200, raw=b"<html>auth start 2</html>"),
+            response(200, CURRENT["identity"]),
+        ]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is True and data.get("need_otp") is True,
+              f"a resume that asks for another verification must keep the OTP panel, got {data}")
+        check(data.get("second_round") is True,
+              f"the payload must say this is a second round, got {data}")
+        check(data.get("sent") is False,
+              f"a new round must not claim a code was already sent, got {data}")
+        check("再验证" in str(data.get("msg")), f"the message must say so: {data.get('msg')}")
+        state = h.otp_state()
+        check(state.get("context") == "ctx-456",
+              f"the OTP state must carry the new context, got {state.get('context')}")
+        check(state.get("attempts") == 0 and state.get("sent") is False,
+              f"the second round starts clean, got {state}")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "a second round must not exchange any serviceToken")
+        check(h.snapshot_data() == before, "a second round must not write any credential file")
+        check(h.otp_session() is session and session.closed is False,
+              "the verification session must stay open for the second round")
+        log_text = h.log.joined()
+        check("resume 响应不完整 (code=0" in log_text,
+              f"the incomplete resume must be logged with its code: {log_text}")
+        check("stage=second_round" in log_text,
+              f"the second round must be logged as such: {log_text}")
+        ok("resume: code 0 + notificationUrl reopens the verification round instead of "
+           "dead-ending on 'missing ssecurity/location/nonce'")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_fresh_session_recovery():
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        CURRENT["login_script"] = [
+            CHALLENGE_ANSWER,
+            # the same account as the verification session: the fallback must not
+            # switch identity, and its answer still has to carry the full ticket
+            {"code": 0, "userId": "jar-user", "passToken": "login-pass",
+             "deviceId": "login-device", "ssecurity": "fresh-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=fresh", "nonce": "fresh-nonce"},
+        ]
+        CURRENT["service_token"] = "service-token-after-fresh"
+        data = verify(h, "123456")
+
+        check(data.get("ok") is True and data.get("verified") is True,
+              f"a clean passToken exchange must finish the login, got {data}")
+        check(len(data.get("devices") or []) == 1, "the device probe must still run")
+        fresh = [entry for entry in CURRENT["verified_login_calls"]
+                 if entry["session"] is not session]
+        check(len(fresh) == 1,
+              f"exactly one exchange on a new session expected, got {len(fresh)}")
+        if fresh:
+            cookies = fresh[0]["kwargs"].get("cookies") or {}
+            check(cookies.get("passToken") == "jar-pass"
+                  and cookies.get("userId") == "jar-user",
+                  f"the new session must carry the verified identity, got {cookies}")
+            check(fresh[0]["session"].closed is True,
+                  "the recovery session must be closed afterwards")
+            check(str(fresh[0]["url"]).startswith(LOGIN_PREFIX),
+                  f"the recovery must use the same serviceLogin, got {fresh[0]['url']}")
+        check(CURRENT["security_calls"]
+              and CURRENT["security_calls"][-1][1] == "https://api2.mina.mi.com/sts?sign=fresh",
+              f"the token must come from the recovered answer, got {CURRENT['security_calls']}")
+        check(CURRENT["security_calls"][-1][2] == "fresh-nonce"
+              and CURRENT["security_calls"][-1][3] == "fresh-ssecurity",
+              "the clientSign inputs must be the recovered nonce/ssecurity")
+        if check(h.auth_path.exists() and h.token_path.exists(),
+                 "a recovered login must persist both credential files"):
+            token = json.loads(h.token_path.read_text(encoding="utf-8"))
+            check(token.get("micoapi") == ["fresh-ssecurity", "service-token-after-fresh"],
+                  f".mi.token must hold the recovered ticket, got {token.get('micoapi')}")
+        check("source=fresh_session" in h.log.joined(),
+              f"the recovered exchange must be logged: {h.log.joined()}")
+        check(h.otp_state() == {} and h.otp_session() is None,
+              "a recovered login must clear the OTP state")
+        ok("resume: a same-session answer without the ticket falls back to one clean "
+           "passToken exchange, then finishes normally")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_incomplete_is_explicit():
+    h = Harness()
+    try:
+        session = _drive_resume(h)     # the session holds no passToken/userId at all
+        CURRENT["login_script"] = [CHALLENGE_ANSWER]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is False and data.get("code") == "resume_incomplete",
+              f"an unrecoverable resume must fail as resume_incomplete, got {data}")
+        message = str(data.get("msg") or "")
+        for field in ("ssecurity", "location", "nonce"):
+            check(field in message,
+                  f"the message must name the missing field {field}: {message}")
+        log_text = h.log.joined()
+        check("resume 响应不完整 (code=0, result=None, missing=ssecurity,location,nonce"
+              in log_text,
+              f"the log must carry code/result/missing and no payload: {log_text}")
+        check("CHALLENGE-SIG-VALUE" not in log_text,
+              f"the log must never carry the payload body: {log_text}")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "an incomplete resume must not reach the token exchange")
+        check(h.snapshot_data() == before,
+              "an incomplete resume must not write any credential file")
+        check(h.otp_state() == {},
+              "resume_incomplete is a breaking error: the OTP state must be dropped")
+        check(session.closed is True,
+              "the dropped verification session must be closed")
+        ok("resume: an answer that cannot be completed is named field by field, logged "
+           "with code/result/missing, and drops the session explicitly")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_second_round_capped():
+    """Xiaomi may keep demanding another code; the loop must be bounded."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        second = {"code": 0, "securityStatus": 16,
+                  "notificationUrl": AUTH_START.replace("ctx-123", "ctx-201")}
+        CURRENT["login_script"] = [second]
+        CURRENT["identity"] = {"flag": 4, "maskedPhone": "13900002222"}
+        session.responses = [
+            response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+            response(200, raw=b"<html>ok</html>"),
+            response(200, raw=b"<html>auth start 2</html>"),
+            response(200, CURRENT["identity"]),
+        ]
+        first = verify(h, "123456")
+        check(first.get("ok") is True and first.get("second_round") is True,
+              f"the first extra round must be offered, got {first}")
+        check(h.otp_state().get("rounds") == 2,
+              f"the state must count the rounds, got {h.otp_state().get('rounds')}")
+
+        # a second extra round would be round 3: refuse instead of sending more SMS
+        CURRENT["login_script"] = [{
+            "code": 0, "securityStatus": 16,
+            "notificationUrl": AUTH_START.replace("ctx-123", "ctx-202"),
+        }]
+        session.responses = [
+            response(200, {"code": 0, "location": "/pass/verify/accepted?token=abc"}),
+            response(200, raw=b"<html>ok</html>"),
+        ]
+        before = h.snapshot_data()
+        tickets_before = [url for url in session.urls() if "sendPhoneTicket" in url]
+        data = verify(h, "654321")
+        check(data.get("ok") is False and data.get("code") == "too_many_rounds",
+              f"a third verification round must be refused, got {data}")
+        check("扫码登录" in str(data.get("msg") or ""),
+              f"the refusal must point at QR login: {data.get('msg')}")
+        check(h.otp_state() == {},
+              "too_many_rounds is a breaking error: the OTP state must be dropped")
+        check(h.snapshot_data() == before, "a refused round must not write any credential file")
+        check([url for url in session.urls() if "sendPhoneTicket" in url] == tickets_before,
+              "a refused round must not send an SMS")
+        ok("resume: repeated 'verify again' answers are capped (no endless SMS loop)")
+    finally:
+        h.cleanup()
+
+
+def scenario_resume_identity_mismatch():
+    """The clean-session fallback must never persist a different account."""
+    h = Harness()
+    try:
+        session = _drive_resume(h, {"passToken": "jar-pass", "userId": "jar-user"})
+        CURRENT["login_script"] = [
+            CHALLENGE_ANSWER,
+            {"code": 0, "userId": "someone-else", "passToken": "other-pass",
+             "deviceId": "login-device", "ssecurity": "other-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=other", "nonce": "other-nonce"},
+        ]
+        before = h.snapshot_data()
+        security_before = len(CURRENT["security_calls"])
+        data = verify(h, "123456")
+
+        check(data.get("ok") is False and data.get("code") == "resume_incomplete",
+              f"a foreign identity must be refused, got {data}")
+        check("身份与验证会话不一致" in h.log.joined(),
+              f"the refusal must be logged without ids: {h.log.joined()}")
+        check("jar-user" not in h.log.joined() and "someone-else" not in h.log.joined(),
+              "neither identity may appear in the log")
+        check(len(CURRENT["security_calls"]) == security_before,
+              "a foreign identity must not reach the token exchange")
+        check(h.snapshot_data() == before,
+              "a foreign identity must never be persisted")
+        check(h.otp_state() == {}, "the rejected verification state must be dropped")
+        ok("resume: the clean-session fallback refuses a different account identity")
+    finally:
+        h.cleanup()
+
+
+def scenario_missing_field_detection():
+    h = Harness()
+    try:
+        missing = h.ns["_otp_missing_login_fields"]
+        check(missing({"ssecurity": "s", "location": "l", "nonce": 0}) == [],
+              "an integer 0 nonce is a present field, not a missing one")
+        check(missing({"ssecurity": "s", "location": "l", "nonce": ""}) == ["nonce"],
+              "an empty nonce must be reported as missing")
+        check(missing({"ssecurity": "s", "location": "l"}) == ["nonce"],
+              "an absent nonce must be reported as missing")
+        check(missing({"ssecurity": "s", "nonce": "n"}) == ["location"],
+              "an absent location must be reported as missing")
+        check(missing("not-a-dict") == ["ssecurity", "location", "nonce"],
+              "a non-object answer must report all three fields")
+        check(h.ns["_otp_login_complete"]({"ssecurity": "s", "location": "l", "nonce": "n"}) is True,
+              "a complete answer must be recognised")
+        ok("classification: missing-field detection is explicit about None vs empty")
+    finally:
+        h.cleanup()
+
+
+def scenario_password_login_challenge_without_code():
+    h = Harness()
+    try:
+        # the first serviceLogin answer is the pre-login challenge: qs/_sign/callback
+        # and no "code" field at all. Treating a missing code as "already logged in"
+        # would skip the password check entirely.
+        CURRENT["login_script"] = [
+            {"qs": "%3Fsid%3Dmicoapi", "sid": "micoapi", "_sign": "sig",
+             "callback": "https://api2.mina.mi.com/sts"},
+            {"code": 0, "userId": "login-user", "passToken": "login-pass",
+             "deviceId": "login-device", "ssecurity": "login-ssecurity",
+             "location": "https://api2.mina.mi.com/sts?sign=login", "nonce": "login-nonce"},
+        ]
+        data = start(h)
+
+        check(data.get("ok") is True and data.get("verified") is True,
+              f"the challenge must still be answered with auth2, then succeed, got {data}")
+        calls = CURRENT["service_login_calls"]
+        check(len(calls) == 2,
+              f"a challenge without a code must still run auth2, got {calls}")
+        if len(calls) == 2:
+            check(str(calls[1][1]) == "serviceLoginAuth2",
+                  f"the second step must be auth2, got {calls[1][1]}")
+            form = calls[1][2] or {}
+            check(form.get("user") == "13800000000" and bool(form.get("hash")),
+                  f"auth2 must carry the username and password hash, got {form}")
+            check(form.get("_sign") == "sig" and form.get("sid") == "micoapi",
+                  f"auth2 must reuse the challenge sign/sid, got {form}")
+        ok("start: a serviceLogin answer without 'code' is a challenge, not a login "
+           "(auth2 still runs, no password check is skipped)")
     finally:
         h.cleanup()
 
@@ -1481,7 +1769,8 @@ def scenario_sts_terminal_hop():
         check("source=resume" in log_text,
               "the log must record that the resume response won over the captured STS URL")
 
-        # (c) a resume without ssecurity/location/nonce keeps failing explicitly
+        # (c) a resume without ssecurity/location/nonce still fails explicitly, but now
+        # names the missing fields instead of pretending the answer was malformed
         restart(h)
         session = _drive_verify(h)
         CURRENT["login_script"] = [{
@@ -1492,8 +1781,10 @@ def scenario_sts_terminal_hop():
         before = h.snapshot_data()
         security_before = len(CURRENT["security_calls"])
         data = verify(h, "123456")
-        check(data.get("ok") is False and data.get("code") == "resume_failed",
+        check(data.get("ok") is False and data.get("code") == "resume_incomplete",
               f"a resume without STS parameters must fail explicitly, got {data}")
+        check("ssecurity" in str(data.get("msg") or ""),
+              f"the failure must name the missing field, got {data.get('msg')}")
         check(len(CURRENT["security_calls"]) == security_before,
               "a resume without location/nonce/ssecurity must not reach the token exchange")
         check(h.snapshot_data() == before,
@@ -2696,6 +2987,13 @@ def main():
         scenario_verify_phone_business_code,
         scenario_verify_success,
         scenario_resume_rejected,
+        scenario_resume_second_round,
+        scenario_resume_fresh_session_recovery,
+        scenario_resume_incomplete_is_explicit,
+        scenario_resume_second_round_capped,
+        scenario_resume_identity_mismatch,
+        scenario_missing_field_detection,
+        scenario_password_login_challenge_without_code,
         scenario_wrong_code,
         scenario_otp_device_probe_gates_writes,
         scenario_ttl_expiry,

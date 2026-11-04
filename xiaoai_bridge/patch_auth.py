@@ -2181,6 +2181,7 @@ OTP_TTL_SECONDS = 300            # 一次验证会话的有效期（秒）
 OTP_RESEND_COOLDOWN = 60         # 「获取验证码」的冷却时间（秒）
 OTP_MAX_ATTEMPTS = 5             # 一个验证会话最多允许输错几次
 OTP_MAX_REDIRECTS = 5            # 验证码通过后最多手动跟随几次跳转（逐跳校验）
+OTP_MAX_ROUNDS = 2               # 同一次登录最多重开几轮验证（防止无限循环发短信）
 # 两个信任集合的语义不同，不能合并成「小米域名都能跟」：
 #   OTP_TRUSTED_AUTH_HOSTS：小米「账号验证」页面（https + 443）。验证码通过后，
 #     这些页面的跳转可以在同一会话里继续 GET，属于账号验证链本身。
@@ -2203,7 +2204,8 @@ OTP_USER_AGENT = (
 # 302 或 confirmUrl 指向别处，就不能再用这份会话去恢复 serviceLogin。
 OTP_STATE_BREAKING_ERRORS = frozenset({
     "bad_json", "no_location", "unsafe_location", "location_http",
-    "resume_failed", "missing_credentials", "no_service_token",
+    "resume_failed", "resume_incomplete", "missing_credentials", "no_service_token",
+    "too_many_rounds",
     "verify_http", "bad_notification_url", "no_notification_url",
     "no_context", "no_flag", "auth_start_http", "identity_list_http",
     "unsafe_redirect", "too_many_redirects", "no_redirect_target",
@@ -2784,10 +2786,13 @@ async def _otp_finish_login(account, resp: dict, device_id: str,
     ssecurity = str(resp.get("ssecurity") or "")
     location = str(resp.get("location") or "")
     nonce = str(resp.get("nonce") or "")
-    if not ssecurity or not location or not nonce:
+    missing = _otp_missing_login_fields(resp)
+    if missing:
+        # _otp_recover_incomplete_login 已按响应形态试过补全；这里说明小米这次确实
+        # 没把 micoapi 的票发完，只报缺了哪几个字段，别让用户和日志里去猜。
         raise OtpFlowError(
-            "unsupported", "resume_failed",
-            "登录响应缺少必要字段（ssecurity/location/nonce），无法完成登录；请改用扫码登录",
+            "unsupported", "resume_incomplete",
+            "登录响应缺少 " + "、".join(missing) + "，无法完成登录；请重新点击「登录」",
         )
     if _otp_login.get("sts_location"):
         # 链上只把 STS 地址留在内存里做诊断；location/nonce/ssecurity 一律以
@@ -2817,6 +2822,118 @@ async def _otp_finish_login(account, resp: dict, device_id: str,
     return list(devices or [])
 
 
+def _otp_missing_login_fields(resp) -> list:
+    '''Which of ssecurity/location/nonce are empty in one serviceLogin answer.
+
+    Xiaomi's failure answers still carry a location (a link to the login page),
+    so only ssecurity + nonce mark a completed micoapi login; location is only
+    meaningful together with them.
+    '''
+    if not isinstance(resp, dict):
+        return ["ssecurity", "location", "nonce"]
+    missing = []
+    for key in ("ssecurity", "location", "nonce"):
+        # 显式判 None/空串：`x or ""` 会把整数 0（或 False）当成缺失，
+        # 而小米的 nonce 是数字字段，未来真出现 0 时不该误报成"缺字段"。
+        value = resp.get(key)
+        if value is None or str(value).strip() == "":
+            missing.append(key)
+    return missing
+
+
+def _otp_login_complete(resp) -> bool:
+    '''True only when the answer carries everything the token exchange needs.'''
+    return not _otp_missing_login_fields(resp)
+
+
+async def _otp_resume_with_identity(device_id: str, pass_token: str, user_id: str) -> dict:
+    '''One serviceLogin with only the verified passToken/userId, in a new session.
+
+    The OTP session is mid-verification: besides passToken/userId its CookieJar
+    also holds the identity cookies the verification pages set. Xiaomi sometimes
+    answers the same-session resume with an incomplete payload (code 0 without
+    ssecurity/location/nonce) while a plain "passToken -> serviceLogin" exchange
+    in a clean session does complete. That is exactly what the manual Cookie
+    login already does, so this adds a second chance, not a new protocol.
+    '''
+    from miservice import MiAccount
+    session = aiohttp.ClientSession()
+    try:
+        account = MiAccount(session, "", "", None)
+        token = {"deviceId": device_id, "passToken": pass_token, "userId": user_id}
+        resp = await _mi_service_login_verified(
+            session, "serviceLogin?sid=micoapi&_json=true", device_id=device_id,
+            token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
+        )
+        code = _otp_int(resp.get("code"), -1)
+        if code != 0 or not _otp_login_complete(resp):
+            log.warning("OTP 登录：新会话换取仍未完成 (code=%s, result=%s, missing=%s)",
+                        code, resp.get("result"),
+                        ",".join(_otp_missing_login_fields(resp)))
+            return {}
+        # 这条兜底换了会话，必须确认回来的还是同一个账号：否则会把另一个身份的
+        # 凭据落盘（_otp_finish_login 用的是响应里的 userId/passToken）。
+        returned_user = str(resp.get("userId") or "").strip()
+        if returned_user and returned_user != str(user_id):
+            log.warning("OTP 登录：新会话返回的身份与验证会话不一致，已丢弃该响应")
+            return {}
+        log.info("OTP 登录：新会话凭据换取成功 (source=fresh_session)")
+        return resp
+    except OtpFlowError as e:
+        log.warning("OTP 登录：新会话换取失败 (code=%s)", e.code)
+        return {}
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+
+
+async def _otp_recover_incomplete_login(session, account, device_id: str, resp: dict,
+                                        username: str, password: str):
+    '''Handle a resume that answered code 0 without the micoapi ticket.
+
+    Xiaomi uses code 0 for "this step is fine", not only for "login finished":
+    the code submission itself answers code 0 + location, and the anonymous
+    serviceLogin answers 70016. A resume whose payload is another step is
+    therefore a normal answer, not a malformed login, and the old code turned it
+    into a dead end ("缺少 ssecurity/location/nonce, 请改用扫码登录").
+
+    Returns (resp, None) when a replacement answer completes the login, or
+    (None, payload) when the user has to submit another code. Raises
+    OtpFlowError(resume_incomplete) when nothing worked; the caller then drops
+    the verification session instead of pretending it succeeded.
+    '''
+    missing = _otp_missing_login_fields(resp)
+    log.warning("OTP 登录：resume 响应不完整 (code=%s, result=%s, missing=%s, keys=%s)",
+                _otp_int(resp.get("code"), -1), resp.get("result"),
+                ",".join(missing), ",".join(sorted(str(k) for k in resp)))
+    # 1) 小米又要求一次验证：同一会话重开一轮，验证态不丢，用户重新收一条短信。
+    if str(resp.get("notificationUrl") or "").strip():
+        log.info("OTP 登录：resume 要求再验证一次 (stage=second_round)")
+        payload = await _otp_open_verification(
+            session, account, device_id, resp, username, password
+        )
+        payload["msg"] = "小米要求再验证一次：请点击「获取验证码」，收到后提交新的验证码"
+        payload["second_round"] = True
+        return None, payload
+    # 2) 已经拿到验证后的 passToken/userId：换一个干净会话再换一次票。
+    identity = _otp_session_identity(session)
+    pass_token = str(identity.get("passToken") or "")
+    user_id = str(identity.get("userId") or "")
+    if pass_token and user_id:
+        recovered = await _otp_resume_with_identity(
+            device_id or str(identity.get("deviceId") or ""), pass_token, user_id
+        )
+        if recovered:
+            return recovered, None
+    raise OtpFlowError(
+        "unsupported", "resume_incomplete",
+        "小米没有完成本次登录（缺少 " + "、".join(missing)
+        + "）；请重新点击「登录」，或改用扫码 / Cookie 登录",
+    )
+
+
 async def _otp_open_verification(session, account, device_id: str, resp: dict,
                                  username: str, password: str) -> dict:
     '''Steps 1-2 of the OTP protocol: open the session, discover the method.'''
@@ -2829,6 +2946,15 @@ async def _otp_open_verification(session, account, device_id: str, resp: dict,
             "小米要求额外验证但没有返回验证链接，无法在本页面完成；请改用扫码登录",
         )
     ntf_url = _otp_normalize_notification_url(notification)
+    # 小米有时会连续要求重新验证；每轮都要用户再收一条短信，所以必须有上限，
+    # 否则服务端一直回「再验一次」时界面就能无限重发（真机遇到过）。
+    rounds = _otp_int(_otp_login.get("rounds"), 0) + 1
+    if rounds > OTP_MAX_ROUNDS:
+        log.warning("OTP 登录：小米连续要求验证，已超过本轮上限 (rounds=%s)", rounds - 1)
+        raise OtpFlowError(
+            "unsupported", "too_many_rounds",
+            "小米已连续 " + str(rounds - 1) + " 次要求重新验证，本次登录已停止；请改用扫码登录",
+        )
     query = parse_qs(urlsplit(ntf_url).query)
     context = str((query.get("context") or [""])[0] or "").strip()
     sid = str((query.get("sid") or ["micoapi"])[0] or "micoapi").strip() or "micoapi"
@@ -2876,6 +3002,7 @@ async def _otp_open_verification(session, account, device_id: str, resp: dict,
         "device_id": device_id,
         "phone_hint": _otp_mask_hint(identity),
         "created_at": time.time(),
+        "rounds": rounds,
         "attempts": 0,
         "sent": False,
         "cooldown_until": 0.0,
@@ -2919,7 +3046,10 @@ async def _otp_password_login(username: str, password: str) -> dict:
             session, "serviceLogin?sid=micoapi&_json=true", device_id=device_id,
             token=token, user_agent=str(getattr(account, "now_ua", "") or ""),
         )
-        if _otp_int(resp.get("code"), 0) != 0:
+        # 缺少 code 时按"需要 auth2"处理（与 miservice 3.0.1 的 resp.get('code') != 0
+        # 一致）：serviceLogin 的挑战响应只有 qs/_sign/callback，原来的默认值 0 会把
+        # 它当成"已登录"从而跳过密码校验。
+        if resp.get("code") is None or _otp_int(resp.get("code"), 0) != 0:
             payload = {
                 "_json": "true",
                 "qs": resp.get("qs", ""),
@@ -3145,6 +3275,14 @@ async def _otp_verify_code(code: str) -> dict:
             "验证码已通过，但恢复登录失败（小米返回 code=" + str(resume_code)
             + "），请重新点击「登录」",
         )
+    if not _otp_login_complete(resp):
+        # code==0 只代表"这一步小米认了"，不代表票发完了（验证提交本身就是
+        # code 0 + location）。先按响应形态补齐，补不齐才显式失败。
+        resp, payload = await _otp_recover_incomplete_login(
+            session, account, device_id, resp, username, password
+        )
+        if payload is not None:
+            return payload
     devices = await _otp_finish_login(account, resp, device_id, username, password)
     await _reset_otp_state()
     log.info("OTP 登录成功，发现 %d 台设备", len(devices))

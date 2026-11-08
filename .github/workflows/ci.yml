@@ -182,6 +182,9 @@ jobs:
       - name: Rules page in a real browser (Playwright + Chromium)
         run: python xiaoai_bridge/test_rules_browser.py --html /tmp/app/web/index.html
 
+      - name: Listening scope in a real browser (Playwright + Chromium)
+        run: python xiaoai_bridge/test_scope_browser.py --html /tmp/app/web/index.html
+
       - name: HAOS Ingress contract
         run: |
           python xiaoai_bridge/test_ingress_contract.py \

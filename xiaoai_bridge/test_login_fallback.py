@@ -21,6 +21,7 @@ WANTED_FUNCS = (
     "_miservice_auth_failure",
     "_note_auth_failure",
     "_token_account_credentials",
+    "_build_token_account",
     "_load_saved_xiaomi_identity",
 )
 NEEDED = ("AUTH_OTP_REQUIRED_CODES", "RELOGIN_FATAL_CODES", "_last_auth_failure")
@@ -142,6 +143,62 @@ def scenario_token_account_has_no_password(reporter, ns, root):
                    callable(ns["_token_account_credentials"]))
 
 
+class FakeMiAccount:
+    """Mirror of miservice_fork 2.9.3 MiAccount for the login() fallback."""
+
+    def __init__(self, session, username, password, token_store=None):
+        self.session = session
+        self.username = username
+        self.password = password
+        self.token = {"deviceId": "D1"}
+
+    async def login(self, sid):
+        # passToken exchange failed -> miservice tries serviceLoginAuth2
+        if not self.password:
+            # no password to send: the fallback never happens, login just fails
+            return False
+        raise Exception({"code": 87001, "desc": "验证码输入错误", "sid": sid})
+
+
+def scenario_builder_blocks_the_fallback(reporter, ns):
+    """The token account must not carry a password into miservice's fallback."""
+    import asyncio
+    import sys
+    import types
+
+    fake = types.ModuleType("miservice")
+    fake.MiAccount = FakeMiAccount
+    sys.modules["miservice"] = fake
+    try:
+        cfg = {"username": "u@example.com", "password": "stale-password"}
+        account = ns["_build_token_account"](object(), cfg)
+        reporter.eq("the builder hands MiAccount no username", account.username, "")
+        reporter.eq("the builder hands MiAccount no password", account.password, "")
+
+        # what miservice would do after a 401
+        raised = None
+        try:
+            result = asyncio.run(account.login("micoapi"))
+        except Exception as exc:  # noqa: BLE001 - the point is that it must not raise
+            raised = exc
+            result = None
+        reporter.check("the fallback never reaches 87001", raised is None,
+                       repr(raised))
+        reporter.eq("login simply fails when there is no password", result, False)
+
+        # a password-carrying account still reproduces the bug, proving the test bites
+        buggy = FakeMiAccount(object(), "u@example.com", "stale-password")
+        bug = None
+        try:
+            asyncio.run(buggy.login("micoapi"))
+        except Exception as exc:  # noqa: BLE001
+            bug = exc
+        reporter.check("a password-carrying account does raise 87001",
+                       bug is not None and bug.args[0].get("code") == 87001, repr(bug))
+    finally:
+        sys.modules.pop("miservice", None)
+
+
 def main():
     bridge = Path(sys.argv[1] if len(sys.argv) > 1 else "/app/bridge.py")
     assert bridge.exists(), "built bridge.py not found: %s" % bridge
@@ -158,6 +215,8 @@ def main():
     print("  --  error classification")
     scenario_token_account_has_no_password(reporter, ns, root)
     print("  --  token account carries no password")
+    scenario_builder_blocks_the_fallback(reporter, ns)
+    print("  --  the password fallback cannot fire")
     if reporter.failures:
         print("login fallback tests FAILED (%d checks, %d failures)"
               % (reporter.checks, len(reporter.failures)))

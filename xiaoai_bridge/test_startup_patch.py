@@ -39,6 +39,7 @@ assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in sou
 MASKED = "\u2022" * 8
 WANTED_FUNCS = [
     "_set_token",
+    "_build_token_account",
     "_load_saved_xiaomi_identity",
     "_get_cookie",
     "_valid_saved_cookie_text",

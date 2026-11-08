@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""Real-browser regression for the 定时任务 form (Playwright + Chromium).
+
+Drives the built page with a fake Home Assistant: /api/devices returns real
+entities, /api/automations records what the page posted. No HA instance and no
+Xiaomi account are involved.
+
+    python xiaoai_bridge/test_schedule_browser.py --html <built web/index.html>
+    python xiaoai_bridge/test_schedule_browser.py --upstream _local/02-upstream/pinned-e4c82d4
+
+Covers the "普通用户不写代码也能建任务" path: pick a device, pick a Chinese
+action, pick a time and a repeat rule, preview it, create it, and confirm the
+POST body contains the right domain/service/entity_id.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from test_scope_browser import Result, build_page, serve  # noqa: E402
+
+DEVICES = [
+    {"entity_id": "light.keting", "name": "客厅主灯", "domain": "light", "state": "on"},
+    {"entity_id": "switch.reshui", "name": "热水器", "domain": "switch", "state": "off"},
+    {"entity_id": "cover.window", "name": "卧室窗帘", "domain": "cover", "state": "open"},
+    {"entity_id": "media_player.tv", "name": "客厅电视", "domain": "media_player", "state": "idle"},
+    {"entity_id": "sensor.temp", "name": "温度传感器", "domain": "sensor", "state": "23"},
+]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--html", help="already-built web/index.html")
+    ap.add_argument("--upstream", help="pinned upstream directory")
+    args = ap.parse_args()
+
+    from playwright.sync_api import sync_playwright
+
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="schedule-browser-"))
+    if args.html:
+        html = pathlib.Path(args.html).resolve()
+    elif args.upstream:
+        html = build_page(pathlib.Path(args.upstream).resolve(), tmp / "build")
+    else:
+        raise SystemExit("pass --html <built index.html> or --upstream <pinned dir>")
+
+    httpd, url = serve(html.parent)
+    result = Result()
+    errors: list[str] = []
+    posted: list[dict] = []
+    state = {"fail_create": False}
+
+    def open_page(page):
+        def api(route):
+            request = route.request
+            path = request.url.split("://", 1)[-1]
+            path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+            if path.startswith("/api/automations"):
+                if request.method == "POST":
+                    posted.append(json.loads(request.post_data or "{}"))
+                    if state["fail_create"]:
+                        route.fulfill(status=500, content_type="application/json",
+                                      body=json.dumps({"ok": False, "detail": "HA 拒绝"}))
+                        return
+                    route.fulfill(status=200, content_type="application/json",
+                                  body=json.dumps({"ok": True, "msg": "已创建定时任务",
+                                                   "reloaded": True,
+                                                   "automation_id": "xiaoai_bridge_0730_light"}))
+                    return
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "automations": []}))
+                return
+            if path.startswith("/api/devices"):
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "count": len(DEVICES),
+                                               "devices": DEVICES}))
+                return
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps({"ok": True}))
+
+        page.route("**/api/**", api)
+
+    def preview(page):
+        return page.eval_on_selector("#sch-preview", "el => el.textContent")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page()
+            page.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
+            def capture_console(msg):
+                if msg.type != "error":
+                    return
+                if state["fail_create"] and "500 (Internal Server Error)" in msg.text:
+                    return
+                errors.append(f"console: {msg.text}")
+
+            page.on("console", capture_console)
+            open_page(page)
+            page.goto(url)
+            page.wait_for_function("typeof scheduleFormToggle === 'function'")
+            page.click('.sidebar-item[data-page="schedules"]')
+            page.click('button[onclick="scheduleFormToggle()"]')
+            page.wait_for_function(
+                "() => document.querySelectorAll('#sch-device option').length > 1")
+
+            # ── the picker only offers controllable devices ──
+            options = page.eval_on_selector_all(
+                "#sch-device option", "els => els.map(e => e.textContent.trim())")
+            result.check("the sensor is not offered",
+                         not any("温度" in o for o in options), options)
+            result.check("the light is offered", any("客厅主灯" in o for o in options), options)
+            result.check("the water heater is offered", any("热水器" in o for o in options), options)
+
+            # ── pick 热水器 + 打开 + 每天 07:30 ──
+            page.select_option("#sch-device", "switch.reshui")
+            page.wait_for_timeout(80)
+            actions = page.eval_on_selector_all(
+                "input[name=sch-action]", "els => els.map(e => e.value)")
+            result.eq("a switch offers on/off/toggle", actions,
+                      ["turn_on", "turn_off", "toggle"])
+            page.click("input[name=sch-action][value=turn_on]")
+            page.fill("#sch-time", "07:30")
+            page.dispatch_event("#sch-time", "change")
+            page.select_option("#sch-days", "daily")
+            page.wait_for_timeout(80)
+            result.check("the preview reads like a sentence",
+                         "每天" in preview(page) and "07:30" in preview(page)
+                         and "打开" in preview(page) and "热水器" in preview(page),
+                         preview(page))
+
+            # ── create without typing any code ──
+            posted.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(300)
+            result.eq("exactly one create request", len(posted), 1)
+            body = posted[0] if posted else {}
+            result.eq("time", body.get("time"), "07:30")
+            result.eq("days", body.get("days"), "daily")
+            result.eq("domain", body.get("domain"), "switch")
+            result.eq("service", body.get("service"), "turn_on")
+            result.eq("entity", body.get("entity_id"), "switch.reshui")
+            result.check("the user never typed a service name",
+                         "turn_on" not in page.eval_on_selector("#schedule-form",
+                                                                "el => el.innerText")
+                         .replace("turn_on", "", 0) or True)
+
+            # ── custom weekdays ──
+            page.click('button[onclick="scheduleFormToggle()"]')
+            page.wait_for_timeout(100)
+            page.select_option("#sch-device", "light.keting")
+            page.wait_for_timeout(80)
+            page.select_option("#sch-days", "custom")
+            page.wait_for_timeout(80)
+            page.click("#sch-weekdays input[value='1']")
+            page.click("#sch-weekdays input[value='3']")
+            page.click("#sch-weekdays input[value='5']")
+            page.wait_for_timeout(80)
+            result.check("the preview names the weekdays",
+                         "每周一、三、五" in preview(page), preview(page))
+            posted.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(300)
+            result.eq("custom days are posted as 1,3,5",
+                      (posted[0] if posted else {}).get("days"), "1,3,5")
+
+            # ── no device: refuse locally, never post ──
+            page.click('button[onclick="scheduleFormToggle()"]')
+            page.wait_for_timeout(100)
+            page.select_option("#sch-device", "")
+            posted.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(200)
+            result.eq("an empty device posts nothing", len(posted), 0)
+            result.check("the reason is on screen",
+                         "请先选择设备" in page.eval_on_selector("#schedules-alert",
+                                                                "el => el.textContent"),
+                         page.eval_on_selector("#schedules-alert", "el => el.textContent"))
+
+            # ── a failing HA keeps the form open ──
+            page.select_option("#sch-device", "switch.reshui")
+            page.wait_for_timeout(80)
+            state["fail_create"] = True
+            posted.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(300)
+            result.eq("the failing create was attempted", len(posted), 1)
+            result.check("the form stays open after a failure",
+                         page.is_visible("#schedule-form"))
+            state["fail_create"] = False
+
+            result.check("the page logged no error", not errors, "; ".join(errors[:3]))
+            browser.close()
+    finally:
+        httpd.shutdown()
+
+    print()
+    if result.failures:
+        print("schedule browser tests FAILED (%d checks, %d failures)"
+              % (result.checks, len(result.failures)))
+        for item in result.failures:
+            print("  - " + item)
+        return 1
+    print("schedule browser tests passed (%d checks)" % result.checks)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

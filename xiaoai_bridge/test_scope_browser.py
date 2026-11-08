@@ -31,6 +31,10 @@ import tempfile
 import threading
 
 HERE = pathlib.Path(__file__).resolve().parent
+try:  # the Windows console is GBK; never let a check line kill the run
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Three speakers: two share a name, one carries quotes and markup.
 DEVICES = [

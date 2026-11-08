@@ -5340,6 +5340,88 @@ replace_exact(
 """,
 )
 
+# ──────────────── I: 日志可追溯（轮转 + 面板读文件尾部） ────────────────
+# 面板的「实时日志」原先只读内存里的最近 200 条、页面又固定只要 80 条，等于几分钟的
+# 流量；而「登录态续期是否每天都成功」需要回看数天。磁盘上的 logs/bridge.log 才是
+# durable 的那份，所以：① 给它加轮转，长期运行不会写满 SD 卡；② /api/logs 改为读文件
+# 尾部（最多 1000 行），读不到才退回内存缓冲。
+replace_exact(
+    "rotating log handler helper",
+    """logging.basicConfig(
+""",
+    """import logging.handlers
+
+
+def _log_file_handler(path):
+    \"\"\"Rotate the on-disk log so a long-running install cannot fill the SD card.
+
+    2 MB × 4 files keeps weeks of the sparse INFO traffic, which is what
+    "did the session renewal keep succeeding every day?" needs.
+    \"\"\"
+    return logging.handlers.RotatingFileHandler(
+        path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+
+
+logging.basicConfig(
+""",
+)
+
+replace_exact(
+    "use the rotating log handler",
+    """        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+""",
+    """        _log_file_handler(LOG_PATH),
+""",
+)
+
+replace_exact(
+    "panel logs read the on-disk file",
+    """@app.get("/api/logs")
+async def get_logs(n: int = 80):
+    return log_records[-n:]
+""",
+    """_LOG_LINE_RE = re.compile(
+    r"^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}) \\[(\\w+)\\] (.*)$")
+
+
+def _log_lines_from_file(limit: int) -> list:
+    \"\"\"Tail the rotated log file so the panel is not limited to the memory buffer.
+
+    The memory buffer holds 200 records and the page used to request 80 — minutes
+    of traffic, far too short to answer "did the renewal succeed every day this
+    week?". Fall back to the memory buffer when the file cannot be read.
+    \"\"\"
+    try:
+        from collections import deque
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as stream:
+            tail = list(deque(stream, maxlen=limit))
+    except OSError:
+        return []
+    parsed = []
+    for line in tail:
+        text = line.rstrip("\\n")
+        if not text.strip():
+            continue
+        match = _LOG_LINE_RE.match(text)
+        if match:
+            stamp, level, message = match.groups()
+            parsed.append({"time": stamp[11:], "level": level, "msg": message})
+        else:
+            parsed.append({"time": "", "level": "INFO", "msg": text})
+    return parsed
+
+
+@app.get("/api/logs")
+async def get_logs(n: int = 80):
+    try:
+        limit = max(1, min(int(n), 1000))
+    except (TypeError, ValueError):
+        limit = 80
+    from_file = _log_lines_from_file(limit)
+    return from_file or log_records[-limit:]
+""",
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

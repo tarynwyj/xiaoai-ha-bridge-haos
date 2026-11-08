@@ -1203,6 +1203,15 @@ async function createSchedule(){
 async function deleteSchedule(id){''',
 )
 
+# 日志页原来固定只要 80 行（约几分钟），而「登录态续期是否每天成功」要回看数天。
+# 后端 /api/logs 已改为读磁盘日志尾部（最多 1000 行），这里把页面请求量提到 500。
+replace_exact(
+    "log page reads more than 80 lines",
+    "fetch('/api/logs?n=80')",
+    "fetch('/api/logs?n=500')",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")
+print("Patched web/index.html with a 500-line log page")

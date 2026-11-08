@@ -38,6 +38,7 @@ RUN python -m py_compile /tmp/patch_web.py \
     && grep -Fq 'async function startPasswordLogin()' /app/web/index.html \
     && grep -Fq 'async function verifyCookieLogin()' /app/web/index.html \
     && ! grep -Fq '免短信' /app/web/index.html \
+    && grep -Fq 'api/logs?n=500' /app/web/index.html \
     && rm /tmp/patch_web.py
 
 COPY patch_auth.py /tmp/patch_auth.py
@@ -51,6 +52,8 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _relogin_retry_plan' /app/bridge.py \
     && grep -Fq 'def _refresh_interval_seconds' /app/bridge.py \
     && grep -Fq 'def _token_age_seconds' /app/bridge.py \
+    && grep -Fq 'def _log_file_handler' /app/bridge.py \
+    && grep -Fq 'def _log_lines_from_file' /app/bridge.py \
     && grep -Fq 'next_refresh_at = time.time()' /app/bridge.py \
     && grep -Fq 'token_data["issued_at"]' /app/bridge.py \
     && grep -Fq '_wait_for_relogin(wait_seconds, fatal)' /app/bridge.py \

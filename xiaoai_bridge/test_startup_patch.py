@@ -56,6 +56,7 @@ WANTED_FUNCS = [
     "_refresh_interval_seconds",
     "_token_age_seconds",
     "_poll_targets",
+    "_warn_poll_scope_empty",
     "_read_saved_credential",
     "_save_auth_and_token",
     "_merge_xiaomi_credentials",
@@ -451,6 +452,7 @@ class Harness:
             "time": __import__("time"),
             "REFRESH_COALESCE_SECONDS": 60,
             "_refresh_lock": None,
+            "_poll_scope_warned": "",
             "_process_login_device_id": "",
             "_refresh_cache": {},
             "datetime": real_datetime.datetime,
@@ -944,6 +946,88 @@ def scenario_poll_target_filtering(root: Path):
     return "poll targets honour device_ids / device_did / fallbacks"
 
 
+def scenario_scope_limits_polling(root: Path):
+    """A saved allow-list must decide which speakers are actually polled."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.cfg["xiaomi"]["device_ids"] = ["speaker-1", "speaker-3"]
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+        {"deviceID": "speaker-2", "hardware": "L05C", "name": "卧室"},
+        {"deviceID": "speaker-3", "hardware": "L06A", "name": "书房"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 6:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    polled = set(harness.polled_devices)
+    assert "speaker-1" in polled, f"the first selected speaker must be polled, got {polled}"
+    assert "speaker-3" in polled, f"the second selected speaker must be polled, got {polled}"
+    assert "speaker-2" not in polled, (
+        f"an unselected speaker must never be polled, got {polled}"
+    )
+    return "only the speakers in the saved allow-list are polled"
+
+
+def scenario_scope_unmatched_polls_nothing(root: Path):
+    """An allow-list that matches nothing must wait, not fall back to devices[0]."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.cfg["xiaomi"]["device_ids"] = ["gone-1", "gone-2"]
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 4:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    assert harness.polled_devices == [], (
+        f"an unmatched allow-list must poll nothing, got {harness.polled_devices}"
+    )
+    assert harness.log.has("一台都没发现"), harness.log.messages
+    return "an unmatched allow-list waits for the selected speakers"
+
+
 def scenario_save_credentials_never_blank(root: Path):
     harness = Harness(root)
     harness.write_token(
@@ -1130,6 +1214,8 @@ def main():
         scenario_device_id_stays_stable,
         scenario_every_xiaoai_device_is_polled,
         scenario_poll_target_filtering,
+        scenario_scope_limits_polling,
+        scenario_scope_unmatched_polls_nothing,
         scenario_runtime_refresh_failure,
         scenario_runtime_refresh_rejected,
         scenario_save_credentials_never_blank,

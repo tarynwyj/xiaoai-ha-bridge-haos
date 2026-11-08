@@ -51,6 +51,7 @@ DEFAULT_BRIDGE = Path(__file__).resolve().parents[2] / "build-main" / "bridge.py
 # Names of the JS functions that must be present in the built HTML and that the
 # Node harness exercises.  Missing names are a hard failure (the patch drifted).
 EXTRACT_FUNCTIONS = [
+    "gv",
     "miScopeNormIds",
     "miScopeSaved",
     "miScopeInit",
@@ -1768,6 +1769,40 @@ test('scope: re-rendering after a login does not change the selection', () => {
   renderMiScope([]);
   renderMiScope(scopeDevices());
   checkEq('the selection survived every re-render', miScopeCollect().ids.join(','), before);
+});
+
+
+test('scope: a failed save keeps the draft and never claims success', async () => {
+  scopeFixture({ device_ids: ['A'] });
+  globalThis.miScopeDevices = scopeDevices();
+  for (const id of ['mi-username', 'mi-password', 'mi-hardware', 'mi-did',
+                    'xiaomi-alert', 'mi-scope-status']){
+    const el = document.createElement('div');
+    el.id = id;
+    document.body.appendChild(el);
+  }
+  const tts = document.createElement('input');
+  tts.id = 'mi-tts';
+  tts.type = 'checkbox';
+  tts.checked = true;
+  document.body.appendChild(tts);
+  setMiScopeMode('selected');
+  toggleMiScopeIndex(2, true);
+  const draftBefore = miScopeCollect().ids.join(',');
+
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ ok: false, msg: '保存失败' }) };
+  };
+  const okd = await saveXiaomi();
+  checkEq('the save reports failure', okd, false);
+  checkEq('exactly one request was made', calls, 1);
+  checkEq('the draft survived the failure', miScopeCollect().ids.join(','), draftBefore);
+  checkEq('the form still shows unsaved changes', miScopeDirty(), true);
+
+  checkEq('the section is still dirty after the failure', miScopeDirty(), true);
+
 });
 
 // --- runner -----------------------------------------------------------------

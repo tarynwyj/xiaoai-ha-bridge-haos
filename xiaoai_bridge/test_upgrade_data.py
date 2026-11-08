@@ -173,6 +173,7 @@ NEW_ONLY_FUNCTIONS = (
     "_refresh_interval_seconds",
     "_token_age_seconds",
     "_poll_targets",
+    "_warn_poll_scope_empty",
     "_log_file_handler",
     "_log_lines_from_file",
     "_plausible_credential",

@@ -26,6 +26,8 @@ RUN python -m py_compile /tmp/patch_web.py \
     && python /tmp/patch_web.py \
     && grep -Fq 'type="checkbox" class="r-e"' /app/web/index.html \
     && grep -Fq 'function saveOneRule(' /app/web/index.html \
+    && grep -Fq 'id="mi-scope-card"' /app/web/index.html \
+    && grep -Fq 'miScopeCollect' /app/web/index.html \
     && grep -Fq '保存全部' /app/web/index.html \
     && ! grep -Fq 'multiple size="6"' /app/web/index.html \
     && grep -Fq 'function ruleSummaryHtml(rule)' /app/web/index.html \
@@ -50,6 +52,7 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
     && grep -Fq 'class MicoapiLoginRejected' /app/bridge.py \
     && grep -Fq 'class CredentialIdentityMismatch' /app/bridge.py \
+    && grep -Fq 'def _warn_poll_scope_empty' /app/bridge.py \
     && grep -Fq 'def _adopt_login_identity' /app/bridge.py \
     && grep -Fq 'def _login_device_id' /app/bridge.py \
     && grep -Fq 'def _refresh_outcome' /app/bridge.py \

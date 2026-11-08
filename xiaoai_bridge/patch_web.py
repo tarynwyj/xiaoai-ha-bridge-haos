@@ -1254,7 +1254,7 @@ function renderMiScope(devices){if(devices!==undefined)globalThis.miScopeDevices
 replace_exact(
     "save the listening scope with the xiaomi section",
     '''async function saveXiaomi(){const o=cfg.xiaomi||{};cfg.xiaomi={username:gv('mi-username'),password:gv('mi-password'),hardware:gv('mi-hardware'),device_did:gv('mi-did'),tts_reply:document.getElementById('mi-tts').checked,cookie_text:o.cookie_text||''};await saveCfg('xiaomi')}''',
-    '''async function saveXiaomi(){var o=cfg.xiaomi||{};var scope=miScopeCollect();if(!scope.ok){showAlert(document.getElementById('mi-scope-status')||document.getElementById('xiaomi-alert'),'err','✗ '+scope.msg);return false}var next={username:gv('mi-username'),password:gv('mi-password'),hardware:gv('mi-hardware'),tts_reply:document.getElementById('mi-tts').checked,cookie_text:o.cookie_text||''};next.device_scope=scope.mode;next.device_ids=(scope.mode==='all')?[]:scope.ids;next.device_id='';next.device_did='';cfg.xiaomi=next;var ok=await saveCfg('xiaomi');if(ok){miScopeReset();renderMiScope();}return ok}''',
+    '''async function saveXiaomi(){var o=cfg.xiaomi||{};var scope=miScopeCollect();if(!scope.ok){showAlert(document.getElementById('mi-scope-status')||document.getElementById('xiaomi-alert'),'err','✗ '+scope.msg);return false}var next={username:gv('mi-username'),password:gv('mi-password'),hardware:gv('mi-hardware'),tts_reply:document.getElementById('mi-tts').checked,cookie_text:o.cookie_text||''};next.device_scope=scope.mode;next.device_ids=(scope.mode==='all')?[]:scope.ids;next.device_id='';next.device_did='';cfg.xiaomi=next;var ok=await saveCfg('xiaomi');if(ok){miScopeReset();renderMiScope();}else{cfg.xiaomi=o;}return ok}''',
 )
 
 replace_exact(

@@ -5723,12 +5723,37 @@ replace_exact(
         targets.append(device)
     if targets:
         return targets
-    # 设备列表为空或全部不匹配：退回配置里的单台，保持旧行为。
+    if wanted:
+        # 显式白名单但当前没有匹配设备：什么都不轮询，绝不回退到未勾选的音箱。
+        # 回退会让「面板上选了什么」和「实际在听哪台」不一致。
+        return []
+    # 没有白名单时的旧行为：退回配置里的单台，再退回第一台。
     if single:
         return [{"deviceID": single, "hardware": mi_cfg.get("hardware", "")}]
     if devices and isinstance(devices[0], dict) and devices[0].get("deviceID"):
         return [devices[0]]
     return []
+
+
+_poll_scope_warned = ""
+
+
+def _warn_poll_scope_empty(mi_cfg: dict, devices: list) -> None:
+    '''Explain an empty poll scope once per distinct situation.'''
+    global _poll_scope_warned
+    wanted = mi_cfg.get("device_ids")
+    if isinstance(wanted, str):
+        wanted = [part.strip() for part in wanted.replace("，", ",").split(",") if part.strip()]
+    if isinstance(wanted, list) and wanted:
+        message = (
+            "监听范围设置了 %d 台音箱，但当前一台都没发现；等待设备上线（不会改听未选中的设备）"
+            % len(wanted)
+        )
+    else:
+        message = "还没有发现可轮询的小爱音箱设备"
+    if message != _poll_scope_warned:
+        _poll_scope_warned = message
+        log.warning("%s", message)
 
 
 async def bridge_loop():
@@ -5748,6 +5773,7 @@ replace_exact(
 """,
     """                targets = _poll_targets(mi_cfg, devices)
                 if not targets:
+                    _warn_poll_scope_empty(mi_cfg, devices)
                     await asyncio.sleep(poll_interval)
                     continue
                 # 多台小爱设备轮流轮询：每台各自一份 last_timestamp，谁说都听得到。

@@ -934,8 +934,8 @@ def scenario_poll_target_filtering(root: Path):
     assert ids({"device_ids": "a, b"}) == ["a", "b"], "a comma string must be accepted"
     assert ids({"device_did": "a"}) == ["a"], "device_did must still mean one device"
     assert ids({"device_did": "2"}) == ["b"], "device_did may also match the miot did"
-    assert ids({"device_ids": ["zz"]}) == ["a"], (
-        "an allow-list matching nothing must fall back to the first device, not poll nothing"
+    assert ids({"device_ids": ["zz"]}) == [], (
+        "an explicit allow-list matching nothing must poll nothing, never an unselected device"
     )
     assert targets({"device_did": "zz"}, []) == [
         {"deviceID": "zz", "hardware": ""}

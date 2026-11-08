@@ -49,6 +49,18 @@ WANTED_FUNCS = [
     "_token_snapshot",
     "_restore_token",
     "_apply_cookie_to_session",
+    "_poll_auth_cookies",
+    "_looks_like_schedule",
+    "_parse_schedule_command",
+    "_schedule_now",
+    "_parse_relative_offset",
+    "_cn_int",
+    "_parse_cn_clock",
+    "_apply_period",
+    "_parse_schedule_days_cn",
+    "_parse_once_date",
+    "_pick_schedule_device",
+    "_schedule_service_for",
     "_relogin_and_refresh",
     "_relogin_failure_from",
     "_relogin_retry_plan",
@@ -663,6 +675,139 @@ def scenario_runtime_refresh_recovers(root: Path):
     return "runtime 401 -> refresh -> polling resumes and command executes"
 
 
+def scenario_scheduled_rule_never_executes_now(root: Path):
+    for index, query in enumerate(("明天八点打开客厅灯", "十分钟后打开客厅灯",
+                                    "每天早上七点打开客厅灯", "每天二十五点打开客厅灯")):
+        harness = Harness(root / str(index))
+        harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                             "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                             "issued_at": int(time.time())})
+        targets = ["light.ceiling", "light.floor"]
+        harness.cfg["intent_rules"] = [{
+            "pattern": "(打开|开)(客厅灯|客厅的灯)",
+            "action": {"domain": "light", "service": "turn_on", "entity_id": targets,
+                       "brightness_pct": 35, "reply": "好的"}}]
+        harness.poll_script = [([{"time": 1_700_000_000_000,
+                                  "query": query, "answer": "好的"}], False)]
+        scheduled = []
+        async def capture(ha, domain, service, data, at, days, session):
+            scheduled.append((domain, service, dict(data), at, days))
+            return "xiaoai_bridge_test", True
+        async def stop(delay):
+            harness.bridge_state["running"] = False
+        harness.namespace["_create_ha_automation"] = capture
+        harness.namespace["asyncio"].sleep = stop
+        if index == 3:
+            harness.cfg["ai_mode"] = True
+            harness.cfg["openai"] = {"api_key": "synthetic-key"}
+            async def unsafe_ai(query):
+                return {"domain": "light", "service": "turn_on", "entity_id": "light.ceiling"}
+            harness.namespace["ai_parse_command"] = unsafe_ai
+        FakeHAClient.calls.clear()
+        harness.run()
+        assert not FakeHAClient.calls, (query, FakeHAClient.calls)
+        assert harness.bridge_state["error"] is None, harness.log.messages
+        if index == 3:
+            assert not scheduled, (query, scheduled)
+        else:
+            assert len(scheduled) == 1, (query, harness.log.messages)
+            assert scheduled[0][2]["entity_id"] == targets, scheduled
+            assert scheduled[0][2]["brightness_pct"] == 35, scheduled
+            assert scheduled[0][2]["once"] is (index < 2), scheduled
+    return "scheduled speech keeps time and rule parameters instead of executing now"
+
+
+def scenario_schedule_ai_fallback_keeps_time(root: Path):
+    harness = Harness(root)
+    harness.cfg["ai_mode"] = True
+    harness.cfg["openai"] = {"api_key": "synthetic-key"}
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": int(time.time())})
+    harness.poll_script = [([{"time": 1_700_000_000_000,
+                              "query": "每天七点打开书房灯"}], False)]
+    scheduled = []
+    async def empty_catalog(*args):
+        return []
+    async def safe_ai(query):
+        return {"domain": "light", "service": "turn_on", "entity_id": "light.study",
+                "type": "schedule", "schedule_time": "07:00", "schedule_days": "daily"}
+    async def capture(*args):
+        scheduled.append(args)
+        return "xiaoai_bridge_test", True
+    async def stop(delay):
+        harness.bridge_state["running"] = False
+    harness.namespace["_ha_device_catalog"] = empty_catalog
+    harness.namespace["ai_parse_command"] = safe_ai
+    harness.namespace["_create_ha_automation"] = capture
+    harness.namespace["asyncio"].sleep = stop
+    harness.run()
+    assert len(scheduled) == 1 and not FakeHAClient.calls, (scheduled, harness.log.messages)
+    return "valid AI schedule fallback remains available without permitting immediate actions"
+
+
+def scenario_renewal_updates_device_scope(root: Path):
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": 0})
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"})
+    discoveries = []
+    original = FakeMiNAService.device_list
+    async def discover(service):
+        devices = [{"deviceID": "speaker-1", "hardware": "L05C"}]
+        if discoveries:
+            devices.append({"deviceID": "speaker-2", "hardware": "L05C"})
+        discoveries.append(devices)
+        return devices
+    async def stop(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 4:
+            harness.bridge_state["running"] = False
+    FakeMiNAService.device_list = discover
+    harness.namespace["asyncio"].sleep = stop
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.device_list = original
+    assert "speaker-2" in harness.polled_devices, (discoveries, harness.polled_devices)
+    assert len(harness.bridge_state["devices"]) == 2, harness.bridge_state
+    return "newly discovered speakers join both polling and the displayed device cache"
+
+
+def scenario_unsaved_renewal_retries_persistence(root: Path):
+    harness = Harness(root)
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": 0})
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"})
+    persist = harness.namespace["_persist_sms_credentials"]
+    writes = []
+    clock = [time.time()]
+    observed = []
+    def flaky(creds):
+        if creds["serviceToken"] == "fresh-service-token" and not writes:
+            writes.append("failed")
+            raise OSError("disk full")
+        persist(creds)
+    async def advance(delay):
+        observed.append(harness.namespace["_poll_auth_cookies"]("speaker-1"))
+        clock[0] += 301
+        if len(observed) >= 3:
+            harness.bridge_state["running"] = False
+    harness.namespace["_persist_sms_credentials"] = flaky
+    harness.namespace["time"] = SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
+    harness.namespace["asyncio"].sleep = advance
+    harness.run()
+    assert len(harness.verified_calls) == 1, harness.verified_calls
+    assert observed[0]["serviceToken"] == "fresh-service-token", observed
+    assert "passToken" not in observed[0], observed
+    assert harness.read_token()["passToken"] == "pass-token-rotated", harness.read_token()
+    assert harness.bridge_state.get("renewal") is None, harness.bridge_state
+    return "a failed renewal write is retried after five minutes while polling uses the new token"
+
+
 def scenario_runtime_refresh_failure(root: Path):
     harness = Harness(root)
     # Startup succeeds from the cached token; only the runtime refresh fails.
@@ -1210,6 +1355,10 @@ def main():
         scenario_startup_refresh,
         scenario_qr_only_start,
         scenario_runtime_refresh_recovers,
+        scenario_scheduled_rule_never_executes_now,
+        scenario_schedule_ai_fallback_keeps_time,
+        scenario_renewal_updates_device_scope,
+        scenario_unsaved_renewal_retries_persistence,
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
         scenario_device_id_stays_stable,

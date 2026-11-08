@@ -59,6 +59,9 @@ WANTED_FUNCS = (
     "_refresh_interval_seconds",
     "_token_age_seconds",
     "_credential_fingerprint",
+    "_poll_auth_cookies",
+    "_get_cookie",
+    "_valid_saved_cookie_text",
 )
 WANTED_CLASSES = ("MicoapiLoginRejected", "CredentialIdentityMismatch")
 
@@ -181,6 +184,7 @@ def build_namespace(bridge_path: Path, root: Path, log: Log):
         "CONFIG_PATH": config_dir / "config.yaml",
         "LOG_PATH": root / "logs" / "bridge.log",
         "POLL_COOKIE_KEYS": ("userId", "serviceToken"),
+        "COOKIE_TEMPLATE": "deviceId={device_id}; serviceToken={service_token}; userId={user_id}",
         "RELOGIN_FATAL_CODES": {70001, 70002, 70016},
         "RELOGIN_FATAL_BACKOFF": 1800,
         "RELOGIN_FATAL_WAIT_SLICE": 60,
@@ -405,6 +409,42 @@ def scenario_persistence(reporter, make_ns):
     assert read_token(ns)["passToken"] == "pass-2", read_token(ns)
     reporter.ok("C2 a failed save is retried without another exchange")
 
+    # A real background retry occurs minutes/hours later, beyond request coalescing.
+    ns = make_ns()
+    write_credentials(ns)
+    reset_exchange()
+    Exchange.response = {"code": 0, "location": "https://sts.example/sts", "nonce": "1",
+                         "ssecurity": "s2", "userId": "user-1", "passToken": "pass-rotated"}
+    original = ns["_write_private_file"]
+    ns["_write_private_file"] = broken_write
+    account = FakeAccount("device-1")
+    first = asyncio.run(ns["_relogin_and_refresh"](account, {}))
+    assert first["ok"] and not first["saved"], first
+    ns["_refresh_cache"]["at"] -= 6 * 3600
+    cookies = ns["_poll_auth_cookies"]("speaker-1")
+    assert cookies == {"userId": "user-1", "serviceToken": "service-1", "deviceId": "speaker-1"}, cookies
+    ns["_write_private_file"] = original
+    Exchange.response = {"code": 70016, "description": "old passToken rejected"}
+    retried = asyncio.run(ns["_relogin_and_refresh"](account, {}))
+    assert retried["ok"] and retried["saved"], retried
+    assert len(Exchange.calls) == 1, Exchange.calls
+    assert read_token(ns)["passToken"] == "pass-rotated", read_token(ns)
+    reporter.ok("C4 delayed save retry retains rotated credentials and polling uses the memory token")
+
+    # New login must invalidate the unsaved token, even for the same Xiaomi user.
+    ns = make_ns()
+    write_credentials(ns)
+    reset_exchange()
+    Exchange.response = {"code": 0, "location": "https://sts.example/sts", "nonce": "1",
+                         "ssecurity": "s2", "userId": "user-1", "passToken": "background-pass"}
+    original = ns["_write_private_file"]
+    ns["_write_private_file"] = broken_write
+    asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
+    ns["_write_private_file"] = original
+    write_credentials(ns, pass_token="new-login-pass", service="new-login-service")
+    assert ns["_poll_auth_cookies"]("speaker-1")["serviceToken"] == "new-login-service"
+    reporter.ok("C5 a manual login supersedes the pending in-memory token")
+
     # the result dict distinguishes write failures from exchange failures
     ns = make_ns()
     write_credentials(ns)
@@ -453,9 +493,14 @@ def scenario_concurrency(reporter, make_ns):
 
     def response(index, user, pass_token):
         return {"code": 0, "location": "https://sts.example/sts", "nonce": "1",
-                "ssecurity": "s2", "userId": user, "passToken": "pass-%d" % index}
+                "ssecurity": "s2", "userId": user, "passToken": "pass-rotated-%d" % index}
 
     Exchange.response = response
+    transport = ns["_mi_service_login_verified"]
+    async def overlapping_transport(*args, **kwargs):
+        await asyncio.sleep(0)
+        return await transport(*args, **kwargs)
+    ns["_mi_service_login_verified"] = overlapping_transport
     account = FakeAccount("device-1")
 
     async def two_renewals():
@@ -484,8 +529,8 @@ def scenario_concurrency(reporter, make_ns):
 
     Exchange.response = relogin_during
     outcome = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
-    assert outcome["ok"] is True, outcome
-    assert outcome["saved"] is False, outcome
+    assert outcome["ok"] is False and outcome["stage"] == "superseded", outcome
+    assert outcome["saved"] is False and outcome["na"] is None, outcome
     assert read_token(ns)["passToken"] == "new-login-pass", read_token(ns)
     reporter.ok("E2 a user re-login during the exchange is not overwritten")
 
@@ -503,7 +548,7 @@ def scenario_concurrency(reporter, make_ns):
 
     Exchange.response = wipe_during
     outcome = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
-    assert outcome["ok"] is True and outcome["saved"] is False, outcome
+    assert outcome["ok"] is False and outcome["stage"] == "superseded", outcome
     assert not ns["TOKEN_PATH"].exists(), "a wiped login must not be resurrected"
     reporter.ok("E3 clearing the login during the exchange is not undone")
 

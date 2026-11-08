@@ -303,6 +303,13 @@ def _poll_auth_cookies(device_id: str) -> dict:
     conversation host, even when the user pasted a full browser cookie.
     '''
     saved = _get_cookie(load_config()) or {}
+    identity = _load_saved_xiaomi_identity()
+    pending_refresh = _unsaved_refresh((identity.get("userId"), identity.get("passToken")))
+    if pending_refresh is not None:
+        # A rotated token must be usable even while /data is temporarily unwritable.
+        pending = pending_refresh[1]
+        if pending.get("userId") and pending.get("serviceToken"):
+            saved = pending
     cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     cookies["deviceId"] = device_id
     return cookies
@@ -319,7 +326,7 @@ def _apply_cookie_to_session(session, cfg: dict) -> bool:
     A plain dict is used per domain on purpose: reusing one SimpleCookie across
     domains stores every cookie under the first host (see _poll_auth_cookies).
     '''
-    saved = _get_cookie(cfg) or {}
+    saved = _poll_auth_cookies("")
     cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     if not cookies:
         return False
@@ -373,13 +380,11 @@ def _recent_refresh(started: tuple):
 
 
 def _unsaved_refresh(started: tuple):
-    '''A renewal whose exchange succeeded but whose write failed.'''
+    '''Keep rotated credentials until saved or superseded, without a time limit.'''
     cached = _refresh_cache.get("outcome")
     if not cached or not cached.get("ok") or cached.get("saved"):
         return None
     if _refresh_cache.get("identity") != started:
-        return None
-    if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_COALESCE_SECONDS:
         return None
     return dict(cached), dict(_refresh_cache.get("pending") or {})
 
@@ -387,7 +392,10 @@ def _unsaved_refresh(started: tuple):
 def _remember_refresh(started: tuple, outcome: dict,
                       pending: dict | None = None) -> None:
     global _refresh_cache
-    _refresh_cache = {"identity": started, "at": time.monotonic(),
+    identity = started
+    if outcome.get("saved") and pending:
+        identity = (pending["userId"], pending["passToken"])
+    _refresh_cache = {"identity": identity, "at": time.monotonic(),
                       "outcome": dict(outcome), "pending": dict(pending or {})}
 
 
@@ -1403,7 +1411,8 @@ replace_exact(
                             bridge_state["renewal"] = None
                             # 401 恢复已经换过一次票：把续期计划往后推，
                             # 否则主动续期会紧接着再换一次同一份凭据。
-                            next_refresh_at = time.time() + refresh_interval
+                            next_refresh_at = time.time() + (
+                                refresh_interval if recovered.get("saved") else TOKEN_REFRESH_RETRY)
                             credential_mark = _credential_fingerprint()
                             log.info("Token 刷新成功，已恢复轮询")
                             await asyncio.sleep(poll_interval)
@@ -5379,7 +5388,8 @@ replace_exact(
 
     async with _refresh_lock_obj():
         # 另一个任务可能刚刚换完票：直接复用，别在成功后立刻再换一次。
-        cached = _recent_refresh(started)
+        current = _load_saved_xiaomi_identity()
+        cached = _recent_refresh((current.get("userId"), current.get("passToken")))
         if cached is not None:
             return cached
         # 上一次换票成功但写盘失败：只重试保存，不再向小米换一次票。
@@ -5391,6 +5401,10 @@ replace_exact(
                 _remember_refresh(started, retry_outcome, pending)
             return retry_outcome
 
+        # The lock may have been held across a user login or a previous rotation.
+        saved = _load_saved_xiaomi_identity()
+        if (saved.get("userId"), saved.get("passToken")) != started:
+            return _refresh_outcome(False, "superseded", message="登录凭据已变化，等待切换新登录态")
         snapshot = _token_snapshot(account)
         device_id = _login_device_id(saved, account)
         try:
@@ -5425,6 +5439,10 @@ replace_exact(
             "ssecurity": micoapi[0] if len(micoapi) > 1 else "",
             "serviceToken": micoapi[1] if len(micoapi) > 1 else "",
         }
+        current = _load_saved_xiaomi_identity()
+        if (current.get("userId"), current.get("passToken")) != started:
+            _restore_token(account, snapshot)
+            return _refresh_outcome(False, "superseded", message="登录凭据已变化，丢弃旧续期结果")
         saved_ok = _save_refreshed_credentials(account, started, pending)
         _last_refresh_failure = {}
         outcome = _refresh_outcome(
@@ -5592,6 +5610,10 @@ replace_exact(
                 if _credential_fingerprint() != credential_mark:
                     credential_mark = _credential_fingerprint()
                     next_refresh_at = 0.0
+                    identity = _load_saved_xiaomi_identity()
+                    if str((getattr(account, "token", None) or {}).get("userId") or "") != str(identity.get("userId") or ""):
+                        devices = []
+                        bridge_state["devices"] = []
                     log.info("检测到登录凭据变化，立即切换到新的登录态")
 
                 if time.time() >= next_refresh_at:
@@ -5602,14 +5624,16 @@ replace_exact(
                     if outcome.get("ok"):
                         if outcome.get("na") is not None:
                             na = outcome["na"]
-                        if not devices and outcome.get("devices"):
+                        if outcome.get("devices"):
                             devices = outcome["devices"]
+                            bridge_state["devices"] = devices
                         _apply_cookie_to_session(_bridge_session, cfg)
                         credential_mark = _credential_fingerprint()
                         if outcome.get("saved"):
                             bridge_state["renewal"] = None
                             log.info("登录态续期成功，已保存新的 serviceToken")
                         else:
+                            next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
                             # 换票成功但没写进 /data：本次运行可用，重启后仍用旧票。
                             bridge_state["renewal"] = (
                                 "已换取新 Token，但未能写入 /data（重启后可能需要重新登录）"
@@ -5822,16 +5846,28 @@ replace_exact(
     r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
 """,
     r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
-                    if not action:
-                        # 语音定时任务：正则规则没命中时，用内置中文解析兜底，
-                        # 解析不出就明确写日志，不能让用户以为任务建好了。
-                        try:
-                            _catalog = await _ha_device_catalog(ha, _bridge_session)
-                        except Exception:
-                            _catalog = []
-                        action = _parse_schedule_command(
-                            query, _catalog, bridge_state.get("device_aliases") or {}
+                    if _looks_like_schedule(query) and not (
+                            action and (action.get("type") == "schedule" or action.get("delay_minutes"))):
+                        # Existing instant rules still resolve the action, but must
+                        # not discard a date/relative time and execute immediately.
+                        _rule_action = action
+                        if _rule_action and _rule_action.get("entity_id"):
+                            _catalog = [{"name": query, "entity_id": _rule_action["entity_id"],
+                                         "domain": _rule_action.get("domain", "")}]
+                        else:
+                            try:
+                                _catalog = await _ha_device_catalog(ha, _bridge_session)
+                            except Exception:
+                                _catalog = []
+                        _scheduled = _parse_schedule_command(
+                            query, _catalog, load_config().get("device_aliases") or {}
                         )
+                        action = _scheduled
+                        if _scheduled and _rule_action:
+                            action = dict(_rule_action)
+                            for _key in ("type", "schedule_time", "schedule_days", "once", "once_date"):
+                                if _key in _scheduled:
+                                    action[_key] = _scheduled[_key]
                         if action:
                             log.info("🕐 识别为定时任务: %s → 每天/指定星期 %s %s %s",
                                      query, action.get("schedule_time"),
@@ -5840,6 +5876,19 @@ replace_exact(
                             log.warning("⏱ 这句话像定时任务，但没能解析出时间/星期/设备: %s"
                                         "（设备名需与 HA 中的名称一致，或用面板创建）", query)
 """,
+)
+
+replace_exact(
+    "an unparsed schedule cannot fall through to an immediate AI action",
+    '''                        if ai_result:
+                            action = ai_result''',
+    '''                        if ai_result and _looks_like_schedule(query) and not (
+                                (ai_result.get("type") == "schedule" and ai_result.get("schedule_time"))
+                                or ai_result.get("delay_minutes")):
+                            log.warning("定时指令的 AI 结果缺少时间，拒绝立即执行: %s", query)
+                            ai_result = None
+                        if ai_result:
+                            action = ai_result''',
 )
 
 replace_exact(
@@ -5896,7 +5945,7 @@ def _automation_outcome(automation_id: str, status: str, ok: bool) -> None:
 
 
 def _automation_stable_id(at_time: str, weekdays, entity_id: str,
-                          domain: str, service: str, once_date=None) -> str:
+                          domain: str, service: str, once_date=None, data=None) -> str:
     '''Deterministic config id: repeating the same request cannot duplicate it.'''
     parts = [at_time.replace(":", ""), "-".join(weekdays or ["daily"]),
              entity_id or "none", domain, service]
@@ -5904,7 +5953,17 @@ def _automation_stable_id(at_time: str, weekdays, entity_id: str,
         # Same time/device on a different day is a different one-shot task.
         parts.insert(0, str(once_date).replace("-", ""))
     slug = re.sub(r"[^a-z0-9]+", "_", "_".join(parts).lower()).strip("_")
-    return (_AUTOMATION_PREFIX + slug)[:60]
+    candidate = _AUTOMATION_PREFIX + slug
+    # Preserve existing short, parameter-free ids. Long targets and parameterised
+    # actions keep a digest of the *whole* request, including fields beyond 60 chars.
+    if len(candidate) <= 60 and not data:
+        return candidate
+    import hashlib
+    canonical = json.dumps([at_time, weekdays or [], entity_id, domain, service,
+                            once_date or "", data or {}],
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return candidate[:35] + "_" + digest
 
 
 async def _automation_exists(ha, automation_id: str, session):
@@ -6249,15 +6308,15 @@ async def _create_ha_automation(
         once_at = when.strftime("%Y-%m-%d %H:%M")
     entity_id = str(data.get("entity_id") or "")
     weekdays = [] if once else _normalize_schedule_weekdays(schedule_days)
+    extra = {k: v for k, v in data.items() if k not in _SCHEDULE_INTERNAL_KEYS}
     if not automation_id:
         automation_id = _automation_stable_id(at_time, weekdays, entity_id,
                                               domain, service,
-                                              once_date if once else None)
+                                              once_date if once else None, data=extra)
 
     action_item = {"service": "%s.%s" % (domain, service)}
     if entity_id:
         action_item["target"] = {"entity_id": entity_id}
-    extra = {k: v for k, v in data.items() if k not in _SCHEDULE_INTERNAL_KEYS}
     if extra:
         action_item["data"] = extra
     label = "%s %s" % (at_time[:5], entity_id or domain)
@@ -6294,14 +6353,16 @@ async def _create_ha_automation(
 
     ok = await ha.create_automation(automation_id, config, session)
     if ok:
+        # Record accepted storage before reload: a reload failure is precisely
+        # when HA states cannot supply this row (or the edited metadata).
+        _schedule_registry_add(automation_id, at_time, weekdays, entity_id,
+                               domain, service, source, once,
+                               once_at=once_at, data=extra)
         ok = await ha.reload_automations(session)
     if not ok:
         _automation_outcome(automation_id, "failed", False)
         return automation_id, False
 
-    _schedule_registry_add(automation_id, at_time, weekdays, entity_id,
-                           domain, service, source, once,
-                           once_at=once_at, data=extra)
     verified = await _automation_exists(ha, automation_id, session)
     if verified is True:
         _automation_outcome(automation_id, "verified", True)
@@ -6579,12 +6640,12 @@ async def _schedule_automation_entity(ha, automation_id, session):
 
 
 _SCHEDULE_AREAS_TEMPLATE = (
-    "{% set out = [] %}"
+    "{% set ns = namespace(out=[]) %}"
     "{% for area in areas() %}"
-    "{% set out = out + [{'id': area, 'name': area_name(area), "
+    "{% set ns.out = ns.out + [{'id': area, 'name': area_name(area), "
     "'entities': area_entities(area)}] %}"
     "{% endfor %}"
-    "{{ out | tojson }}"
+    "{{ ns.out | tojson }}"
 )
 
 

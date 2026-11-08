@@ -212,9 +212,9 @@ def scenario_parsing(reporter, ns):
                    action is not None and action["once"] is True, action)
     if action:
         reporter.eq("十分钟后 is stored as a one-shot rule", action["schedule_days"], "once")
-        reporter.check("十分钟后 keeps today's date",
-                       action.get("once_date") in (before.strftime("%Y-%m-%d"),
-                                                   after.strftime("%Y-%m-%d")),
+        reporter.check("十分钟后 records the target date, including midnight rollover",
+                       action.get("once_date") in ((before + _td2(minutes=10)).strftime("%Y-%m-%d"),
+                                                   (after + _td2(minutes=10)).strftime("%Y-%m-%d")),
                        action.get("once_date"))
         expected_low = (before + _td2(minutes=10)).strftime("%H:%M")
         expected_high = (after + _td2(minutes=10)).strftime("%H:%M")
@@ -253,6 +253,55 @@ def scenario_stable_ids(reporter, ns):
     reporter.check("a different time gets a different id", first != other, (first, other))
     reporter.check("ids carry the bridge prefix", first.startswith("xiaoai_bridge_"), first)
     reporter.check("ids are slugged", all(ch.isalnum() or ch == "_" for ch in first), first)
+
+
+def scenario_request_identity(reporter, ns):
+    async def run():
+        ha = FakeHA()
+        entity = "switch.xiaomi_cn_1234567890_switch_1"
+        on, on_ok = await ns["_create_ha_automation"](
+            ha, "switch", "turn_on", {"entity_id": entity}, "08:00", "daily")
+        off, off_ok = await ns["_create_ha_automation"](
+            ha, "switch", "turn_off", {"entity_id": entity}, "08:00", "daily")
+        reporter.check("long entity ids preserve opposite services", on != off and on_ok and off_ok, (on, off))
+        reporter.eq("both opposite actions are written", len(ha.created), 2)
+        other, _ = await ns["_create_ha_automation"](
+            ha, "switch", "turn_on", {"entity_id": entity + "_other"}, "08:00", "daily")
+        reporter.check("long entities sharing a prefix stay distinct", other != on, (other, on))
+        reporter.check("hashed ids obey the length limit", all(len(x) <= 60 for x in (on, off, other)))
+        param_ha = FakeHA()
+        heat, _ = await ns["_create_ha_automation"](
+            param_ha, "select", "select_option", {"entity_id": "select.mode", "option": "Heat"}, "09:00", "daily")
+        cool, _ = await ns["_create_ha_automation"](
+            param_ha, "select", "select_option", {"entity_id": "select.mode", "option": "Cool"}, "09:00", "daily")
+        repeated, ok = await ns["_create_ha_automation"](
+            param_ha, "select", "select_option", {"option": "Cool", "entity_id": "select.mode"}, "09:00", "daily")
+        reporter.check("service parameters participate in identity", heat != cool, (heat, cool))
+        reporter.eq("identical requests with reordered keys are idempotent", repeated, cool)
+        reporter.check("the repeated parameterised request succeeds", ok)
+        reporter.eq("two distinct parameter sets produce exactly two writes", len(param_ha.created), 2)
+    asyncio.run(run())
+
+
+def scenario_reload_registry(reporter, ns):
+    ha = FakeHA()
+    ha.reload_ok = False
+    ha.create_automation = _drop_after_create(ha)
+    async def run():
+        aid, ok = await ns["_create_ha_automation"](
+            ha, "switch", "turn_on", {"entity_id": "switch.unloaded"}, "10:00", "daily", source="form")
+        reporter.check("reload failure is not reported as loaded", not ok)
+        row = next(item for item in ns["_schedule_listing"]([]) if item["config_id"] == aid)
+        reporter.eq("accepted but unloaded config remains visible", row["status"], "not_loaded")
+        reporter.eq("the visible row retains form provenance", row["source"], "form")
+        await ns["_create_ha_automation"](
+            ha, "switch", "turn_off", {"entity_id": "switch.unloaded"}, "11:00", "daily",
+            source="form", replace=True, automation_id=aid)
+        row = next(item for item in ns["_schedule_listing"]([]) if item["config_id"] == aid)
+        reporter.eq("an edit persists its new time even if reload fails", row["time"], "11:00:00")
+        reporter.eq("an edit persists its new service even if reload fails", row["service"], "turn_off")
+        reporter.eq("editing does not add another row", len([x for x in ns["_schedule_registry_read"]() if x["id"] == aid]), 1)
+    asyncio.run(run())
 
 
 def scenario_creation(reporter, ns):
@@ -502,6 +551,8 @@ def main():
     for name, scenario in (("chinese parsing", scenario_parsing),
                            ("merged listing", scenario_listing),
                            ("stable ids", scenario_stable_ids),
+                           ("complete request identity", scenario_request_identity),
+                           ("registry survives reload failure", scenario_reload_registry),
                            ("verified creation", scenario_creation),
                            ("weekday conditions", scenario_weekdays)):
         scenario(reporter, ns)

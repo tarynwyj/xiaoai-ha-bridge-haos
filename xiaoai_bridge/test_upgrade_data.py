@@ -153,6 +153,8 @@ BASE_FUNCTIONS = (
 )
 # Only 1.0.10 has these (the access-control / credential-hardening release).
 NEW_ONLY_FUNCTIONS = (
+    "_poll_auth_cookies",
+    "_looks_like_schedule",
     "_read_saved_credential",
     "_token_snapshot",
     "_restore_token",
@@ -194,6 +196,7 @@ WANTED_CLASSES = ("MicoapiLoginRejected", "CredentialIdentityMismatch")
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the
 # import-time side effect that creates /data/config/.access_token in 1.0.10.
 NEEDED_ASSIGNMENTS = (
+    "_SCHEDULE_HINTS",
     "AUTH_TOKEN_PATH",
     "MASKED_VALUE",
     "RELOGIN_BACKOFF_START",

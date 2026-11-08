@@ -97,6 +97,7 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
     names = (
         "_valid_saved_cookie_text",
         "_get_cookie",
+        "_load_saved_xiaomi_identity",
         "_poll_auth_cookies",
         "_apply_cookie_to_session",
         "_get_latest_ask_from_xiaoai",
@@ -568,7 +569,7 @@ def scenario_source_contract():
     check("raise MicoapiLoginRejected(code, description)" in built,
           "a rejected exchange must carry its Xiaomi code to the loop")
     # 401 恢复已经换过一次票，必须把续期计划往后推；两处都要有这行，缺一处就会连着换票。
-    check(built.count("next_refresh_at = time.time() + refresh_interval") >= 2,
+    check("refresh_interval if recovered.get(\"saved\") else TOKEN_REFRESH_RETRY" in built,
           "401 recovery must re-arm the proactive renewal clock, not just the scheduler")
     check('bridge_state["renewal"]' in built,
           "a failed renewal must be visible without declaring the session expired")

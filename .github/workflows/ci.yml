@@ -202,6 +202,9 @@ jobs:
       - name: Rules page in a real browser (Playwright + Chromium)
         run: python xiaoai_bridge/test_rules_browser.py --html /tmp/app/web/index.html
 
+      - name: Render the shipped rooms template with sandboxed Jinja
+        run: python xiaoai_bridge/test_schedule_template.py /tmp/app/bridge.py
+
       - name: Listening scope in a real browser (Playwright + Chromium)
         run: python xiaoai_bridge/test_scope_browser.py --html /tmp/app/web/index.html
 

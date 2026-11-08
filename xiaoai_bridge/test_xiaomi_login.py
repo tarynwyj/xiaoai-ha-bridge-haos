@@ -2143,6 +2143,12 @@ def scenario_cookie_login():
             check(token.get("micoapi") == ["", "svc-fallback"],
                   f"the pasted token may only be the fallback, got {token.get('micoapi')}")
             check("兜底" in h3.log.joined(), "the fallback must be visible in the log")
+            # The saved passToken was never accepted: saying so at login time is the
+            # only chance to warn before the browser token expires days later.
+            check("未经校验" in h3.log.joined(),
+                  "a fallback login must warn that the saved passToken was never accepted")
+            check("passToken 换票被小米拒绝" in str(data.get("msg", "")),
+                  f"the success message must carry that warning too, got {data.get('msg')!r}")
         finally:
             CURRENT["cookie_login"] = "ok"
             h3.cleanup()

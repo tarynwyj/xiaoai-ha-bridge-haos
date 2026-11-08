@@ -99,6 +99,10 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         "_poll_auth_cookies",
         "_apply_cookie_to_session",
         "_get_latest_ask_from_xiaoai",
+        "_relogin_failure_from",
+        "_relogin_retry_plan",
+        "_credential_fingerprint",
+        "_wait_for_relogin",
     )
     namespace = {
         "TOKEN_PATH": token_path,
@@ -110,6 +114,8 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         ),
         "json": json,
         "log": log,
+        "asyncio": asyncio,
+        "bridge_state": {"running": True},
         "load_config": lambda: cfg,
         "aiohttp": SimpleNamespace(
             ClientTimeout=lambda **kwargs: ("timeout", kwargs),
@@ -412,13 +418,101 @@ def scenario_redirect_would_leak_without_the_flag(root):
     return "negative control: without allow_redirects=False the cookies do leak"
 
 
+def scenario_rejected_pass_token_is_terminal(root):
+    """A rejected passToken (70016) must end as "log in again", not an endless retry.
+
+    Reported on a 101-hour-old install: the server session expired, Xiaomi answered
+    ``code=70016 登录验证失败`` to every ``serviceLogin?sid=micoapi`` exchange, and the
+    panel kept saying "正在自动重试（当前间隔 300s）" forever. Retrying cannot succeed,
+    so the loop must say so and give the user the one action that works.
+    """
+    cfg = make_data(root)
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    failure_of = namespace["_relogin_failure_from"]
+    plan = namespace["_relogin_retry_plan"]
+
+    class Rejected(RuntimeError):
+        def __init__(self, code):
+            super().__init__("micoapi 登录失败 (code=%s): 登录验证失败" % code)
+            self.xiaomi_code = code
+
+    rejected = failure_of(Rejected(70016))
+    check(rejected.get("code") == 70016 and rejected.get("fatal") is True,
+          f"70016 must be a terminal rejection, got {rejected}")
+    fatal, wait_seconds, message = plan(rejected, 10)
+    check(fatal is True, "a terminal rejection must not be treated as retryable")
+    check(wait_seconds == namespace["RELOGIN_FATAL_BACKOFF"],
+          f"a terminal rejection must wait the long window, got {wait_seconds}")
+    check("70016" in message and "重新扫码" in message,
+          f"the panel must show the code and the fix, got {message!r}")
+    check("正在自动重试" not in message,
+          f"a terminal rejection must not claim it is retrying, got {message!r}")
+    check(plan(rejected, 300)[1] == namespace["RELOGIN_FATAL_BACKOFF"],
+          "the terminal window must not depend on the retry counter")
+
+    transient = failure_of(RuntimeError("小米 STS 未返回 micoapi serviceToken"))
+    fatal, wait_seconds, message = plan(transient, 40)
+    check(fatal is False and wait_seconds == 40,
+          f"a transient failure must keep backing off, got {(fatal, wait_seconds)}")
+    check("当前间隔 40s" in message,
+          f"the retry message must keep its wording, got {message!r}")
+
+    fatal, _, message = plan({"code": None, "message": "no creds", "fatal": True}, 10)
+    check(fatal is True and "重新扫码" in message,
+          f"missing credentials must also ask for a new login, got {message!r}")
+    return "a rejected passToken (70016) becomes 'log in again' instead of an endless retry"
+
+
+def scenario_new_login_wakes_the_terminal_wait(root):
+    """The terminal wait must notice a fresh login instead of sleeping the whole window."""
+    cfg = make_data(root)
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    namespace["RELOGIN_FATAL_WAIT_SLICE"] = 0.05
+    namespace["bridge_state"] = {"running": True}
+    token_path = root / "config" / ".mi.token"
+    fingerprint = namespace["_credential_fingerprint"]
+    before = fingerprint()
+
+    async def run():
+        task = asyncio.create_task(namespace["_wait_for_relogin"](30, True))
+        await asyncio.sleep(0.12)
+        token_path.write_text(
+            json.dumps({"userId": "u2", "passToken": "p2", "deviceId": "d2"}),
+            encoding="utf-8",
+        )
+        await asyncio.wait_for(task, timeout=10)
+        return fingerprint()
+
+    after = asyncio.run(run())
+    check(after != before, "rewriting .mi.token must change the credential fingerprint")
+    check(log.has("检测到新的登录凭据"),
+          f"a fresh login must be noticed, log={log.messages}")
+
+    # A stopped bridge must not keep sleeping: the wait ends with the loop.
+    namespace["bridge_state"] = {"running": False}
+
+    async def stopped():
+        await asyncio.wait_for(namespace["_wait_for_relogin"](30, True), timeout=10)
+
+    asyncio.run(stopped())
+    return "a new login (or a stopped bridge) ends the terminal wait immediately"
+
+
 def scenario_source_contract():
     check("cookies = _poll_auth_cookies(device_id)" in built,
           "the poll request must build its cookies through _poll_auth_cookies()")
     check('cookies = {"deviceId": device_id}' not in built,
           "the old deviceId-only cookie mapping must be gone")
     check("allow_redirects=False" in built, "the poll request must disable redirects")
-    return "built bridge.py uses _poll_auth_cookies() and disables redirects"
+    check("_relogin_retry_plan(" in built,
+          "the poll loop must decide retry vs re-login through _relogin_retry_plan()")
+    check('bridge_state["error"] = "小米登录已过期' not in built,
+          "the loop must not set the retry banner unconditionally")
+    check("raise MicoapiLoginRejected(code, description)" in built,
+          "a rejected exchange must carry its Xiaomi code to the loop")
+    return "built bridge.py classifies a rejected exchange and disables redirects"
 
 
 def main():
@@ -433,6 +527,8 @@ def main():
         scenario_redirect_does_not_leak,
         scenario_jar_least_privilege,
         scenario_login_and_refresh_still_get_pass_token,
+        scenario_rejected_pass_token_is_terminal,
+        scenario_new_login_wakes_the_terminal_wait,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -48,6 +48,10 @@ WANTED_FUNCS = [
     "_restore_token",
     "_apply_cookie_to_session",
     "_relogin_and_refresh",
+    "_relogin_failure_from",
+    "_relogin_retry_plan",
+    "_credential_fingerprint",
+    "_wait_for_relogin",
     "_read_saved_credential",
     "_save_auth_and_token",
     "_merge_xiaomi_credentials",
@@ -62,6 +66,15 @@ for node in tree.body:
         nodes[node.name] = node
 missing = [name for name in WANTED_FUNCS if name not in nodes]
 assert not missing, f"patched bridge.py is missing expected functions: {missing}"
+
+rejected_class = next(
+    (node for node in tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "MicoapiLoginRejected"),
+    None,
+)
+assert rejected_class is not None, (
+    "patched bridge.py must classify a rejected exchange with MicoapiLoginRejected"
+)
 
 # FastAPI decorators cannot be evaluated here; keep the plain function bodies.
 for name in ("post_config", "bridge_loop"):
@@ -123,6 +136,7 @@ class FakeAccount:
 
     instances = []
     reject_service_login = False
+    transport_error = False
 
     def __init__(self, session, username, password, token_store=None):
         assert token_store is None, "MiService must never own the saved token file"
@@ -358,6 +372,8 @@ class Harness:
                                          user_agent=""):
             # Simulate the TLS-verified transport, not the pinned library's
             # _serviceLogin implementation (which explicitly disables TLS).
+            if FakeAccount.transport_error:
+                raise RuntimeError("访问小米账号服务失败（网络错误）")
             if FakeAccount.reject_service_login:
                 return {"code": 70016, "description": "passToken 已失效"}
             return {
@@ -372,6 +388,7 @@ class Harness:
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
             "_delayed_tasks": set(),
+            "_last_refresh_failure": {},
             "clear_xiaomi_login": clear_synthetic_login,
             "_otp_password_login": fake_otp_password_login,
             "_reset_otp_state": reset_otp_login,
@@ -429,6 +446,10 @@ class Harness:
         )
         exec(
             compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        exec(
+            compile(ast.Module(body=[rejected_class], type_ignores=[]), str(source_path), "exec"),
             namespace,
         )
         for name in WANTED_FUNCS:
@@ -597,7 +618,8 @@ def scenario_runtime_refresh_failure(root: Path):
     token_before = harness.read_token()
     auth_before = json.loads(harness.auth_path.read_text(encoding="utf-8"))
     harness.poll_script = [([], True), ([], True), ([], True)]
-    FakeAccount.reject_service_login = True
+    # A network failure is transient: it must keep the exponential backoff.
+    FakeAccount.transport_error = True
 
     # The loop would retry forever; stop it after the second backoff sleep.
     async def bounded_sleep(delay):
@@ -609,7 +631,7 @@ def scenario_runtime_refresh_failure(root: Path):
     try:
         harness.run()
     finally:
-        FakeAccount.reject_service_login = False
+        FakeAccount.transport_error = False
 
     assert token_before == harness.read_token(), "failed refresh must not rewrite .mi.token"
     assert auth_before == json.loads(harness.auth_path.read_text(encoding="utf-8")), (
@@ -619,7 +641,51 @@ def scenario_runtime_refresh_failure(root: Path):
     backoffs = [delay for delay in harness.sleeps if delay >= 10]
     assert backoffs[:2] == [10, 20], f"expected exponential backoff, got {harness.sleeps}"
     assert harness.bridge_state["error"], "a persistent failure must be surfaced"
-    return "runtime 401 -> refresh fails -> backoff, credentials untouched"
+    return "runtime 401 -> transient refresh failure -> exponential backoff"
+
+
+def scenario_runtime_refresh_rejected(root: Path):
+    """A rejected passToken must not be retried on the 5-minute ladder forever."""
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    token_before = harness.read_token()
+    harness.poll_script = [([], True), ([], True), ([], True)]
+    FakeAccount.reject_service_login = True
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    assert token_before == harness.read_token(), "a rejected refresh must not rewrite .mi.token"
+    message = harness.bridge_state["error"] or ""
+    assert "70016" in message, f"the panel must show the Xiaomi code, got {message!r}"
+    assert "重新扫码" in message, f"the panel must name the fix, got {message!r}"
+    assert "正在自动重试" not in message, (
+        f"a rejected passToken must not claim it is retrying, got {message!r}"
+    )
+    backoffs = [delay for delay in harness.sleeps if delay >= 10]
+    assert 10 not in backoffs and 20 not in backoffs, (
+        f"a rejected passToken must not use the retry ladder, got {harness.sleeps}"
+    )
+    assert backoffs, f"the loop must still wait before the next attempt, got {harness.sleeps}"
+    return "runtime 401 -> rejected passToken -> 'log in again', no retry ladder"
 
 
 def scenario_save_credentials_never_blank(root: Path):
@@ -804,6 +870,7 @@ def main():
         scenario_qr_only_start,
         scenario_runtime_refresh_recovers,
         scenario_runtime_refresh_failure,
+        scenario_runtime_refresh_rejected,
         scenario_save_credentials_never_blank,
         scenario_post_config_credentials,
         scenario_background_otp_must_not_count_as_login,

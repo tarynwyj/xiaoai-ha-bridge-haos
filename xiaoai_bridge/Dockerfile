@@ -47,6 +47,10 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _refresh_micoapi_token' /app/bridge.py \
     && grep -Fq 'micoapi serviceToken 已保存' /app/bridge.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
+    && grep -Fq 'class MicoapiLoginRejected' /app/bridge.py \
+    && grep -Fq 'async def _relogin_retry_plan' /app/bridge.py \
+    && grep -Fq '_wait_for_relogin(wait_seconds, fatal)' /app/bridge.py \
+    && ! grep -Fq 'await asyncio.sleep(relogin_backoff)' /app/bridge.py \
     && grep -Fq 'async def _enforce_access_control' /app/bridge.py \
     && grep -Fq 'async def reveal_direct_token' /app/bridge.py \
     && grep -Fq 'async def xiaomi_otp_start' /app/bridge.py \

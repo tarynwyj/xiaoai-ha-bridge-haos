@@ -4992,6 +4992,241 @@ replace_exact(
     return {"ok": True, "reloaded": True}''',
 )
 
+# ──────────────── G: 换票被小米拒绝时不再无限重试 ────────────────
+# 现象：小米服务端会话（serviceToken）到期后，轮询收到 401，桥接器用保存的 passToken
+# 换票；若小米直接拒绝这个 passToken（code=70016「登录验证失败」等），换票永远不可能
+# 成功，但旧实现仍按 10→20→…→300s 无限重试，面板只显示「正在自动重试」，用户看不出
+# 这是需要重新登录的终态。本段把「凭据被拒绝」与「网络/STS 抖动」分开。
+replace_exact(
+    "a rejected credential exchange carries its Xiaomi code",
+    """    if resp.get("code") != 0:
+        code = resp.get("code", "unknown")
+        description = resp.get("description") or resp.get("desc") or "登录验证失败"
+        raise RuntimeError(f"micoapi 登录失败 (code={code}): {description}")
+""",
+    """    if resp.get("code") != 0:
+        raw_code = resp.get("code", "unknown")
+        try:
+            code = int(raw_code)
+        except (TypeError, ValueError):
+            code = raw_code
+        description = resp.get("description") or resp.get("desc") or "登录验证失败"
+        raise MicoapiLoginRejected(code, description)
+""",
+)
+
+replace_exact(
+    "retry decision helpers for a failed credential refresh",
+    """def _token_snapshot(account) -> dict:
+""",
+    """class MicoapiLoginRejected(RuntimeError):
+    \"\"\"Xiaomi answered serviceLogin with a non-zero code (credentials rejected).\"\"\"
+
+    def __init__(self, code, description: str):
+        super().__init__("micoapi 登录失败 (code=%s): %s" % (code, description))
+        self.xiaomi_code = code
+
+
+# 小米账号服务对「这个 passToken 不被接受」给出的错误码。这类失败重试多少次都是同一个
+# 结果，只会把「401 → 换票 → 401」拖成每 5 分钟一次的噪声，因此必须与网络抖动、STS
+# 抖动分开：前者直接给出「需要重新登录」的结论。
+RELOGIN_FATAL_CODES = {70001, 70002, 70016}
+# 致命失败的等待窗口：足够用户看到面板提示并重新扫码，又不至于永不再试（风控解除后
+# 同一份凭据仍可能恢复）。窗口内按片检查凭据文件，用户重新登录后立即重试。
+RELOGIN_FATAL_BACKOFF = 1800
+RELOGIN_FATAL_WAIT_SLICE = 60
+
+# 最近一次换票失败的原因，供轮询循环决定「重试」还是「要求重新登录」。
+_last_refresh_failure: dict = {}
+
+
+def _relogin_failure_from(exc: BaseException) -> dict:
+    \"\"\"Turn a failed exchange into a retry decision: {code, message, fatal}.\"\"\"
+    code = getattr(exc, "xiaomi_code", None)
+    return {
+        "code": code,
+        "message": str(exc) or type(exc).__name__,
+        "fatal": code in RELOGIN_FATAL_CODES,
+    }
+
+
+def _relogin_retry_plan(failure: dict | None, backoff: int) -> tuple:
+    \"\"\"(fatal, wait_seconds, panel_message) for one failed credential refresh.\"\"\"
+    failure = failure or {}
+    code = failure.get("code")
+    if failure.get("fatal"):
+        if code is None:
+            return (
+                True, RELOGIN_FATAL_BACKOFF,
+                "小米登录凭据缺失或已失效：无法自动换取 Token，"
+                "请到「小米账号」页重新扫码登录",
+            )
+        return (
+            True, RELOGIN_FATAL_BACKOFF,
+            "小米登录凭据已失效（code=%s）：自动换票被小米拒绝，重试不会恢复，"
+            "请到「小米账号」页重新扫码登录" % code,
+        )
+    return (
+        False, backoff,
+        "小米登录已过期，正在自动重试（当前间隔 %ss）" % backoff,
+    )
+
+
+def _credential_fingerprint() -> tuple:
+    \"\"\"Identity of the saved credential files; changes when the user logs in again.\"\"\"
+    fingerprint = []
+    for saved_path in (TOKEN_PATH, AUTH_PATH):
+        try:
+            info = saved_path.stat()
+        except OSError:
+            fingerprint.append(None)
+            continue
+        fingerprint.append((info.st_mtime_ns, info.st_size))
+    return tuple(fingerprint)
+
+
+async def _wait_for_relogin(seconds: int, watch_credentials: bool) -> None:
+    \"\"\"Sleep before the next refresh; stop early when a new login was just saved.\"\"\"
+    if not watch_credentials:
+        await asyncio.sleep(seconds)
+        return
+    before = _credential_fingerprint()
+    waited = 0
+    while bridge_state["running"] and waited < seconds:
+        slice_seconds = min(RELOGIN_FATAL_WAIT_SLICE, seconds - waited)
+        await asyncio.sleep(slice_seconds)
+        waited += slice_seconds
+        if _credential_fingerprint() != before:
+            log.info("检测到新的登录凭据，立即重试换取 Token")
+            return
+
+
+def _token_snapshot(account) -> dict:
+""",
+)
+
+replace_exact(
+    "record why a credential refresh failed",
+    """    saved = _load_saved_xiaomi_identity()
+    if not saved:
+        log.warning("没有可用的扫码或 Cookie 凭据，无法自动刷新 Token")
+        return None
+
+    snapshot = _token_snapshot(account)
+    try:
+        await _refresh_micoapi_token(
+            account,
+            saved["userId"],
+            saved["passToken"],
+            saved.get("deviceId") or get_random(16).upper(),
+        )
+        na = MiNAService(account)
+        devices = await na.device_list()
+        if not devices:
+            raise RuntimeError("设备列表为空")
+    except Exception as e:
+        log.warning("Token 刷新失败: %s", e)
+        _restore_token(account, snapshot)
+        return None
+
+    _save_auth_and_token(account)
+    return na, devices
+""",
+    """    global _last_refresh_failure
+    saved = _load_saved_xiaomi_identity()
+    if not saved:
+        log.warning("没有可用的扫码或 Cookie 凭据，无法自动刷新 Token")
+        _last_refresh_failure = {"code": None,
+                                 "message": "没有可用的扫码或 Cookie 凭据",
+                                 "fatal": True}
+        return None
+
+    snapshot = _token_snapshot(account)
+    try:
+        await _refresh_micoapi_token(
+            account,
+            saved["userId"],
+            saved["passToken"],
+            saved.get("deviceId") or get_random(16).upper(),
+        )
+        na = MiNAService(account)
+        devices = await na.device_list()
+        if not devices:
+            raise RuntimeError("设备列表为空")
+    except Exception as e:
+        log.warning("Token 刷新失败: %s", e)
+        _last_refresh_failure = _relogin_failure_from(e)
+        _restore_token(account, snapshot)
+        return None
+
+    _last_refresh_failure = {}
+    _save_auth_and_token(account)
+    return na, devices
+""",
+)
+
+replace_exact(
+    "a rejected passToken is terminal, not a retry loop",
+    """                        else:
+                            bridge_state["error"] = "小米登录已过期，正在自动重试（当前间隔 %ss）" % relogin_backoff
+                            log.warning("Token 刷新失败，%ss 后重试；若持续失败请重新扫码登录",
+                                        relogin_backoff)
+                            await asyncio.sleep(relogin_backoff)
+                            relogin_backoff = min(relogin_backoff * 2, RELOGIN_BACKOFF_MAX)
+                        continue
+""",
+    """                        else:
+                            fatal, wait_seconds, message = _relogin_retry_plan(
+                                _last_refresh_failure, relogin_backoff)
+                            bridge_state["error"] = message
+                            if fatal:
+                                # 凭据被小米拒绝：继续按 5 分钟一次重试没有意义，把结论
+                                # 直接写到面板上，并在等待窗口里盯着凭据文件，用户重新
+                                # 登录后立刻重试，不必等满窗口。
+                                log.error("%s", message)
+                            else:
+                                log.warning("Token 刷新失败，%ss 后重试；若持续失败请重新扫码登录",
+                                            relogin_backoff)
+                            await _wait_for_relogin(wait_seconds, fatal)
+                            if not fatal:
+                                relogin_backoff = min(relogin_backoff * 2,
+                                                      RELOGIN_BACKOFF_MAX)
+                        continue
+""",
+)
+
+replace_exact(
+    "a fallback cookie login warns that the passToken was never accepted",
+    """        if not service_token and pasted_service_token:
+            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            service_token = pasted_service_token
+            ssecurity = pasted_ssecurity
+""",
+    """        fallback_note = ""
+        if not service_token and pasted_service_token:
+            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            # 兜底保存的 passToken 从未通过校验：等浏览器 serviceToken 到期，换票还会
+            # 被拒。必须当场说清楚，否则用户几天后只会看到「登录已过期」。
+            log.warning("Cookie 登录：passToken 换票被小米拒绝，本次保存的 passToken "
+                        "未经校验；浏览器 serviceToken 到期后需要重新登录")
+            fallback_note = ("；注意：passToken 换票被小米拒绝，当前只能用浏览器的 "
+                             "serviceToken 临时运行，它到期后需要重新登录")
+            service_token = pasted_service_token
+            ssecurity = pasted_ssecurity
+""",
+)
+
+replace_exact(
+    "fallback cookie login reports the warning to the caller",
+    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+""",
+    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）")
+                   + fallback_note,
+""",
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

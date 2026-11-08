@@ -6236,7 +6236,8 @@ def _schedule_listing(states) -> list:
         result.append({
             "config_id": config_id,
             "entity_id": "",
-            "alias": "",
+            "alias": "小爱桥接-%s %s（HA 未加载）" % (
+                meta.get("time", "")[:5], meta.get("entity_id", "")),
             "state": "",
             "last_triggered": None,
             "time": meta.get("time", ""),

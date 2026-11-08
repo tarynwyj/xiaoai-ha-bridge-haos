@@ -104,6 +104,19 @@ jobs:
           python xiaoai_bridge/patch_web.py /tmp/app/web/index.html
           python -m py_compile /tmp/app/bridge.py
 
+      - name: The shipped page script must parse
+        # A patch that closes a JS string early still passes grep and the Python
+        # checks; only a real parser catches it.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          html = open('/tmp/app/web/index.html', encoding='utf-8').read()
+          script = max(re.findall(r'<script>(.*?)</script>', html, re.S), key=len)
+          open('/tmp/app/page.js', 'w', encoding='utf-8').write(script)
+          PY
+          node --check /tmp/app/page.js
+
       - name: Reject forbidden patterns in the patched app
         # `! grep ...` under `set -e` exits non-zero only for the negated command and
         # does not fail the step, which let real matches pass silently. Check the
@@ -160,6 +173,9 @@ jobs:
       - name: Scheduled voice rules build HA automations (HH:MM:SS + weekday arrays)
         run: python xiaoai_bridge/test_schedule_automation.py /tmp/app/bridge.py
 
+      - name: Voice-created schedule tasks (Chinese parsing, idempotency, read-back)
+        run: python xiaoai_bridge/test_voice_schedule.py /tmp/app/bridge.py
+
       - name: Clearing the Xiaomi login fails when a credential file survives
         run: python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
 
@@ -184,6 +200,9 @@ jobs:
 
       - name: Listening scope in a real browser (Playwright + Chromium)
         run: python xiaoai_bridge/test_scope_browser.py --html /tmp/app/web/index.html
+
+      - name: Schedule form in a real browser (Playwright + Chromium)
+        run: python xiaoai_bridge/test_schedule_browser.py --html /tmp/app/web/index.html
 
       - name: HAOS Ingress contract
         run: |

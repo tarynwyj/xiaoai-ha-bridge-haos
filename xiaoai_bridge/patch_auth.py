@@ -4825,7 +4825,7 @@ replace_exact(
                     for s in states
                     if s.get("entity_id", "").startswith("automation.xiaoai_bridge_")
                 ]''',
-    '                return _automation_entries(states)',
+    '                return _schedule_listing(states)',
 )
 
 # 审计修复②：没有实体时不要生成空 target（HA 只认真实 entity_id / all / none）。
@@ -5156,6 +5156,8 @@ replace_exact(
     r'''    async with aiohttp.ClientSession() as s:
         ok = await ha.delete_automation(automation_id, s)
         reloaded = False
+        if ok:
+            _schedule_registry_remove(automation_id)
         if ok:
             reloaded = await ha.reload_automations(s)
         else:
@@ -6107,6 +6109,9 @@ async def _create_ha_automation(
         _automation_outcome(automation_id, "failed", False)
         return automation_id, False
 
+    _schedule_registry_add(automation_id, at_time, weekdays, entity_id,
+                           domain, service, "voice" if data.get("__source") != "form" else "form",
+                           bool(data.get("__once")))
     verified = await _automation_exists(ha, automation_id, session)
     if verified is True:
         _automation_outcome(automation_id, "verified", True)
@@ -6119,6 +6124,132 @@ async def _create_ha_automation(
     _automation_outcome(automation_id, "unverified", True)
     log.warning("定时任务已创建，但无法回读确认: %s", automation_id)
     return automation_id, True
+
+
+# ──────────────── 定时任务本地登记表：页面不再只依赖 HA 实体状态 ────────────────
+# HA 的 /api/states 只反映「已经加载的 automation 实体」。配置写进去了但 reload 没
+# 生效时，列表会显示 0 条，用户就以为没建成。这里在 /data 记一份登记表，列表把
+# 两边合并，并明确标出「HA 里没有」的状态。
+
+def _schedule_registry_path():
+    override = globals().get("_SCHEDULE_REGISTRY_OVERRIDE")
+    if override:
+        return Path(override)
+    return AUTH_PATH.parent / "schedules.json"
+
+
+def _schedule_registry_read() -> list:
+    try:
+        data = json.loads(_schedule_registry_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.warning("定时任务登记表读取失败，按空处理: %s", type(e).__name__)
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def _schedule_registry_write(items: list) -> None:
+    try:
+        _schedule_registry_path().parent.mkdir(parents=True, exist_ok=True)
+        _schedule_registry_path().write_text(
+            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("定时任务登记表写入失败: %s", type(e).__name__)
+
+
+def _schedule_registry_add(automation_id: str, at_time: str, weekdays,
+                           entity_id: str, domain: str, service: str,
+                           source: str, once: bool = False) -> None:
+    items = [item for item in _schedule_registry_read()
+             if str(item.get("id")) != automation_id]
+    items.append({
+        "id": automation_id,
+        "time": at_time,
+        "weekdays": list(weekdays or []),
+        "entity_id": entity_id,
+        "domain": domain,
+        "service": service,
+        "source": source,
+        "once": bool(once),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    _schedule_registry_write(items)
+
+
+def _schedule_registry_remove(automation_id: str) -> None:
+    _schedule_registry_write([item for item in _schedule_registry_read()
+                              if str(item.get("id")) != automation_id])
+
+
+def _schedule_next_run(at_time: str, weekdays, once: bool, now=None):
+    '''Next datetime this task should fire, or None when it cannot be known.'''
+    from datetime import datetime as _dt, timedelta as _td
+    now = now or _dt.now()
+    try:
+        hour, minute = [int(part) for part in str(at_time).split(":")[:2]]
+    except Exception:
+        return None
+    week_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    allowed = [week_map[d] for d in (weekdays or []) if d in week_map]
+    for offset in range(0, 8):
+        candidate = (now + _td(days=offset)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            continue
+        if once:
+            return candidate.strftime("%Y-%m-%d %H:%M")
+        if not allowed or candidate.weekday() in allowed:
+            return candidate.strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def _schedule_listing(states) -> list:
+    '''Merge what HA loaded with what we know we wrote.'''
+    entries = _automation_entries(states)
+    registry = {str(item.get("id")): item for item in _schedule_registry_read()}
+    seen = set()
+    result = []
+    for entry in entries:
+        config_id = entry.get("config_id", "")
+        seen.add(config_id)
+        meta = registry.get(config_id) or {}
+        result.append({
+            "config_id": config_id,
+            "entity_id": entry.get("entity_id", ""),
+            "alias": entry.get("alias", ""),
+            "state": entry.get("state", ""),
+            "last_triggered": entry.get("last_triggered"),
+            "time": meta.get("time", ""),
+            "weekdays": meta.get("weekdays") or [],
+            "entity": meta.get("entity_id", ""),
+            "source": meta.get("source", ""),
+            "once": bool(meta.get("once")),
+            "created_at": meta.get("created_at", ""),
+            "next_run": _schedule_next_run(meta.get("time", ""), meta.get("weekdays"),
+                                           bool(meta.get("once"))) if meta.get("time") else None,
+            "status": "active" if entry.get("state") == "on" else "disabled",
+        })
+    for config_id, meta in registry.items():
+        if config_id in seen:
+            continue
+        result.append({
+            "config_id": config_id,
+            "entity_id": "",
+            "alias": "",
+            "state": "",
+            "last_triggered": None,
+            "time": meta.get("time", ""),
+            "weekdays": meta.get("weekdays") or [],
+            "entity": meta.get("entity_id", ""),
+            "source": meta.get("source", ""),
+            "once": bool(meta.get("once")),
+            "created_at": meta.get("created_at", ""),
+            "next_run": _schedule_next_run(meta.get("time", ""), meta.get("weekdays"),
+                                           bool(meta.get("once"))) if meta.get("time") else None,
+            "status": "not_loaded",
+        })
+    return result
 """
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast

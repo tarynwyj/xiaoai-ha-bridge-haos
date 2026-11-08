@@ -33,6 +33,13 @@ FUNCTIONS = (
     "_automation_stable_id",
     "_automation_outcome",
     "_automation_exists",
+    "_schedule_registry_path",
+    "_schedule_registry_read",
+    "_schedule_registry_write",
+    "_schedule_registry_add",
+    "_schedule_registry_remove",
+    "_schedule_next_run",
+    "_schedule_listing",
     "create_automation",
     "delete_automation",
 )
@@ -44,6 +51,8 @@ TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
 CURRENT_CONFIG = {"homeassistant": {"url": "http://ha.local:8123", "token": "ha-token"}}
 CREATED_HA = []
 ROUTES = {}
+_REGISTRY_PATH = __import__("os").path.join(
+    __import__("tempfile").gettempdir(), "xiaoai-test-schedules.json")
 
 
 class FakeHA:
@@ -175,6 +184,8 @@ def load(bridge_path: pathlib.Path):
         "HTTPException": HttpError,
         "app": StubApp(),
         "BaseModel": object,
+        "Path": __import__("pathlib").Path,
+        "_SCHEDULE_REGISTRY_OVERRIDE": _REGISTRY_PATH,
         "load_config": _load_config,
         "HAClient": _new_ha,
         "ScheduleAutomationRequest": object,

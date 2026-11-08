@@ -31,6 +31,14 @@ WANTED_FUNCS = (
     "_normalize_schedule_time",
     "_normalize_schedule_weekdays",
     "_create_ha_automation",
+    "_schedule_registry_path",
+    "_schedule_registry_read",
+    "_schedule_registry_write",
+    "_schedule_registry_add",
+    "_schedule_registry_remove",
+    "_schedule_next_run",
+    "_schedule_listing",
+    "_automation_entries",
 )
 NEEDED_ASSIGNMENTS = ("_AUTOMATION_PREFIX", "_WEEKDAY_MAP", "_automation_outcomes", "_SCHEDULE_HINTS", "_CN_DIGITS", "_CN_WEEKDAY", "_SCHEDULE_WEEKDAY_ORDER")
 
@@ -40,6 +48,10 @@ DEVICES = [
     {"entity_id": "cover.chuanglian", "name": "卧室窗帘", "domain": "cover", "state": "open"},
     {"entity_id": "media_player.tv", "name": "客厅电视", "domain": "media_player", "state": "idle"},
 ]
+
+
+REGISTRY_PATH = __import__("os").path.join(
+    __import__("tempfile").gettempdir(), "xiaoai-voice-schedules.json")
 
 
 class Log:
@@ -122,7 +134,9 @@ def build_namespace(bridge: Path):
     missing = [n for n in WANTED_FUNCS if n not in functions]
     assert not missing, "built bridge.py is missing: %s" % missing
     namespace = {"re": __import__("re"), "time": __import__("time"),
-                 "log": Log(), "json": json}
+                 "log": Log(), "json": json,
+                 "Path": __import__("pathlib").Path,
+                 "_SCHEDULE_REGISTRY_OVERRIDE": REGISTRY_PATH}
     for node in tree.body:
         if isinstance(node, ast.Assign):
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
@@ -272,6 +286,53 @@ def scenario_weekdays(reporter, ns):
                     condition[0]["weekday"], ["mon", "wed", "fri"])
 
 
+
+def scenario_listing(reporter, ns):
+    """The page must list tasks even when HA has not loaded them yet."""
+    import os
+    if os.path.exists(REGISTRY_PATH):
+        os.remove(REGISTRY_PATH)
+
+    ns["_schedule_registry_add"]("xiaoai_bridge_0730_daily_switch_reshui",
+                                 "07:30", [], "switch.reshui", "switch", "turn_on",
+                                 "voice", False)
+    loaded = [{
+        "entity_id": "automation.xiaoai_bridge_0730_daily_switch_reshui",
+        "state": "on",
+        "attributes": {"id": "xiaoai_bridge_0730_daily_switch_reshui",
+                       "friendly_name": "小爱桥接-07:30 switch.reshui",
+                       "last_triggered": "2026-11-08T07:30:01"},
+    }]
+    entries = ns["_schedule_listing"](loaded)
+    reporter.eq("a loaded task is listed once", len(entries), 1)
+    entry = entries[0]
+    reporter.eq("status is active", entry["status"], "active")
+    reporter.eq("the source is recorded", entry["source"], "voice")
+    reporter.eq("the time is recorded", entry["time"], "07:30")
+    reporter.check("a next run is computed", entry["next_run"], entry["next_run"])
+    reporter.eq("the last trigger is passed through",
+                entry["last_triggered"], "2026-11-08T07:30:01")
+
+    # HA lost it (reload failed / not loaded yet) -> still listed, flagged
+    entries = ns["_schedule_listing"]([])
+    reporter.eq("a task HA has not loaded is still listed", len(entries), 1)
+    reporter.eq("and it is flagged as not loaded", entries[0]["status"], "not_loaded")
+
+    # deleting forgets it
+    ns["_schedule_registry_remove"]("xiaoai_bridge_0730_daily_switch_reshui")
+    reporter.eq("after delete the registry is empty", ns["_schedule_listing"]([]), [])
+
+    # next-run maths
+    from datetime import datetime
+    now = datetime(2026, 11, 9, 6, 0)  # Monday 06:00
+    reporter.eq("daily 07:30 fires the same day",
+                ns["_schedule_next_run"]("07:30", [], False, now), "2026-11-09 07:30")
+    reporter.eq("a time already passed rolls to tomorrow",
+                ns["_schedule_next_run"]("05:00", [], False, now), "2026-11-10 05:00")
+    reporter.eq("weekday rules skip to the next allowed day",
+                ns["_schedule_next_run"]("05:00", ["wed"], False, now), "2026-11-11 05:00")
+
+
 def main():
     bridge = Path(sys.argv[1] if len(sys.argv) > 1 else "/app/bridge.py")
     assert bridge.exists(), "built bridge.py not found: %s" % bridge
@@ -283,6 +344,7 @@ def main():
     reporter = Reporter()
     print("voice schedule tests | %s" % bridge)
     for name, scenario in (("chinese parsing", scenario_parsing),
+                           ("merged listing", scenario_listing),
                            ("stable ids", scenario_stable_ids),
                            ("verified creation", scenario_creation),
                            ("weekday conditions", scenario_weekdays)):

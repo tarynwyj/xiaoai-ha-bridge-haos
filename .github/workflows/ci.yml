@@ -77,6 +77,7 @@ jobs:
             xiaoai_bridge/test_xiaomi_login.py \
             xiaoai_bridge/test_tls_handshake.py \
             xiaoai_bridge/test_schedule_automation.py \
+            xiaoai_bridge/test_schedule_http.py \
             xiaoai_bridge/test_clear_login_files.py \
             xiaoai_bridge/test_credential_renewal.py \
             xiaoai_bridge/test_workflow_policy.py
@@ -175,6 +176,9 @@ jobs:
 
       - name: Voice-created schedule tasks (Chinese parsing, idempotency, read-back)
         run: python xiaoai_bridge/test_voice_schedule.py /tmp/app/bridge.py
+
+      - name: Schedule page and HA REST contract over real HTTP (local fake HA)
+        run: python xiaoai_bridge/test_schedule_http.py /tmp/app/bridge.py
 
       - name: Clearing the Xiaomi login fails when a credential file survives
         run: python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
@@ -304,6 +308,9 @@ jobs:
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_schedule_automation.py:/tmp/test_schedule_automation.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_schedule_automation.py /app/bridge.py
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_schedule_http.py:/tmp/test_schedule_http.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_schedule_http.py /app/bridge.py
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \

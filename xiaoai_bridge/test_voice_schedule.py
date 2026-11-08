@@ -20,6 +20,13 @@ WANTED_FUNCS = (
     "_cn_int",
     "_parse_cn_clock",
     "_apply_period",
+    "_parse_relative_offset",
+    "_parse_once_date",
+    "_normalize_schedule_date",
+    "_schedule_now",
+    "_schedule_once_at",
+    "_schedule_local_naive",
+    "_schedule_once_state",
     "_parse_schedule_days_cn",
     "_looks_like_schedule",
     "_pick_schedule_device",
@@ -38,9 +45,10 @@ WANTED_FUNCS = (
     "_schedule_registry_remove",
     "_schedule_next_run",
     "_schedule_listing",
+    "_schedule_purge_expired",
     "_automation_entries",
 )
-NEEDED_ASSIGNMENTS = ("_AUTOMATION_PREFIX", "_WEEKDAY_MAP", "_automation_outcomes", "_SCHEDULE_HINTS", "_CN_DIGITS", "_CN_WEEKDAY", "_SCHEDULE_WEEKDAY_ORDER")
+NEEDED_ASSIGNMENTS = ("_AUTOMATION_PREFIX", "_WEEKDAY_MAP", "_automation_outcomes", "_SCHEDULE_HINTS", "_CN_DIGITS", "_CN_WEEKDAY", "_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_INTERNAL_KEYS")
 
 DEVICES = [
     {"entity_id": "switch.reshui", "name": "热水器", "domain": "switch", "state": "off"},
@@ -101,6 +109,11 @@ class FakeHA:
     async def reload_automations(self, session=None):
         self.reload_calls += 1
         return self.reload_ok
+
+    async def delete_automation(self, automation_id, session=None):
+        self.states = [state for state in self.states
+                       if (state.get("attributes") or {}).get("id") != automation_id]
+        return True
 
     async def list_automation_states(self, session=None):
         if self.list_error:
@@ -184,6 +197,44 @@ def scenario_parsing(reporter, ns):
 
     action = parse(ns, "明天八点打开热水器")
     reporter.check("明天 marks a one-shot", action is not None and action["once"] is True, action)
+    if action:
+        from datetime import datetime, timedelta
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        reporter.eq("明天 records tomorrow's date", action.get("once_date"), tomorrow)
+        reporter.eq("明天 is stored as a one-shot rule", action["schedule_days"], "once")
+
+    # 相对时间：十分钟后 / 半小时后 只能是一次性的绝对时间点
+    from datetime import datetime as _dt2, timedelta as _td2
+    before = _dt2.now()
+    action = parse(ns, "十分钟后打开热水器")
+    after = _dt2.now()
+    reporter.check("十分钟后 is understood as a one-shot",
+                   action is not None and action["once"] is True, action)
+    if action:
+        reporter.eq("十分钟后 is stored as a one-shot rule", action["schedule_days"], "once")
+        reporter.check("十分钟后 keeps today's date",
+                       action.get("once_date") in (before.strftime("%Y-%m-%d"),
+                                                   after.strftime("%Y-%m-%d")),
+                       action.get("once_date"))
+        expected_low = (before + _td2(minutes=10)).strftime("%H:%M")
+        expected_high = (after + _td2(minutes=10)).strftime("%H:%M")
+        reporter.check("十分钟后 lands ten minutes ahead",
+                       action["schedule_time"] in (expected_low, expected_high),
+                       (action["schedule_time"], expected_low, expected_high))
+
+    action = parse(ns, "半小时后关掉客厅主灯")
+    reporter.check("半小时后 is understood too",
+                   action is not None and action["once"] is True
+                   and action["service"] == "turn_off", action)
+
+    action = parse(ns, "两个小时后打开卧室窗帘")
+    reporter.check("N 小时后 is understood",
+                   action is not None and action["once"] is True, action)
+
+    reporter.check("a relative phrase without a device is refused",
+                   parse(ns, "十分钟后提醒我") is None)
+    reporter.check("每天 is not a one-shot",
+                   parse(ns, "每天八点打开热水器")["once"] is False)
 
     action = parse(ns, "每天八点打开主灯", aliases={"主灯": "light.keting"})
     reporter.check("an alias resolves to the entity",
@@ -233,6 +284,62 @@ def scenario_creation(reporter, ns):
     reporter.eq("the duplicate reuses the same id", automation_id2, automation_id)
     reporter.eq("the outcome says it already existed",
                 ns["_automation_outcomes"][automation_id2]["status"], "exists")
+
+    # ── one-shot tasks: absolute date trigger, not a daily clock ──
+    action = parse(ns, "明天八点打开热水器")
+    payload = {"entity_id": action["entity_id"], "once": action["once"],
+               "once_date": action["once_date"]}
+
+    async def create_once():
+        return await ns["_create_ha_automation"](
+            ha, action["domain"], action["service"], payload,
+            action["schedule_time"], action["schedule_days"], None)
+
+    once_id, once_ok = asyncio.run(create_once())
+    reporter.check("a one-shot task is created", once_ok is True, once_ok)
+    reporter.eq("its trigger is a clock time (HA has no date-time trigger)",
+                ha.created[-1]["config"]["trigger"][0]["at"], "08:00:00")
+    reporter.check("the date guard is what makes it one-shot",
+                   action["once_date"] in (
+                       (ha.created[-1]["config"].get("condition") or [{}])[0]
+                       .get("value_template") or ""),
+                   ha.created[-1]["config"].get("condition"))
+    reporter.eq("it carries a date guard condition",
+                (ha.created[-1]["config"].get("condition") or [{}])[0].get("condition"),
+                "template")
+    meta = [item for item in ns["_schedule_registry_read"]() if item.get("id") == once_id]
+    reporter.check("the registry records the one-shot moment",
+                   meta and meta[0].get("once_at") == action["once_date"] + " 08:00"
+                   and meta[0].get("once") is True, meta)
+    once_id2, once_ok2 = asyncio.run(create_once())
+    reporter.eq("the same one-shot request reuses the id", once_id2, once_id)
+    reporter.eq("the same one-shot request does not create twice",
+                len([item for item in ha.created
+                     if item["config"]["trigger"][0]["at"].endswith("08:00:00")]), 1)
+
+    later = parse(ns, "后天八点打开热水器")
+    later_payload = {"entity_id": later["entity_id"], "once": later["once"],
+                     "once_date": later["once_date"]}
+
+    async def create_later():
+        return await ns["_create_ha_automation"](
+            ha, later["domain"], later["service"], later_payload,
+            later["schedule_time"], later["schedule_days"], None)
+
+    later_id, later_ok = asyncio.run(create_later())
+    reporter.check("a different day gets its own one-shot id",
+                   later_ok and later_id != once_id, (later_id, once_id))
+
+    async def create_in_the_past():
+        ha_past = FakeHA()
+        result = await ns["_create_ha_automation"](
+            ha_past, "switch", "turn_on", {"entity_id": "switch.reshui"},
+            "08:00", "once", None, once=True, once_date="2020-01-01")
+        return result, ha_past.created
+
+    (past_id, past_ok), past_created = asyncio.run(create_in_the_past())
+    reporter.check("a one-shot in the past is refused",
+                   past_ok is False and not past_created, (past_id, past_ok))
 
     # HA accepted the write but never loaded it -> not a success
     ha2 = FakeHA()
@@ -322,6 +429,41 @@ def scenario_listing(reporter, ns):
     ns["_schedule_registry_remove"]("xiaoai_bridge_0730_daily_switch_reshui")
     reporter.eq("after delete the registry is empty", ns["_schedule_listing"]([]), [])
 
+    # ── one-shot tasks: done after firing, expired when HA never ran them ──
+    ns["_schedule_registry_add"]("xiaoai_bridge_once_done", "08:00", [],
+                                 "switch.reshui", "switch", "turn_on", "voice", True,
+                                 once_at="2026-11-01 08:00")
+    fired_states = [{
+        "entity_id": "automation.xiao_ai_qiao_jie_2026_11_01_0800",
+        "state": "on",
+        "attributes": {"id": "xiaoai_bridge_once_done",
+                       "friendly_name": "小爱桥接-2026-11-01 08:00 switch.reshui",
+                       "last_triggered": "2026-11-01T08:00:02+08:00"},
+    }]
+    done_entry = [item for item in ns["_schedule_listing"](fired_states)
+                  if item["config_id"] == "xiaoai_bridge_once_done"][0]
+    reporter.eq("a fired one-shot is marked done", done_entry["status"], "done")
+    reporter.check("a fired one-shot has no next run", done_entry["next_run"] is None,
+                   done_entry["next_run"])
+    reporter.check("a fired one-shot is flagged expired", done_entry["expired"] is True,
+                   done_entry)
+    kept = asyncio.run(ns["_schedule_purge_expired"](FakeHA(), None, [done_entry]))
+    reporter.eq("a fired one-shot is purged from the listing", kept, [])
+    reporter.eq("a fired one-shot is forgotten by the registry",
+                [item for item in ns["_schedule_registry_read"]()
+                 if item.get("id") == "xiaoai_bridge_once_done"], [])
+
+    ns["_schedule_registry_add"]("xiaoai_bridge_once_missed", "09:00", [],
+                                 "switch.reshui", "switch", "turn_on", "voice", True,
+                                 once_at="2026-11-01 09:00")
+    missed_entry = [item for item in ns["_schedule_listing"]([])
+                    if item["config_id"] == "xiaoai_bridge_once_missed"][0]
+    reporter.eq("a one-shot HA never ran is marked expired",
+                missed_entry["status"], "expired")
+    kept = asyncio.run(ns["_schedule_purge_expired"](FakeHA(), None, [missed_entry]))
+    reporter.eq("a missed one-shot is kept for inspection", len(kept), 1)
+    ns["_schedule_registry_remove"]("xiaoai_bridge_once_missed")
+
     # next-run maths
     from datetime import datetime
     now = datetime(2026, 11, 9, 6, 0)  # Monday 06:00
@@ -331,6 +473,13 @@ def scenario_listing(reporter, ns):
                 ns["_schedule_next_run"]("05:00", [], False, now), "2026-11-10 05:00")
     reporter.eq("weekday rules skip to the next allowed day",
                 ns["_schedule_next_run"]("05:00", ["wed"], False, now), "2026-11-11 05:00")
+    reporter.eq("a one-shot next run is its absolute moment",
+                ns["_schedule_next_run"]("08:00", [], True, now,
+                                         once_at="2026-11-09 08:00"),
+                "2026-11-09 08:00")
+    reporter.eq("a one-shot in the past has no next run",
+                ns["_schedule_next_run"]("08:00", [], True, now,
+                                         once_at="2026-11-01 08:00"), None)
 
 
 def main():

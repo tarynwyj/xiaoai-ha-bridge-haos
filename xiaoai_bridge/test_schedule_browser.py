@@ -20,6 +20,7 @@ import json
 import pathlib
 import sys
 import tempfile
+from datetime import date, timedelta
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -32,6 +33,11 @@ DEVICES = [
     {"entity_id": "cover.window", "name": "卧室窗帘", "domain": "cover", "state": "open"},
     {"entity_id": "media_player.tv", "name": "客厅电视", "domain": "media_player", "state": "idle"},
     {"entity_id": "sensor.temp", "name": "温度传感器", "domain": "sensor", "state": "23"},
+]
+
+AREAS = [
+    {"id": "kitchen", "name": "厨房", "entities": ["light.keting", "switch.reshui"]},
+    {"id": "bedroom", "name": "卧室", "entities": ["cover.window", "media_player.tv"]},
 ]
 
 
@@ -57,6 +63,7 @@ def main() -> int:
     errors: list[str] = []
     posted: list[dict] = []
     toggles: list[dict] = []
+    updated: list[dict] = []
     state = {"fail_create": False, "automations": []}
 
     def open_page(page):
@@ -69,6 +76,19 @@ def main() -> int:
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"ok": True, "enabled": False,
                                                "msg": "已暂停"}))
+                return
+            if path.startswith("/api/automations/") and request.method == "PUT":
+                body = json.loads(request.post_data or "{}")
+                body["__id"] = path.rsplit("/", 1)[-1]
+                updated.append(body)
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "reloaded": True,
+                                               "automation_id": body["__id"],
+                                               "msg": "已保存修改 " + str(body.get("time", ""))}))
+                return
+            if path.startswith("/api/ha/areas"):
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "supported": True, "areas": AREAS}))
                 return
             if path.startswith("/api/automations"):
                 if request.method == "POST":
@@ -129,6 +149,28 @@ def main() -> int:
             result.check("the light is offered", any("客厅主灯" in o for o in options), options)
             result.check("the water heater is offered", any("热水器" in o for o in options), options)
 
+            # ── room filter ──
+            areas = page.eval_on_selector_all(
+                "#sch-area option", "els => els.map(e => e.textContent.trim())")
+            result.check("the room filter is populated",
+                         any("厨房" in a for a in areas), areas)
+            page.select_option("#sch-area", "kitchen")
+            page.wait_for_timeout(150)
+            kitchen = page.eval_on_selector_all(
+                "#sch-device option", "els => els.map(e => e.value)")
+            result.check("the kitchen filter keeps only kitchen devices",
+                         "light.keting" in kitchen and "switch.reshui" in kitchen
+                         and "cover.window" not in kitchen, kitchen)
+            page.select_option("#sch-area", "bedroom")
+            page.wait_for_timeout(150)
+            bedroom = page.eval_on_selector_all(
+                "#sch-device option", "els => els.map(e => e.value)")
+            result.check("the bedroom filter keeps only bedroom devices",
+                         "cover.window" in bedroom and "light.keting" not in bedroom,
+                         bedroom)
+            page.select_option("#sch-area", "")
+            page.wait_for_timeout(120)
+
             # ── pick 热水器 + 打开 + 每天 07:30 ──
             page.select_option("#sch-device", "switch.reshui")
             page.wait_for_timeout(80)
@@ -181,6 +223,31 @@ def main() -> int:
             result.eq("custom days are posted as 1,3,5",
                       (posted[0] if posted else {}).get("days"), "1,3,5")
 
+            # ── one-shot task: date field + once flag ──
+            page.click('button[onclick="scheduleFormToggle()"]')
+            page.wait_for_timeout(150)
+            page.select_option("#sch-device", "switch.reshui")
+            page.wait_for_timeout(100)
+            page.select_option("#sch-days", "once")
+            page.wait_for_timeout(100)
+            result.check("the date field appears for a one-shot",
+                         page.is_visible("#sch-date"))
+            future = (date.today() + timedelta(days=1)).isoformat()
+            page.fill("#sch-date", future)
+            page.fill("#sch-time", "08:00")
+            page.dispatch_event("#sch-time", "change")
+            page.wait_for_timeout(100)
+            result.check("the preview shows the chosen date",
+                         future in preview(page), preview(page))
+            posted.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(300)
+            body = posted[0] if posted else {}
+            result.eq("a one-shot posts once=true", body.get("once"), True)
+            result.eq("a one-shot posts its date", body.get("date"), future)
+            result.eq("a one-shot still posts a valid days value",
+                      body.get("days"), "daily")
+
             # ── no device: refuse locally, never post ──
             page.click('button[onclick="scheduleFormToggle()"]')
             page.wait_for_timeout(100)
@@ -212,12 +279,16 @@ def main() -> int:
                  "entity_id": "automation.xiaoai_bridge_0730_switch_reshui",
                  "alias": "小爱桥接-07:30 switch.reshui", "state": "on",
                  "last_triggered": "2026-11-08T07:30:01", "time": "07:30",
-                 "weekdays": [], "source": "voice", "next_run": "2026-11-09 07:30",
+                 "weekdays": [], "entity": "switch.reshui", "domain": "switch",
+                 "service": "turn_on", "data": {}, "once": False, "once_at": "",
+                 "source": "voice", "next_run": "2026-11-09 07:30",
                  "status": "active"},
                 {"config_id": "xiaoai_bridge_0900_daily_light_a_light_turn_off",
                  "entity_id": "", "alias": "小爱桥接-09:00 light.a（HA 未加载）",
                  "state": "", "last_triggered": None, "time": "09:00",
-                 "weekdays": [], "source": "form", "next_run": "2026-11-09 09:00",
+                 "weekdays": [], "entity": "light.keting", "domain": "light",
+                 "service": "turn_off", "data": {}, "once": False, "once_at": "",
+                 "source": "form", "next_run": "2026-11-09 09:00",
                  "status": "not_loaded"},
             ]
             page.click('button[onclick="loadSchedules()"]')
@@ -240,6 +311,34 @@ def main() -> int:
             result.eq("pausing posts once", len(toggles), 1)
             result.eq("pausing asks HA to disable it",
                       (toggles[0] if toggles else {}).get("enabled"), False)
+
+            # ── edit: prefilled form, PUT to the same config id ──
+            edit_buttons = page.query_selector_all(
+                '#schedule-list button[onclick^="editSchedule"]')
+            result.eq("loaded tasks offer edit", len(edit_buttons), 2)
+            if edit_buttons:
+                edit_buttons[0].click()
+                page.wait_for_timeout(600)
+            result.check("the edit form is open", page.is_visible("#schedule-form"))
+            result.check("the edit banner names the task",
+                         "小爱桥接-07:30" in page.inner_text("#sch-edit-banner"),
+                         page.inner_text("#sch-edit-banner"))
+            result.eq("the time is prefilled", page.input_value("#sch-time"), "07:30")
+            result.eq("the device is prefilled",
+                      page.input_value("#sch-device"), "switch.reshui")
+            page.fill("#sch-time", "08:45")
+            page.dispatch_event("#sch-time", "change")
+            posted.clear()
+            updated.clear()
+            page.click("#sch-create")
+            page.wait_for_timeout(400)
+            result.eq("editing sends one PUT", len(updated), 1)
+            result.eq("editing sends no POST", len(posted), 0)
+            body = updated[0] if updated else {}
+            result.eq("the PUT carries the new time", body.get("time"), "08:45")
+            result.eq("the PUT targets the same config id", body.get("__id"),
+                      "xiaoai_bridge_0730_switch_reshui")
+            result.eq("the PUT keeps the service", body.get("service"), "turn_on")
 
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()

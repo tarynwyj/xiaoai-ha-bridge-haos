@@ -23,6 +23,15 @@ import types
 FUNCTIONS = (
     "_normalize_schedule_time",
     "_normalize_schedule_weekdays",
+    "_normalize_schedule_date",
+    "_schedule_now",
+    "_schedule_once_at",
+    "_schedule_form_date",
+    "_schedule_local_naive",
+    "_schedule_once_state",
+    "_schedule_purge_expired",
+    "_schedule_automation_entity",
+    "_schedule_parse_areas",
     "_schedule_form_days",
     "_schedule_form_action",
     "_schedule_form_data",
@@ -41,14 +50,17 @@ FUNCTIONS = (
     "_schedule_next_run",
     "_schedule_listing",
     "create_automation",
+    "update_automation",
     "delete_automation",
     "toggle_automation",
     "ha_services",
+    "ha_areas",
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
           "_automation_outcomes",
           "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
-          "_SCHEDULE_CROSS_DOMAIN_ALLOWED", "_SCHEDULE_RESERVED_DATA_KEYS")
+          "_SCHEDULE_CROSS_DOMAIN_ALLOWED", "_SCHEDULE_RESERVED_DATA_KEYS",
+          "_SCHEDULE_INTERNAL_KEYS", "_SCHEDULE_AREAS_TEMPLATE")
 
 CURRENT_CONFIG = {"homeassistant": {"url": "http://ha.local:8123", "token": "ha-token"}}
 CREATED_HA = []
@@ -63,6 +75,9 @@ class FakeHA:
     reload_ok = True
     delete_ok = True
     service_ok = True
+    # HA's automations are shared state, not a property of one HTTP client:
+    # keep the list on the class so every HAClient() sees the same tasks.
+    created_ids = []
 
     def __init__(self):
         self.created = []
@@ -76,9 +91,7 @@ class FakeHA:
             # A real HA exposes the new automation through /api/states once the
             # config is written and reloaded; mirror that so the bridge's
             # read-back check sees what it would see on a real instance.
-            if not hasattr(self, "created_ids"):
-                self.created_ids = []
-            self.created_ids.append(automation_id)
+            type(self).created_ids.append(automation_id)
         return type(self).create_ok
 
     async def call_service(self, domain, service, data, session):
@@ -90,17 +103,16 @@ class FakeHA:
 
     async def delete_automation(self, automation_id, session):
         self.deleted.append(automation_id)
-        ids = getattr(self, "created_ids", [])
+        ids = type(self).created_ids
         if automation_id in ids:
             ids.remove(automation_id)
         return type(self).delete_ok
 
     async def list_automation_states(self, session):
-        ids = getattr(self, "created_ids", [])
         return [
             {"entity_id": "automation." + item, "state": "on",
              "attributes": {"id": item, "friendly_name": item}}
-            for item in ids
+            for item in type(self).created_ids
         ]
 
 
@@ -120,6 +132,13 @@ class StubApp:
         return decorator
 
     def delete(self, path):
+        def decorator(func):
+            func.route = path
+            return func
+
+        return decorator
+
+    def put(self, path):
         def decorator(func):
             func.route = path
             return func
@@ -148,6 +167,9 @@ class FakeResponse:
     async def json(self):
         return self._payload
 
+    async def text(self):
+        return self._payload if isinstance(self._payload, str) else json.dumps(self._payload)
+
 
 class StubSession:
     async def __aenter__(self):
@@ -156,11 +178,17 @@ class StubSession:
     async def __aexit__(self, *exc):
         return False
 
-    def get(self, url, **kwargs):
+    def _route(self, url):
         for prefix, (status, payload) in ROUTES.items():
             if str(url).startswith(prefix):
                 return FakeResponse(status, payload)
         return FakeResponse(404, None)
+
+    def get(self, url, **kwargs):
+        return self._route(url)
+
+    def post(self, url, **kwargs):
+        return self._route(url)
 
 
 def _load_config():
@@ -313,6 +341,9 @@ def main() -> int:
     # ── 暂停/启用：页面按钮最终落到 HA 的 automation.turn_off / turn_on ──
     ROUTES.clear()
     SERVICE_CALLS.clear()
+    # The HA entity id is derived from the alias, not from the config id, so the
+    # endpoint has to resolve it from /api/states. Only a loaded task can toggle.
+    FakeHA.created_ids.append("xiaoai_bridge_0730_light")
 
     def run_toggle(automation_id, enabled):
         try:
@@ -340,6 +371,14 @@ def main() -> int:
         FakeHA.service_ok = True
     check("a refused toggle raises instead of reporting success",
           error is not None and payload is None, (payload, error))
+
+    payload, error = run_toggle("xiaoai_bridge_missing", False)
+    check("toggling a task HA never loaded returns 404",
+          payload is None and error is not None and error.status_code == 404, error)
+    payload, error = run_toggle("automation.foreign", False)
+    check("toggling an automation from elsewhere is refused",
+          payload is None and error is not None and error.status_code == 403, error)
+    FakeHA.created_ids.remove("xiaoai_bridge_0730_light")
 
     # ── /api/ha/services：表单要能拿到 HA 真正提供的服务 ──
     ROUTES["http://ha.local:8123/api/services"] = (
@@ -447,6 +486,7 @@ def main() -> int:
 
     ROUTES.clear()
     CREATED_HA.clear()
+    FakeHA.created_ids.clear()
     response = call(form("07:30", "1,3,5"))
     check("form endpoint creates the automation", response.get("ok") is True, response)
     check("form endpoint returns the automation id",
@@ -514,6 +554,7 @@ def main() -> int:
           response.get("ok") is True, response)
 
     # audit P2-4: created but reload failed must not be reported as "not created"
+    FakeHA.created_ids.clear()
     ROUTES["http://ha.local:8123/api/config/automation/config/"] = (200, {"alias": "x"})
     FakeHA.reload_ok = False
     try:
@@ -525,6 +566,7 @@ def main() -> int:
     ROUTES.pop("http://ha.local:8123/api/config/automation/config/", None)
 
     # audit P2-4: nothing saved and reload failed -> a real failure
+    FakeHA.created_ids.clear()
     FakeHA.reload_ok = False
     try:
         expect_error(form("07:30", entity="light.a"),
@@ -533,6 +575,7 @@ def main() -> int:
         FakeHA.reload_ok = True
 
     # audit P2-4 / P2-B: an unconfirmable result must not be reported as "not created"
+    FakeHA.created_ids.clear()
     ROUTES["http://ha.local:8123/api/config/automation/config/"] = (500, None)
     FakeHA.reload_ok = False
     try:
@@ -546,6 +589,112 @@ def main() -> int:
     CURRENT_CONFIG["homeassistant"] = {"url": "", "token": ""}
     expect_error(form("07:30"), "form refuses when HA is not configured", "HA 未配置", 400)
     CURRENT_CONFIG["homeassistant"] = {"url": "http://ha.local:8123", "token": "ha-token"}
+
+    # ── one-shot tasks from the form ──
+    from datetime import datetime, timedelta
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def form_once(date_value, time_value="08:00", entity="switch.reshui"):
+        return types.SimpleNamespace(time=time_value, days="daily", domain="switch",
+                                     service="turn_on", entity_id=entity, data=None,
+                                     once=True, date=date_value)
+
+    FakeHA.created_ids.clear()
+    ROUTES.clear()
+    response = call(form_once(tomorrow))
+    check("a one-shot form task is created", response.get("ok") is True, response)
+    check("its message names the date and time",
+          response.get("msg") == "已创建一次性任务 " + tomorrow + " 08:00", response.get("msg"))
+    created = CREATED_HA[-1].created[-1]
+    eq("its trigger is a clock time (HA has no date-time time trigger)",
+       created["trigger"][0]["at"], "08:00:00")
+    check("the date guard is what makes it one-shot",
+          "template" == (created.get("condition") or [{}])[0].get("condition")
+          and tomorrow in (created.get("condition") or [{}])[0].get("value_template", ""),
+          created.get("condition"))
+    meta = [item for item in ns["_schedule_registry_read"]()
+            if item.get("id") == response["automation_id"]]
+    check("the registry records it as one-shot",
+          meta and meta[0].get("once") is True
+          and meta[0].get("once_at") == tomorrow + " 08:00", meta)
+    eq("the form source is recorded", (meta or [{}])[0].get("source"), "form")
+    expect_error(form_once(""), "a one-shot without a date is refused", "需要选择日期", 400)
+    expect_error(form_once("2020-01-01"),
+                 "a one-shot in the past is refused", "已经过去", 400)
+    expect_error(form_once("2026-02-30"),
+                 "an impossible calendar date is refused", "需要选择日期", 400)
+
+    # ── editing an existing task (PUT) ──
+    update_endpoint = ns["update_automation"]
+    FakeHA.created_ids.clear()
+
+    def edit(automation_id, time_value="08:15", days="weekdays", domain="light",
+             service="turn_off", entity="light.a", once=False, date_value=None):
+        request = types.SimpleNamespace(time=time_value, days=days, domain=domain,
+                                        service=service, entity_id=entity, data=None,
+                                        once=once, date=date_value)
+        return asyncio.run(update_endpoint(automation_id, request))
+
+    base = call(form("07:30", "daily", entity="light.a"))
+    base_id = base["automation_id"]
+    response = edit(base_id, "08:15", "weekdays")
+    check("editing returns ok", response.get("ok") is True, response)
+    eq("editing keeps the same config id", response.get("automation_id"), base_id)
+    check("editing says it saved", str(response.get("msg", "")).startswith("已保存修改"),
+          response.get("msg"))
+    edited = CREATED_HA[-1].created[-1]
+    eq("the edited trigger uses the new time", edited["trigger"][0]["at"], "08:15:00")
+    eq("the edited condition uses the new weekdays",
+       edited["condition"][0]["weekday"], ["mon", "tue", "wed", "thu", "fri"])
+    eq("the edited action uses the new service",
+       edited["action"][0]["service"], "light.turn_off")
+    meta = [item for item in ns["_schedule_registry_read"]() if item.get("id") == base_id]
+    check("the registry is updated, not duplicated",
+          len(meta) == 1 and meta[0].get("time") == "08:15:00"
+          and meta[0].get("weekdays") == ["mon", "tue", "wed", "thu", "fri"], meta)
+
+    try:
+        edit("automation.foreign")
+        check("editing a foreign automation is refused", False, "no error raised")
+    except HttpError as exc:
+        check("editing a foreign automation is refused", exc.status_code == 403, exc.detail)
+    ROUTES.clear()
+    try:
+        edit(base_id, time_value="25:00")
+        check("editing with an invalid time is refused", False, "no error raised")
+    except HttpError as exc:
+        check("editing with an invalid time is refused", exc.status_code == 400, exc.detail)
+    try:
+        edit(base_id, days="8")
+        check("editing with an invalid weekday is refused", False, "no error raised")
+    except HttpError as exc:
+        check("editing with an invalid weekday is refused", exc.status_code == 400, exc.detail)
+
+    # ── rooms/areas proxy for the device filter ──
+    areas_endpoint = ns["ha_areas"]
+    ROUTES["http://ha.local:8123/api/template"] = (
+        200, json.dumps([{"id": "kitchen", "name": "厨房",
+                          "entities": ["light.a", "switch.kettle"]},
+                         {"id": "bathroom", "name": "浴室", "entities": ["light.b"]},
+                         {"name": "no id"}, "junk"]))
+    payload = asyncio.run(areas_endpoint())
+    check("areas are returned", payload.get("ok") is True and payload.get("supported") is True,
+          payload)
+    eq("area names and entities are parsed", payload.get("areas"),
+       [{"id": "kitchen", "name": "厨房", "entities": ["light.a", "switch.kettle"]},
+        {"id": "bathroom", "name": "浴室", "entities": ["light.b"]}])
+    ROUTES["http://ha.local:8123/api/template"] = (404, None)
+    payload = asyncio.run(areas_endpoint())
+    check("HA without the template API degrades to an empty filter",
+          payload.get("ok") is True and payload.get("supported") is False,
+          payload)
+    ROUTES["http://ha.local:8123/api/template"] = (500, None)
+    try:
+        asyncio.run(areas_endpoint())
+        check("a broken HA template call is reported", False, "no error raised")
+    except HttpError as exc:
+        check("a broken HA template call is reported", exc.status_code == 502, exc.detail)
+    ROUTES.clear()
 
     # ── delete: reload result must be reported, not assumed (audit P2-2) ──
     def delete(id_value):

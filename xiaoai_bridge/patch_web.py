@@ -1478,6 +1478,353 @@ replace_exact(
     'async function loadSchedules(){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations\');\n    const d=await r.json();\n    if(!d.ok){showAlert(a,\'err\',d.msg);return}\n    document.getElementById(\'schedule-count\').textContent=d.count+\'个\';\n    const list=document.getElementById(\'schedule-list\');\n    if(!d.automations.length){\n      list.innerHTML=\'<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>\';\n      return;\n    }\n    list.innerHTML=d.automations.map(function(s){\n      const name=escHtml(s.alias||s.entity_id||\'（未命名任务）\');\n      const eid=escHtml(s.entity_id||\'\');\n      const id=(s.config_id||\'\').trim()||String(s.entity_id||\'\').replace(\'automation.\',\'\');\n      const on=s.state===\'on\';\n      const last=s.last_triggered?new Date(s.last_triggered).toLocaleString(\'zh-CN\'):\'从未\';\n      const next=s.next_run?escHtml(s.next_run):\'—\';\n      const missing=s.status===\'not_loaded\';\n      const src=s.source===\'voice\'?\'语音\':(s.source===\'form\'?\'面板\':\'\');\n      const badge=missing?\'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>\':\'\';\n      const toggle=missing?\'\':\'<button class="rule-del" title="暂停/启用" data-id="\'+escAttr(id)+\'" data-on="\'+(on?\'false\':\'true\')+\'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">\'+(on?\'⏸\':\'▶\')+\'</button>\';\n      return \'<div class="rule-item"><div class="device-item"><div class="device-info">\'\n        +\'<div class="device-name">\'+name+badge+\'</div>\'\n        +\'<div class="device-meta">\'+(eid||\'（配置已写入，HA 尚未加载）\')+\'</div>\'\n        +\'<div style="font-size:10px;color:var(--txt-dim);margin-top:2px">下次: \'+next+\' · 上次: \'+last+(src?\' · 来源: \'+src:\'\')+\'</div>\'\n        +\'</div><div style="display:flex;align-items:center;gap:10px">\'\n        +\'<span class="schedule-state \'+(on?\'on\':\'off\')+\'">\'+(on?\'启用\':\'禁用\')+\'</span>\'\n        +toggle\n        +\'<button class="rule-del" onclick="deleteSchedule(\\\'\'+escAttr(id)+\'\\\')">✕</button>\'\n        +\'</div></div></div>\';\n    }).join(\'\');\n  }catch(e){showAlert(a,\'err\',\'加载失败: \'+e.message)}\n}\nasync function toggleSchedule(id,enabled){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations/\'+encodeURIComponent(id)+\'/toggle\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({enabled:enabled===true||enabled===\'true\'})});\n    const d=await r.json().catch(function(){return {}});\n    if(d&&d.ok){showAlert(a,\'ok\',d.msg||\'已切换\');loadSchedules()}\n    else{showAlert(a,\'err\',(d&&d.detail)||\'切换失败\')}\n  }catch(e){showAlert(a,\'err\',\'切换失败: \'+e.message)}\n}\n',
 )
 
+# ════════════════ 定时任务 v2：房间筛选 + 一次性任务 + 编辑 ════════════════
+# 这里追加的是「覆盖层」：同名函数在 script 末尾重新声明，后声明者生效。
+# 这样不用改动上游内联 HTML 里的大段函数，避免把字符串字面量切断。
+replace_exact(
+    "schedules form: edit banner and title id",
+    '''      <div id="schedule-form" style="display:none;margin:12px 0;padding:14px;background:var(--page-bg);border:1px solid var(--border-default);border-radius:var(--r-md)">
+        <div style="font-size:14px;font-weight:600;color:var(--txt-primary);margin-bottom:10px">新建定时任务</div>''',
+    '''      <div id="schedule-form" style="display:none;margin:12px 0;padding:14px;background:var(--page-bg);border:1px solid var(--border-default);border-radius:var(--r-md)">
+        <div id="sch-edit-banner" style="display:none;margin-bottom:10px;padding:8px 10px;background:var(--card-bg);border:1px solid var(--border-default);border-radius:var(--r-md);font-size:12px;color:var(--txt-primary)">正在修改：<span id="sch-edit-name"></span> <button class="btn" style="margin-left:8px;padding:2px 8px" onclick="cancelScheduleEdit()">取消修改</button></div>
+        <div id="sch-form-title" style="font-size:14px;font-weight:600;color:var(--txt-primary);margin-bottom:10px">新建定时任务</div>''',
+)
+
+replace_exact(
+    "schedules form: room filter above the device picker",
+    '''        <div class="field"><label>选择设备</label>
+          <input id="sch-search" placeholder="搜索设备名称…" oninput="scheduleDeviceFilter()" style="margin-bottom:6px">
+          <select id="sch-device" onchange="scheduleDeviceChanged()"><option value="">正在读取设备…</option></select>''',
+    '''        <div class="field"><label>选择设备</label>
+          <div class="form-grid" style="margin-bottom:6px">
+            <select id="sch-area" onchange="scheduleDeviceFilter()"><option value="">全部房间</option></select>
+            <input id="sch-search" placeholder="搜索设备名称…" oninput="scheduleDeviceFilter()">
+          </div>
+          <select id="sch-device" onchange="scheduleDeviceChanged()"><option value="">正在读取设备…</option></select>''',
+)
+
+replace_exact(
+    "schedules form: one-shot repeat option and date field",
+    '''          <div class="field"><label>重复方式</label><select id="sch-days" onchange="scheduleDaysChanged()"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekends">周末</option><option value="custom">自定义星期</option></select></div>
+        </div>''',
+    '''          <div class="field"><label>重复方式</label><select id="sch-days" onchange="scheduleDaysChanged()"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekends">周末</option><option value="custom">自定义星期</option><option value="once">仅一次（指定日期）</option></select></div>
+          <div class="field" id="sch-date-wrap" style="display:none"><label>执行日期</label><input type="date" id="sch-date" onchange="schedulePreview()"></div>
+        </div>''',
+)
+
+replace_exact(
+    "schedules page v2 overrides (areas, one-shot, edit)",
+    "\ninit();",
+    r'''
+// ════════════════ 定时任务 v2：房间筛选 / 一次性任务 / 编辑 ════════════════
+// 同名函数在脚本末尾重新声明：后声明者生效（不改上游内联 HTML 的大段函数）。
+var scheduleItems = [];
+var scheduleEditId = '';
+var haAreas = null;
+
+function scheduleAreaValue(){
+  var sel=document.getElementById('sch-area');
+  return sel?String(sel.value||''):'';
+}
+
+function loadHaAreas(){
+  if(haAreas!==null)return Promise.resolve(haAreas);
+  return fetch('/api/ha/areas').then(function(r){return r.json()}).then(function(d){
+    var sel=document.getElementById('sch-area');
+    if(d&&d.ok&&d.supported&&Array.isArray(d.areas)&&d.areas.length){
+      haAreas=d.areas;
+      if(sel){
+        sel.innerHTML='<option value="">全部房间</option>'+d.areas.map(function(a){
+          return '<option value="'+escAttr(a.id)+'">'+escHtml(a.name)+'（'+((a.entities||[]).length)+'）</option>';
+        }).join('');
+        sel.style.display='';
+      }
+    }else{
+      haAreas=[];
+      if(sel)sel.style.display='none';
+    }
+    return haAreas;
+  }).catch(function(){
+    haAreas=[];
+    var sel=document.getElementById('sch-area');
+    if(sel)sel.style.display='none';
+    return haAreas;
+  });
+}
+
+function scheduleDeviceList(){
+  var list=(typeof haDevices!=='undefined'&&Array.isArray(haDevices))?haDevices:[];
+  var rows=list.filter(function(d){
+    var domain=String((d&&d.domain)||String((d&&d.entity_id)||'').split('.')[0]);
+    return Object.prototype.hasOwnProperty.call(SCHEDULE_ACTIONS,domain);
+  });
+  var area=scheduleAreaValue();
+  if(area&&haAreas&&haAreas.length){
+    var allowed={};
+    haAreas.forEach(function(a){
+      if(a.id===area)(a.entities||[]).forEach(function(entity){allowed[String(entity)]=1;});
+    });
+    rows=rows.filter(function(d){return allowed[String((d&&d.entity_id)||'')];});
+  }
+  return rows;
+}
+
+function scheduleDaysText(days){
+  if(days==='once')return '仅一次';
+  if(days==='daily')return '每天';
+  if(days==='weekdays')return '工作日';
+  if(days==='weekends')return '周末';
+  var map={'1':'一','2':'二','3':'三','4':'四','5':'五','6':'六','7':'日'};
+  var parts=String(days||'').split(',').map(function(x){return String(x).trim();}).filter(Boolean);
+  if(!parts.length)return '自定义星期';
+  return '每周'+parts.map(function(x){return map[x]||x;}).join('、');
+}
+
+function scheduleDaysChanged(){
+  var sel=document.getElementById('sch-days');
+  var wrap=document.getElementById('sch-days-custom-wrap');
+  var dateWrap=document.getElementById('sch-date-wrap');
+  if(!sel)return;
+  var once=sel.value==='once';
+  if(wrap)wrap.style.display=sel.value==='custom'?'block':'none';
+  if(dateWrap)dateWrap.style.display=once?'block':'none';
+  if(sel.value==='custom')scheduleRenderWeekdays();
+  if(once){
+    var d=document.getElementById('sch-date');
+    if(d&&!d.value){
+      var t=new Date(Date.now()+86400000);
+      d.value=t.getFullYear()+'-'+('0'+(t.getMonth()+1)).slice(-2)+'-'+('0'+t.getDate()).slice(-2);
+    }
+  }
+  schedulePreview();
+}
+
+function schedulePreview(){
+  var box=document.getElementById('sch-preview');if(!box)return;
+  var dev=scheduleSelectedDevice();
+  var timeEl=document.getElementById('sch-time');
+  var time=timeEl?String(timeEl.value||''):'';
+  var days=scheduleDaysValue();
+  var service=scheduleCurrentService();
+  var label='';
+  var actions=scheduleActionsFor(dev?String(dev.domain||''):'');
+  actions.forEach(function(a){if(a[0]===service)label=a[1];});
+  if(!dev){box.textContent='先选择设备';return;}
+  var when=time;
+  if(days==='once'){
+    var dateEl=document.getElementById('sch-date');
+    when=((dateEl&&String(dateEl.value||''))||'未选日期')+' '+(time||'--:--');
+  }
+  box.textContent=scheduleDaysText(days)+' '+(when||'--:--')+'，'+(label||service)+'「'+(dev.name||dev.entity_id)+'」';
+}
+
+function scheduleValidate(){
+  var timeEl=document.getElementById('sch-time');
+  var time=timeEl?String(timeEl.value||'').trim():'';
+  if(!/^\d{1,2}:\d{2}(:\d{2})?$/.test(time))return '时间格式无效，请用 HH:MM（24 小时制）';
+  var days=scheduleDaysValue();
+  if(days==='once'){
+    var dateEl=document.getElementById('sch-date');
+    var date=dateEl?String(dateEl.value||'').trim():'';
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return '一次性任务需要选择日期';
+    var when=new Date(date+'T'+(time.length===5?time+':00':time));
+    if(isNaN(when.getTime()))return '日期格式无效';
+    if(when.getTime()<=Date.now())return '选择的时间已经过去，请换一个将来的时间';
+  }else if(days==='custom'||!days){
+    return '自定义重复至少要选一天';
+  }
+  if(scheduleAdvancedOpen()){
+    var domain=String((document.getElementById('sch-domain')||{}).value||'').trim();
+    if(!domain)return '高级模式需要填写 domain';
+    return '';
+  }
+  var dev=scheduleSelectedDevice();
+  if(!dev)return '请先选择设备';
+  if(!scheduleCurrentService())return '请选择执行操作';
+  return '';
+}
+
+function cancelScheduleEdit(){
+  scheduleEditId='';
+  var banner=document.getElementById('sch-edit-banner');
+  if(banner)banner.style.display='none';
+  var title=document.getElementById('sch-form-title');
+  if(title)title.textContent='新建定时任务';
+  var btn=document.getElementById('sch-create');
+  if(btn)btn.innerHTML='&#10003; 创建';
+}
+
+function scheduleFormToggle(){
+  var form=document.getElementById('schedule-form');
+  if(!form)return Promise.resolve(false);
+  var show=form.style.display==='none';
+  form.style.display=show?'block':'none';
+  if(!show){cancelScheduleEdit();return Promise.resolve(false);}
+  cancelScheduleEdit();
+  var timeEl=document.getElementById('sch-time');
+  if(timeEl)timeEl.focus();
+  return Promise.resolve(loadHaServices()).then(function(){
+    return loadHaAreas();
+  }).then(function(){
+    if(typeof loadRuleDevices==='function')return Promise.resolve(loadRuleDevices());
+  }).then(function(){
+    scheduleRenderDevices('');scheduleRenderActions();schedulePreview();
+    return true;
+  });
+}
+
+function editSchedule(id){
+  var item=null;
+  (scheduleItems||[]).forEach(function(s){if(String(s.config_id||'')===String(id))item=s;});
+  if(!item)return;
+  var opening=document.getElementById('schedule-form');
+  opening=opening&&opening.style.display==='none'?scheduleFormToggle():Promise.resolve(true);
+  opening.then(function(){
+    scheduleEditId=String(id);
+    var entity=String(item.entity||'').trim();
+    if(!entity)entity=String(item.entity_id||'').replace(/^automation\./,'');
+    var sel=document.getElementById('sch-device');
+    if(sel&&entity){
+      var found=false;
+      for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===entity)found=true;}
+      if(!found)sel.insertAdjacentHTML('beforeend','<option value="'+escAttr(entity)+'">'+escHtml(entity)+'</option>');
+      sel.value=entity;
+    }
+    scheduleDeviceChanged();
+    if(item.service)scheduleActionChanged(String(item.service));
+    var timeEl=document.getElementById('sch-time');
+    if(timeEl&&item.time)timeEl.value=String(item.time).slice(0,5);
+    var daysEl=document.getElementById('sch-days');
+    var wd=Array.isArray(item.weekdays)?item.weekdays:[];
+    var dateEl=document.getElementById('sch-date');
+    if(item.once){
+      if(daysEl)daysEl.value='once';
+      if(dateEl&&item.once_at)dateEl.value=String(item.once_at).slice(0,10);
+    }else if(!wd.length){
+      if(daysEl)daysEl.value='daily';
+    }else if(wd.join(',')==='mon,tue,wed,thu,fri'){
+      if(daysEl)daysEl.value='weekdays';
+    }else if(wd.join(',')==='sat,sun'){
+      if(daysEl)daysEl.value='weekends';
+    }else{
+      if(daysEl)daysEl.value='custom';
+      var dayMap={mon:'1',tue:'2',wed:'3',thu:'4',fri:'5',sat:'6',sun:'7'};
+      scheduleDaysDraft=wd.map(function(day){return dayMap[day]||day;});
+      scheduleRenderWeekdays();
+    }
+    scheduleDaysChanged();
+    var dm=document.getElementById('sch-domain');
+    var svcEl=document.getElementById('sch-service');
+    var entEl=document.getElementById('sch-entity');
+    var dataEl=document.getElementById('sch-data');
+    if(dm&&item.domain)dm.value=item.domain;
+    if(svcEl&&item.service)svcEl.value=item.service;
+    if(entEl)entEl.value=entity;
+    if(dataEl)dataEl.value=(item.data&&Object.keys(item.data).length)?JSON.stringify(item.data):'';
+    var simple=(scheduleActionsFor(item.domain)||[]).map(function(a){return a[0];});
+    var adv=document.getElementById('sch-advanced');
+    if(adv&&item.service&&simple.indexOf(String(item.service))<0)adv.open=true;
+    var banner=document.getElementById('sch-edit-banner');
+    var nameEl=document.getElementById('sch-edit-name');
+    var title=document.getElementById('sch-form-title');
+    var btn=document.getElementById('sch-create');
+    if(nameEl)nameEl.textContent=String(item.alias||id);
+    if(banner)banner.style.display='';
+    if(title)title.textContent='修改定时任务';
+    if(btn)btn.innerHTML='&#10003; 保存修改';
+    schedulePreview();
+    var formEl=document.getElementById('schedule-form');
+    if(formEl&&formEl.scrollIntoView)formEl.scrollIntoView({block:'start'});
+  });
+}
+
+async function createSchedule(){
+  const a=document.getElementById('schedules-alert');
+  const st=document.getElementById('sch-status');
+  const btn=document.getElementById('sch-create');
+  const val=function(id){const el=document.getElementById(id);return el?String(el.value||'').trim():'';};
+  let time=val('sch-time');let domain=val('sch-domain');let service=val('sch-service');let entity=val('sch-entity');
+  if(!scheduleAdvancedOpen()){
+    const dev=scheduleSelectedDevice();
+    if(!dev){showAlert(a,'err','✗ 请先选择设备');return;}
+    domain=String(dev.domain||String(dev.entity_id||'').split('.')[0]);
+    service=scheduleCurrentService();
+    entity=String(dev.entity_id||'');
+  }
+  const daysRaw=scheduleDaysValue();
+  const once=daysRaw==='once';
+  const dateRaw=val('sch-date');
+  const dataRaw=val('sch-data');let extra={};
+  if(dataRaw){try{extra=JSON.parse(dataRaw)}catch(e){showAlert(a,'err','✗ 服务参数不是合法 JSON');return;}}
+  if(!once&&daysRaw==='custom'&&!val('sch-days-custom')){showAlert(a,'err','✗ 自定义重复必须填写星期（如 1,3,5 或 mon,wed）');return;}
+  if(!/^\d{1,2}:\d{2}(:\d{2})?$/.test(time)){showAlert(a,'err','✗ 时间格式无效，请用 HH:MM（24 小时制）');return;}
+  if(once&&!/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)){showAlert(a,'err','✗ 一次性任务需要选择日期');return;}
+  if(!entity&&['light','switch','climate','fan','cover','media_player','scene','script','input_boolean'].indexOf(domain)>=0){showAlert(a,'err','✗ 这个服务必须填写实体 entity_id');return;}
+  const editing=scheduleEditId;
+  const payload={time:time,days:once?'daily':daysRaw,domain:domain,service:service,entity_id:entity,data:extra,once:once};
+  if(once)payload.date=dateRaw;
+  if(btn)btn.disabled=true;if(st)st.textContent=editing?'⟳ 正在保存...':'⟳ 正在创建...';
+  try{
+    const url=editing?('/api/automations/'+encodeURIComponent(editing)):'/api/automations';
+    const r=await fetch(url,{method:editing?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json().catch(function(){return {};});
+    if(!r.ok){
+      if(r.status===504){if(st)st.textContent='';showAlert(a,'warn','⚠ '+(d&&d.detail||'结果待确认，请先去 HA 核对，不要直接重复提交'));return;}
+      throw new Error((d&&d.detail)||('HTTP '+r.status));
+    }
+    if(st)st.textContent='';
+    showAlert(a,d.reloaded===false?'warn':'ok',(d.reloaded===false?'⚠ ':'✓ ')+(d.msg||(editing?'已保存修改':'已创建定时任务')));
+    cancelScheduleEdit();
+    scheduleFormToggle();
+    loadSchedules();
+  }catch(e){if(st)st.textContent='✗ '+e.message;showAlert(a,'err','✗ '+(editing?'保存失败':'创建失败')+': '+e.message);}
+  finally{if(btn)btn.disabled=false;}
+}
+
+async function loadSchedules(){
+  const a=document.getElementById('schedules-alert');
+  try{
+    const r=await fetch('/api/automations');
+    const d=await r.json();
+    if(!d.ok){showAlert(a,'err',d.msg);return}
+    scheduleItems=Array.isArray(d.automations)?d.automations:[];
+    document.getElementById('schedule-count').textContent=d.count+'个';
+    const list=document.getElementById('schedule-list');
+    if(!scheduleItems.length){
+      list.innerHTML='<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>';
+      return;
+    }
+    list.innerHTML=scheduleItems.map(function(s){
+      const name=escHtml(s.alias||s.entity_id||'（未命名任务）');
+      const eid=escHtml(s.entity_id||'');
+      const id=(s.config_id||'').trim()||String(s.entity_id||'').replace('automation.','');
+      const on=s.state==='on';
+      const last=s.last_triggered?new Date(s.last_triggered).toLocaleString('zh-CN'):'从未';
+      const next=s.next_run?escHtml(s.next_run):'—';
+      const missing=s.status==='not_loaded';
+      const done=s.status==='done';
+      const expired=s.status==='expired';
+      const src=s.source==='voice'?'语音':(s.source==='form'?'面板':'');
+      const onceTag=s.once?' · 一次性':'';
+      const label=done?'已完成':(expired?'已过期':(on?'启用':'禁用'));
+      const badge=missing?'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>':(expired?'<span class="schedule-state off" style="margin-left:6px">已过期未执行</span>':'');
+      const pause=(missing||done||expired)?'':'<button class="rule-del" title="暂停/启用" data-id="'+escAttr(id)+'" data-on="'+(on?'false':'true')+'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">'+(on?'⏸':'▶')+'</button>';
+      const edit=done?'':'<button class="rule-del" title="修改任务" data-id="'+escAttr(id)+'" onclick="editSchedule(this.dataset.id)">✎</button>';
+      return '<div class="rule-item"><div class="device-item"><div class="device-info">'
+        +'<div class="device-name">'+name+badge+'</div>'
+        +'<div class="device-meta">'+(eid||'（配置已写入，HA 尚未加载）')+'</div>'
+        +'<div style="font-size:10px;color:var(--txt-dim);margin-top:2px">下次: '+next+' · 上次: '+last+(src?' · 来源: '+src:'')+onceTag+'</div>'
+        +'</div><div style="display:flex;align-items:center;gap:10px">'
+        +'<span class="schedule-state '+(on?'on':'off')+'">'+label+'</span>'+pause+edit
+        +'<button class="rule-del" title="删除" onclick="deleteSchedule(\''+escAttr(id)+'\')">✕</button>'
+        +'</div></div></div>';
+    }).join('');
+  }catch(e){showAlert(a,'err','加载失败: '+e.message)}
+}
+
+init();''',
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

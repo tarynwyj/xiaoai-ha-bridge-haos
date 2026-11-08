@@ -175,10 +175,19 @@ NEW_ONLY_FUNCTIONS = (
     "_poll_targets",
     "_log_file_handler",
     "_log_lines_from_file",
+    "_plausible_credential",
+    "_adopt_login_identity",
+    "_login_device_id",
+    "_refresh_lock_obj",
+    "_refresh_outcome",
+    "_recent_refresh",
+    "_remember_refresh",
+    "_unsaved_refresh",
+    "_save_refreshed_credentials",
 )
 # Classes that must be real objects, not the object() placeholder: `raise` and
 # `except` require a BaseException subclass.
-WANTED_CLASSES = ("MicoapiLoginRejected",)
+WANTED_CLASSES = ("MicoapiLoginRejected", "CredentialIdentityMismatch")
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the
 # import-time side effect that creates /data/config/.access_token in 1.0.10.
 NEEDED_ASSIGNMENTS = (
@@ -195,6 +204,10 @@ NEEDED_ASSIGNMENTS = (
     "_last_refresh_failure",
     "_LOG_LINE_RE",
     "POLL_COOKIE_KEYS",
+    "REFRESH_COALESCE_SECONDS",
+    "_refresh_lock",
+    "_process_login_device_id",
+    "_refresh_cache",
 )
 
 
@@ -533,6 +546,7 @@ class PatchedApp:
                 to_thread=immediate_thread,
                 CancelledError=real_asyncio.CancelledError,
                 TimeoutError=real_asyncio.TimeoutError,
+                Lock=real_asyncio.Lock,
             ),
             "HAClient": FakeHAClient,
             "_get_latest_ask_from_xiaoai": stack.poll,

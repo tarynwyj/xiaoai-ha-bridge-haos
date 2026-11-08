@@ -63,6 +63,15 @@ WANTED_FUNCS = [
     "_enforce_access_control",
     "post_config",
     "bridge_loop",
+    "_plausible_credential",
+    "_adopt_login_identity",
+    "_login_device_id",
+    "_refresh_lock_obj",
+    "_refresh_outcome",
+    "_recent_refresh",
+    "_remember_refresh",
+    "_unsaved_refresh",
+    "_save_refreshed_credentials",
 ]
 nodes = {}
 for node in tree.body:
@@ -78,6 +87,15 @@ rejected_class = next(
 )
 assert rejected_class is not None, (
     "patched bridge.py must classify a rejected exchange with MicoapiLoginRejected"
+)
+identity_class = next(
+    (node for node in tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "CredentialIdentityMismatch"),
+    None,
+)
+assert identity_class is not None, (
+    "patched bridge.py must refuse a mismatched account identity with "
+    "CredentialIdentityMismatch"
 )
 
 # FastAPI decorators cannot be evaluated here; keep the plain function bodies.
@@ -315,6 +333,7 @@ class Harness:
             to_thread=to_thread,
             CancelledError=real_asyncio.CancelledError,
             TimeoutError=real_asyncio.TimeoutError,
+            Lock=real_asyncio.Lock,
         )
 
     async def fake_poll(self, session, device_id, hardware, last_ts):
@@ -430,6 +449,10 @@ class Harness:
             "re": re,
             "os": __import__("os"),
             "time": __import__("time"),
+            "REFRESH_COALESCE_SECONDS": 60,
+            "_refresh_lock": None,
+            "_process_login_device_id": "",
+            "_refresh_cache": {},
             "datetime": real_datetime.datetime,
             "log": self.log,
             "load_config": self.load_config,
@@ -476,6 +499,10 @@ class Harness:
         )
         exec(
             compile(ast.Module(body=[rejected_class], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        exec(
+            compile(ast.Module(body=[identity_class], type_ignores=[]), str(source_path), "exec"),
             namespace,
         )
         for name in WANTED_FUNCS:

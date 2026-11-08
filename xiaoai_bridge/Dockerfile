@@ -49,6 +49,13 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'micoapi serviceToken 已保存' /app/bridge.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
     && grep -Fq 'class MicoapiLoginRejected' /app/bridge.py \
+    && grep -Fq 'class CredentialIdentityMismatch' /app/bridge.py \
+    && grep -Fq 'def _adopt_login_identity' /app/bridge.py \
+    && grep -Fq 'def _login_device_id' /app/bridge.py \
+    && grep -Fq 'def _refresh_outcome' /app/bridge.py \
+    && grep -Fq 'def _save_refreshed_credentials' /app/bridge.py \
+    && grep -Fq 'def _unsaved_refresh' /app/bridge.py \
+    && grep -Fq 'bridge_state["renewal"]' /app/bridge.py \
     && grep -Fq 'def _relogin_retry_plan' /app/bridge.py \
     && grep -Fq 'def _refresh_interval_seconds' /app/bridge.py \
     && grep -Fq 'def _token_age_seconds' /app/bridge.py \

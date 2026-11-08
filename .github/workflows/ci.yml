@@ -78,6 +78,7 @@ jobs:
             xiaoai_bridge/test_tls_handshake.py \
             xiaoai_bridge/test_schedule_automation.py \
             xiaoai_bridge/test_clear_login_files.py \
+            xiaoai_bridge/test_credential_renewal.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
@@ -161,6 +162,9 @@ jobs:
 
       - name: Clearing the Xiaomi login fails when a credential file survives
         run: python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
+
+      - name: Credential rotation, renewal and persistence (fault injection)
+        run: python xiaoai_bridge/test_credential_renewal.py /tmp/app/bridge.py
 
       - name: HTTP access control
         run: python xiaoai_bridge/test_api_auth.py /tmp/app
@@ -282,6 +286,9 @@ jobs:
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \
               --bridge /app/bridge.py --html /app/web/index.html --no-node
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_credential_renewal.py:/tmp/test_credential_renewal.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_credential_renewal.py /app/bridge.py
 
       - name: Rules-page JS from the shipped image
         shell: bash

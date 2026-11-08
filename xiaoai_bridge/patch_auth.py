@@ -149,6 +149,71 @@ replace_exact(
     return {}
 
 
+class CredentialIdentityMismatch(RuntimeError):
+    '''serviceLogin answered for a different account than the one we asked about.'''
+
+
+def _plausible_credential(value) -> str:
+    '''Return a usable credential string, or "" when the value is not usable.
+
+    Xiaomi rotates passToken on some responses and omits it on others; a blank or
+    malformed value must never replace the working credential we already hold.
+    '''
+    text = str(value or "").strip()
+    if not text or len(text) > 4096:
+        return ""
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in text):
+        return ""
+    return text
+
+
+def _adopt_login_identity(resp: dict, requested_user_id: str,
+                          requested_pass_token: str) -> dict:
+    '''Decide which identity fields to keep after a serviceLogin response.
+
+    Rules (defensive, they do not assume any particular server behaviour):
+    - a non-empty userId that differs from the requested one is a hard error:
+      adopting it would silently switch accounts;
+    - a missing/blank userId keeps the requested one;
+    - a non-empty, well formed passToken replaces the old one (the server rotates
+      it); a missing/blank one keeps the old one instead of blanking it.
+    '''
+    requested_user = str(requested_user_id or "").strip()
+    response_user = str(resp.get("userId") or "").strip()
+    if response_user and requested_user and response_user != requested_user:
+        raise CredentialIdentityMismatch(
+            "serviceLogin 返回的账号与已保存账号不一致，已拒绝写入"
+        )
+    adopted_pass = _plausible_credential(resp.get("passToken"))
+    return {
+        "userId": response_user or requested_user,
+        "passToken": adopted_pass or requested_pass_token,
+        "rotated": bool(adopted_pass) and adopted_pass != requested_pass_token,
+    }
+
+
+# 进程内稳定的登录客户端标识：一次生成，之后所有换票（含失败重试）都用同一个。
+# 落盘后由 .mi.token 的 deviceId 接管，重启也沿用。它只是登录客户端标识，与音箱的
+# deviceID/did 完全是两回事，二者不得混用。
+_process_login_device_id = ""
+
+
+def _login_device_id(saved: dict, account) -> str:
+    '''The stable login-client identifier, reused across retries and callers.'''
+    global _process_login_device_id
+    token = getattr(account, "token", None)
+    for candidate in ((saved or {}).get("deviceId"),
+                      token.get("deviceId") if isinstance(token, dict) else None,
+                      _process_login_device_id):
+        device_id = str(candidate or "").strip()
+        if device_id:
+            _process_login_device_id = device_id
+            return device_id
+    from miservice.miaccount import get_random
+    _process_login_device_id = get_random(16).upper()
+    return _process_login_device_id
+
+
 async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
                                   device_id: str) -> str:
     \"\"\"Exchange an account passToken for a fresh micoapi serviceToken.\"\"\"
@@ -193,8 +258,12 @@ async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
     if not service_token:
         raise RuntimeError("小米 STS 未返回 micoapi serviceToken")
 
-    account.token["userId"] = str(resp.get("userId", user_id))
-    account.token["passToken"] = resp.get("passToken", pass_token)
+    # 只采用「非空且格式正常」的新值：服务端没返回 passToken 时保留调用方手里那张，
+    # 返回别的 userId 时直接拒绝（不能静默切账号）。
+    adopted = _adopt_login_identity(resp, user_id, pass_token)
+    account.token["userId"] = adopted["userId"]
+    account.token["passToken"] = adopted["passToken"]
+    account.token["pass_token_rotated"] = adopted["rotated"]
     account.token["micoapi"] = (resp["ssecurity"], service_token)
     return service_token
 
@@ -264,12 +333,103 @@ def _apply_cookie_to_session(session, cfg: dict) -> bool:
         return False
 
 
-async def _relogin_and_refresh(account, cfg: dict):
-    '''Unified recovery after a 401: exchange the saved passToken for a new micoapi token.
+# 后台续期与 401 恢复共用的协调状态：
+# - 同一时刻只允许一次换票，避免拿同一张旧 passToken 并发换票；
+# - 成功后短时间内复用结果，避免「刚换完又立刻再换一次」。
+REFRESH_COALESCE_SECONDS = 60
+_refresh_lock = None
+_refresh_cache: dict = {}
 
-    Works with QR / Cookie only installs (no username/password). Returns
-    (na, devices) on success and None on failure; a failed refresh never writes
-    to auth.json / .mi.token and leaves the previously working token in memory.
+
+def _refresh_lock_obj():
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
+
+
+def _refresh_outcome(ok: bool, stage: str, na=None, devices=None, saved: bool = False,
+                     rotated: bool = False, reused: bool = False,
+                     message: str = "") -> dict:
+    '''Result of one credential renewal.
+
+    `stage` separates the four things that used to collapse into one bool:
+    exchange (did the server accept the passToken), device_list, persist, ok.
+    '''
+    return {"ok": ok, "stage": stage, "na": na, "devices": devices,
+            "saved": saved, "rotated": rotated, "reused": reused,
+            "message": message}
+
+
+def _recent_refresh(started: tuple):
+    cached = _refresh_cache.get("outcome")
+    if not cached or not cached.get("ok") or not cached.get("saved"):
+        return None
+    if _refresh_cache.get("identity") != started:
+        return None
+    if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_COALESCE_SECONDS:
+        return None
+    return dict(cached, reused=True)
+
+
+def _unsaved_refresh(started: tuple):
+    '''A renewal whose exchange succeeded but whose write failed.'''
+    cached = _refresh_cache.get("outcome")
+    if not cached or not cached.get("ok") or cached.get("saved"):
+        return None
+    if _refresh_cache.get("identity") != started:
+        return None
+    if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_COALESCE_SECONDS:
+        return None
+    return dict(cached), dict(_refresh_cache.get("pending") or {})
+
+
+def _remember_refresh(started: tuple, outcome: dict,
+                      pending: dict | None = None) -> None:
+    global _refresh_cache
+    _refresh_cache = {"identity": started, "at": time.monotonic(),
+                      "outcome": dict(outcome), "pending": dict(pending or {})}
+
+
+def _save_refreshed_credentials(account, started: tuple,
+                                pending: dict | None = None) -> bool:
+    '''Persist a background renewal only while it still describes the same login.
+
+    磁盘上的凭据本身就是「代际」：换票期间用户重新登录或清除凭据后，
+    (userId, passToken) 已经变了，此时写入只会把新登录覆盖成旧账号的票。
+    '''
+    current = _load_saved_xiaomi_identity()
+    if (current.get("userId"), current.get("passToken")) != started:
+        log.warning("后台续期期间登录凭据已变化，丢弃本次续期结果（不覆盖新的登录）")
+        return False
+    if pending:
+        if pending.get("userId") and pending["userId"] != started[0]:
+            log.warning("续期返回的账号与已保存账号不一致，拒绝写入")
+            return False
+        try:
+            _persist_sms_credentials(dict(pending))
+            return True
+        except Exception as e:
+            log.warning("保存续期凭据失败 (%s)", type(e).__name__)
+            return False
+    token = getattr(account, "token", None)
+    account_user = str(token.get("userId") or "") if isinstance(token, dict) else ""
+    # 只有当我们确实知道当前账号、而它与续期目标不一致时才拒绝；
+    # 刚构造出来的 account 还没有 userId，不该因此放弃保存。
+    if account_user and account_user != started[0]:
+        log.warning("续期返回的账号与已保存账号不一致，拒绝写入")
+        return False
+    return bool(_save_auth_and_token(account).get("ok"))
+
+
+async def _relogin_and_refresh(account, cfg: dict) -> dict:
+    '''Renew the micoapi session for the *saved* account identity.
+
+    Works with QR / Cookie only installs (no username/password). Returns a status
+    dict (see _refresh_outcome) instead of a bare tuple so callers can tell apart
+    "server accepted the passToken", "credentials persisted", "device discovery
+    worked" and "the session is usable". A failed exchange never writes to
+    auth.json / .mi.token and leaves the previously working token in memory.
     '''
     from miservice import MiNAService
     from miservice.miaccount import get_random
@@ -1231,12 +1391,20 @@ replace_exact(
                         _bridge_session.cookie_jar.clear_domain("account.xiaomi.com")
                         _bridge_session.cookie_jar.clear_domain("mina.mi.com")
                         recovered = await _relogin_and_refresh(account, cfg)
-                        if recovered:
-                            na, devices = recovered
+                        if recovered.get("ok"):
+                            if recovered.get("na") is not None:
+                                na = recovered["na"]
+                            if recovered.get("devices"):
+                                devices = recovered["devices"]
                             # 刷新成功后同步 MiNAService 与轮询 Cookie
                             _apply_cookie_to_session(_bridge_session, cfg)
                             relogin_backoff = RELOGIN_BACKOFF_START
                             bridge_state["error"] = None
+                            bridge_state["renewal"] = None
+                            # 401 恢复已经换过一次票：把续期计划往后推，
+                            # 否则主动续期会紧接着再换一次同一份凭据。
+                            next_refresh_at = time.time() + refresh_interval
+                            credential_mark = _credential_fingerprint()
                             log.info("Token 刷新成功，已恢复轮询")
                             await asyncio.sleep(poll_interval)
                         else:
@@ -1287,18 +1455,21 @@ replace_exact(
     return {}
 
 
-def _save_auth_and_token(account) -> None:
+def _save_auth_and_token(account) -> dict:
     """保存登录成功后得到的凭据，且永不把有效字段写成空值。
 
     只写回非空的身份字段；缺失字段回退到磁盘上已有的值，因此一次不完整的
     刷新不会销毁仍然可用的 passToken。
+
+    返回 {"ok": bool, "reason": str}：调用方必须据此决定「已保存」的文案，
+    写盘失败不能被当成成功（否则面板会在没落盘时报告已保存）。
     """
     if not _credential_write_allowed():
         log.warning("已取消的登录请求不得重新保存凭据")
-        return
+        return {"ok": False, "reason": "cancelled"}
     token = getattr(account, "token", None)
     if not isinstance(token, dict) or not token:
-        return
+        return {"ok": False, "reason": "empty"}
     previous_token = _read_saved_credential(TOKEN_PATH)
     previous_auth = _read_saved_credential(AUTH_PATH)
     candidate_user = str(token.get("userId") or "").strip()
@@ -1315,14 +1486,14 @@ def _save_auth_and_token(account) -> None:
     }
     if not identity["userId"] or not identity["passToken"]:
         log.warning("跳过保存登录信息：凭据不完整，保留已有文件")
-        return
+        return {"ok": False, "reason": "incomplete"}
     token_data = dict(identity)
     micoapi = token.get("micoapi") or (previous_token.get("micoapi") if same_identity else None)
     if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
         token_data["micoapi"] = [micoapi[0], micoapi[1]]
     if "micoapi" not in token_data:
         log.warning("登录没有有效 micoapi serviceToken，拒绝覆盖原有凭据")
-        return
+        return {"ok": False, "reason": "no-service-token"}
     try:
         _persist_sms_credentials({
             "userId": identity["userId"], "passToken": identity["passToken"],
@@ -1332,6 +1503,8 @@ def _save_auth_and_token(account) -> None:
         })
     except Exception as e:
         log.warning("保存小米登录凭据失败 (%s)", type(e).__name__)
+        return {"ok": False, "reason": "write-failed"}
+    return {"ok": True, "reason": ""}
 ''',
 )
 
@@ -5054,12 +5227,22 @@ _last_refresh_failure: dict = {}
 
 
 def _relogin_failure_from(exc: BaseException) -> dict:
-    \"\"\"Turn a failed exchange into a retry decision: {code, message, fatal}.\"\"\"
+    \"\"\"Turn a failed exchange into a retry decision: {code, message, fatal, kind}.\"\"\"
     code = getattr(exc, "xiaomi_code", None)
+    if isinstance(exc, CredentialIdentityMismatch):
+        kind = "identity"
+    elif isinstance(exc, ValueError):
+        # 本地凭据不完整（缺 userId/passToken）：重试多少次都是同一个结果。
+        kind = "missing"
+    elif code in RELOGIN_FATAL_CODES:
+        kind = "rejected"
+    else:
+        kind = "transient"
     return {
         "code": code,
         "message": str(exc) or type(exc).__name__,
-        "fatal": code in RELOGIN_FATAL_CODES,
+        "fatal": kind != "transient",
+        "kind": kind,
     }
 
 
@@ -5068,7 +5251,14 @@ def _relogin_retry_plan(failure: dict | None, backoff: int) -> tuple:
     failure = failure or {}
     code = failure.get("code")
     if failure.get("fatal"):
-        if code is None:
+        kind = failure.get("kind") or ("rejected" if code is not None else "missing")
+        if kind == "identity":
+            return (
+                True, RELOGIN_FATAL_BACKOFF,
+                "小米返回的账号与已保存账号不一致：为避免写错账号已停止自动换票，"
+                "请到「小米账号」页确认账号后重新登录",
+            )
+        if kind == "missing":
             return (
                 True, RELOGIN_FATAL_BACKOFF,
                 "小米登录凭据缺失或已失效：无法自动换取 Token，"
@@ -5151,30 +5341,70 @@ replace_exact(
         log.warning("没有可用的扫码或 Cookie 凭据，无法自动刷新 Token")
         _last_refresh_failure = {"code": None,
                                  "message": "没有可用的扫码或 Cookie 凭据",
-                                 "fatal": True}
-        return None
+                                 "fatal": True, "kind": "missing"}
+        return _refresh_outcome(False, "no-identity", message="没有可用的登录凭据")
 
-    snapshot = _token_snapshot(account)
-    try:
-        await _refresh_micoapi_token(
-            account,
-            saved["userId"],
-            saved["passToken"],
-            saved.get("deviceId") or get_random(16).upper(),
-        )
+    started = (saved["userId"], saved["passToken"])
+    cached = _recent_refresh(started)
+    if cached is not None:
+        return cached
+
+    async with _refresh_lock_obj():
+        # 另一个任务可能刚刚换完票：直接复用，别在成功后立刻再换一次。
+        cached = _recent_refresh(started)
+        if cached is not None:
+            return cached
+        # 上一次换票成功但写盘失败：只重试保存，不再向小米换一次票。
+        retry = _unsaved_refresh(started)
+        if retry is not None:
+            retry_outcome, pending = retry
+            if _save_refreshed_credentials(account, started, pending):
+                retry_outcome = dict(retry_outcome, saved=True, message="")
+                _remember_refresh(started, retry_outcome, pending)
+            return retry_outcome
+
+        snapshot = _token_snapshot(account)
+        device_id = _login_device_id(saved, account)
+        try:
+            await _refresh_micoapi_token(
+                account, saved["userId"], saved["passToken"], device_id
+            )
+        except Exception as e:
+            log.warning("Token 刷新失败: %s", e)
+            _last_refresh_failure = _relogin_failure_from(e)
+            _restore_token(account, snapshot)
+            return _refresh_outcome(False, "exchange", message=str(e))
+
+        rotated = bool((getattr(account, "token", None) or {}).get("pass_token_rotated"))
+        # 换票已经成功。设备发现是独立的一步：暂时失败或返回空列表都不能把刚拿到的
+        # 轮换凭据丢掉（空列表只说明「还没发现可监听设备」，不是认证失败）。
         na = MiNAService(account)
-        devices = await na.device_list()
-        if not devices:
-            raise RuntimeError("设备列表为空")
-    except Exception as e:
-        log.warning("Token 刷新失败: %s", e)
-        _last_refresh_failure = _relogin_failure_from(e)
-        _restore_token(account, snapshot)
-        return None
+        devices = None
+        stage = "device_list"
+        try:
+            devices = await na.device_list()
+            if devices:
+                stage = "ok"
+        except Exception as e:
+            log.warning("换票成功，但获取设备列表失败: %s", e)
 
-    _last_refresh_failure = {}
-    _save_auth_and_token(account)
-    return na, devices
+        token = getattr(account, "token", None) or {}
+        micoapi = token.get("micoapi") or ("", "")
+        pending = {
+            "userId": str(token.get("userId") or ""),
+            "passToken": str(token.get("passToken") or ""),
+            "deviceId": str(token.get("deviceId") or ""),
+            "ssecurity": micoapi[0] if len(micoapi) > 1 else "",
+            "serviceToken": micoapi[1] if len(micoapi) > 1 else "",
+        }
+        saved_ok = _save_refreshed_credentials(account, started, pending)
+        _last_refresh_failure = {}
+        outcome = _refresh_outcome(
+            True, stage, na=na, devices=devices, saved=saved_ok, rotated=rotated,
+            message="" if saved_ok else "已换取新 Token，但未能写入 /data",
+        )
+        _remember_refresh(started, outcome, pending)
+        return outcome
 """,
 )
 
@@ -5277,22 +5507,31 @@ TOKEN_REFRESH_RETRY = 300
 
 def _refresh_interval_seconds(mi_cfg: dict | None = None) -> int:
     \"\"\"How often to renew the micoapi session before it expires (default 6h).\"\"\"
+    import math
+
     raw = (mi_cfg or {}).get("token_refresh_hours")
     try:
         hours = float(raw)
     except (TypeError, ValueError):
         hours = 6.0
-    if hours <= 0:
+    # NaN / inf / 0 / 负数 / 荒谬的大值都必须落回默认，否则 int() 会抛异常，
+    # 或者把续期排到几百年之后。
+    if not math.isfinite(hours) or hours <= 0:
         hours = 6.0
-    return max(900, int(hours * 3600))
+    return max(900, min(int(hours * 3600), 7 * 24 * 3600))
 
 
 def _token_age_seconds() -> float:
     \"\"\"Age of the saved service token; an unknown age means "renew right away".\"\"\"
+    import math
+
     saved = _read_saved_credential(TOKEN_PATH)
     try:
         issued = float(saved.get("issued_at"))
     except (TypeError, ValueError):
+        return float("inf")
+    # NaN 会让所有比较都变成 False（于是永远不续期），必须当成「年龄未知」。
+    if not math.isfinite(issued):
         return float("inf")
     return max(0.0, time.time() - issued)
 
@@ -5311,28 +5550,52 @@ replace_exact(
                 device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
 """,
     """        bridge_state["error"] = None
+        bridge_state["renewal"] = None
         relogin_backoff = RELOGIN_BACKOFF_START
         # 主动续期：serviceToken 还在有效期内就换一张新的，登录态不因自然过期中断。
         refresh_interval = _refresh_interval_seconds(mi_cfg)
         next_refresh_at = time.time() + max(0.0, refresh_interval - _token_age_seconds())
+        credential_mark = _credential_fingerprint()
 
         while bridge_state["running"]:
             try:
+                # 用户重新登录 / 清除凭据后磁盘上的凭据会变：立即切到新身份，
+                # 不要让桥接器继续无限期使用旧账号的会话。
+                if _credential_fingerprint() != credential_mark:
+                    credential_mark = _credential_fingerprint()
+                    next_refresh_at = 0.0
+                    log.info("检测到登录凭据变化，立即切换到新的登录态")
+
                 if time.time() >= next_refresh_at:
                     next_refresh_at = time.time() + refresh_interval
                     log.info("登录态主动续期（每 %d 小时一次）",
                              max(1, refresh_interval // 3600))
-                    renewed = await _relogin_and_refresh(account, cfg)
-                    if renewed:
-                        na, fresh_devices = renewed
-                        if not devices and fresh_devices:
-                            devices = fresh_devices
+                    outcome = await _relogin_and_refresh(account, cfg)
+                    if outcome.get("ok"):
+                        if outcome.get("na") is not None:
+                            na = outcome["na"]
+                        if not devices and outcome.get("devices"):
+                            devices = outcome["devices"]
                         _apply_cookie_to_session(_bridge_session, cfg)
-                        log.info("登录态续期成功，已保存新的 serviceToken")
+                        credential_mark = _credential_fingerprint()
+                        if outcome.get("saved"):
+                            bridge_state["renewal"] = None
+                            log.info("登录态续期成功，已保存新的 serviceToken")
+                        else:
+                            # 换票成功但没写进 /data：本次运行可用，重启后仍用旧票。
+                            bridge_state["renewal"] = (
+                                "已换取新 Token，但未能写入 /data（重启后可能需要重新登录）"
+                            )
+                            log.error("登录态已续期但未能持久化: %s",
+                                      outcome.get("message") or "写入失败")
                     else:
                         # 续期失败不等于登录失败：当前 serviceToken 还能用，先重试，
                         # 不要把它写成面板错误，否则用户会被误导去重新扫码。
                         next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
+                        bridge_state["renewal"] = (
+                            "当前登录仍可用，但自动续期异常（%s），%ss 后重试"
+                            % (outcome.get("message") or "未知原因", TOKEN_REFRESH_RETRY)
+                        )
                         log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
                                     TOKEN_REFRESH_RETRY)
 

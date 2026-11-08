@@ -107,6 +107,15 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         "_read_saved_credential",
         "_refresh_interval_seconds",
         "_token_age_seconds",
+        "_plausible_credential",
+        "_adopt_login_identity",
+        "_login_device_id",
+        "_refresh_lock_obj",
+        "_refresh_outcome",
+        "_recent_refresh",
+        "_remember_refresh",
+        "_unsaved_refresh",
+        "_save_refreshed_credentials",
     )
     namespace = {
         "TOKEN_PATH": token_path,
@@ -121,6 +130,13 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         "asyncio": asyncio,
         "time": time,
         "bridge_state": {"running": True},
+        "REFRESH_COALESCE_SECONDS": 60,
+        "CredentialIdentityMismatch": type(
+            "CredentialIdentityMismatch", (RuntimeError,), {}
+        ),
+        "_refresh_lock": None,
+        "_process_login_device_id": "",
+        "_refresh_cache": {},
         "load_config": lambda: cfg,
         "aiohttp": SimpleNamespace(
             ClientTimeout=lambda **kwargs: ("timeout", kwargs),

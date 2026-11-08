@@ -56,13 +56,20 @@ def main() -> int:
     result = Result()
     errors: list[str] = []
     posted: list[dict] = []
-    state = {"fail_create": False}
+    toggles: list[dict] = []
+    state = {"fail_create": False, "automations": []}
 
     def open_page(page):
         def api(route):
             request = route.request
             path = request.url.split("://", 1)[-1]
             path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+            if path.startswith("/api/automations/") and path.endswith("/toggle"):
+                toggles.append(json.loads(request.post_data or "{}"))
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "enabled": False,
+                                               "msg": "已暂停"}))
+                return
             if path.startswith("/api/automations"):
                 if request.method == "POST":
                     posted.append(json.loads(request.post_data or "{}"))
@@ -76,7 +83,9 @@ def main() -> int:
                                                    "automation_id": "xiaoai_bridge_0730_light"}))
                     return
                 route.fulfill(status=200, content_type="application/json",
-                              body=json.dumps({"ok": True, "automations": []}))
+                              body=json.dumps({"ok": True,
+                                               "count": len(state["automations"]),
+                                               "automations": state["automations"]}))
                 return
             if path.startswith("/api/devices"):
                 route.fulfill(status=200, content_type="application/json",
@@ -196,6 +205,41 @@ def main() -> int:
             result.check("the form stays open after a failure",
                          page.is_visible("#schedule-form"))
             state["fail_create"] = False
+
+            # ── the list shows next run / source / HA-not-loaded, and can pause ──
+            state["automations"] = [
+                {"config_id": "xiaoai_bridge_0730_switch_reshui",
+                 "entity_id": "automation.xiaoai_bridge_0730_switch_reshui",
+                 "alias": "小爱桥接-07:30 switch.reshui", "state": "on",
+                 "last_triggered": "2026-11-08T07:30:01", "time": "07:30",
+                 "weekdays": [], "source": "voice", "next_run": "2026-11-09 07:30",
+                 "status": "active"},
+                {"config_id": "xiaoai_bridge_0900_daily_light_a_light_turn_off",
+                 "entity_id": "", "alias": "小爱桥接-09:00 light.a（HA 未加载）",
+                 "state": "", "last_triggered": None, "time": "09:00",
+                 "weekdays": [], "source": "form", "next_run": "2026-11-09 09:00",
+                 "status": "not_loaded"},
+            ]
+            page.click('button[onclick="loadSchedules()"]')
+            page.wait_for_timeout(250)
+            rows = page.eval_on_selector_all(
+                "#schedule-list .rule-item", "els => els.map(e => e.textContent)")
+            result.eq("both tasks are listed", len(rows), 2)
+            joined = " | ".join(rows)
+            result.check("the row shows the next run", "下次: 2026-11-09 07:30" in joined, joined)
+            result.check("the row shows the source", "来源: 语音" in joined, joined)
+            result.check("the row shows the last trigger", "上次:" in joined, joined)
+            result.check("the task HA has not loaded is flagged", "HA 未加载" in joined, joined)
+            pause = page.query_selector_all(
+                '#schedule-list button[onclick^="toggleSchedule"]')
+            result.eq("only the loaded task offers pause", len(pause), 1)
+            toggles.clear()
+            if pause:
+                pause[0].click()
+                page.wait_for_timeout(300)
+            result.eq("pausing posts once", len(toggles), 1)
+            result.eq("pausing asks HA to disable it",
+                      (toggles[0] if toggles else {}).get("enabled"), False)
 
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()

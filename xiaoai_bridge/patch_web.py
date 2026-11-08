@@ -1206,7 +1206,22 @@ var SCHEDULE_ACTIONS={
 };
 var SCHEDULE_WEEKDAYS=[['1','一'],['2','二'],['3','三'],['4','四'],['5','五'],['6','六'],['7','日']];
 var scheduleDaysDraft=[];
-function scheduleActionsFor(domain){return SCHEDULE_ACTIONS[domain]||[['turn_on','打开'],['turn_off','关闭']];}
+var haServiceCache={};
+function scheduleActionsFor(domain){
+  var base=SCHEDULE_ACTIONS[domain]||[['turn_on','打开'],['turn_off','关闭']];
+  var known=haServiceCache[domain];
+  if(Array.isArray(known)&&known.length){
+    var only=base.filter(function(p){return known.indexOf(p[0])>=0;});
+    if(only.length)return only;
+  }
+  return base;
+}
+function loadHaServices(){
+  return fetch('/api/ha/services').then(function(r){return r.json()}).then(function(d){
+    if(d&&d.ok&&d.services)haServiceCache=d.services;
+    return haServiceCache;
+  }).catch(function(){return haServiceCache});
+}
 function scheduleDeviceList(){
   var list=(typeof haDevices!=='undefined'&&Array.isArray(haDevices))?haDevices:[];
   return list.filter(function(d){
@@ -1314,7 +1329,7 @@ function schedulePreview(){
   if(!dev){box.textContent='先选择设备';return;}
   box.textContent=scheduleDaysText(days)+' '+(time||'--:--')+'，'+(label||service)+'「'+(dev.name||dev.entity_id)+'」';
 }
-function scheduleFormToggle(){
+function scheduleFormToggle(){loadHaServices().then(scheduleRenderActions);
   var f=document.getElementById('schedule-form');if(!f)return;
   var show=f.style.display==='none';
   f.style.display=show?'block':'none';
@@ -1455,6 +1470,12 @@ replace_exact(
     "initialise the listening scope draft from the saved config",
     '''  safeSet('mi-did',mi.device_did||'');safeCheck('mi-tts',mi.tts_reply!==false);''',
     '''  safeSet('mi-did',mi.device_did||'');safeCheck('mi-tts',mi.tts_reply!==false);miScopeReset();''',
+)
+
+replace_exact(
+    "schedules list shows next run, source, HA-not-loaded and can pause",
+    'async function loadSchedules(){const a=document.getElementById(\'schedules-alert\');try{const r=await fetch(\'/api/automations\');const d=await r.json();if(!d.ok){showAlert(a,\'err\',d.msg);return}document.getElementById(\'schedule-count\').textContent=d.count+\'个\';const list=document.getElementById(\'schedule-list\');if(!d.automations.length){list.innerHTML=\'<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>\';return}list.innerHTML=d.automations.map(s=>{const name=escHtml(s.alias||s.entity_id);const eid=escHtml(s.entity_id);const id=(s.config_id||\'\').trim()||s.entity_id.replace(\'automation.\',\'\');const st=s.state===\'on\';const last=s.last_triggered?new Date(s.last_triggered).toLocaleString(\'zh-CN\'):\'从未\';return\'<div class="rule-item"><div class="device-item"><div class="device-info"><div class="device-name">\'+name+\'</div><div class="device-meta">\'+eid+\'</div><div style="font-size:10px;color:var(--txt-dim);margin-top:2px">上次: \'+last+\'</div></div><div style="display:flex;align-items:center;gap:10px"><span class="schedule-state \'+(st?\'on\':\'off\')+\'">\'+(st?\'启用\':\'禁用\')+\'</span><button class="rule-del" onclick="deleteSchedule(\\\'\'+escAttr(id)+\'\\\')">✕</button></div></div></div>\'}).join(\'\')}catch(e){showAlert(a,\'err\',\'加载失败: \'+e.message)}}\n',
+    'async function loadSchedules(){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations\');\n    const d=await r.json();\n    if(!d.ok){showAlert(a,\'err\',d.msg);return}\n    document.getElementById(\'schedule-count\').textContent=d.count+\'个\';\n    const list=document.getElementById(\'schedule-list\');\n    if(!d.automations.length){\n      list.innerHTML=\'<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>\';\n      return;\n    }\n    list.innerHTML=d.automations.map(function(s){\n      const name=escHtml(s.alias||s.entity_id||\'（未命名任务）\');\n      const eid=escHtml(s.entity_id||\'\');\n      const id=(s.config_id||\'\').trim()||String(s.entity_id||\'\').replace(\'automation.\',\'\');\n      const on=s.state===\'on\';\n      const last=s.last_triggered?new Date(s.last_triggered).toLocaleString(\'zh-CN\'):\'从未\';\n      const next=s.next_run?escHtml(s.next_run):\'—\';\n      const missing=s.status===\'not_loaded\';\n      const src=s.source===\'voice\'?\'语音\':(s.source===\'form\'?\'面板\':\'\');\n      const badge=missing?\'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>\':\'\';\n      const toggle=missing?\'\':\'<button class="rule-del" title="暂停/启用" data-id="\'+escAttr(id)+\'" data-on="\'+(on?\'false\':\'true\')+\'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">\'+(on?\'⏸\':\'▶\')+\'</button>\';\n      return \'<div class="rule-item"><div class="device-item"><div class="device-info">\'\n        +\'<div class="device-name">\'+name+badge+\'</div>\'\n        +\'<div class="device-meta">\'+(eid||\'（配置已写入，HA 尚未加载）\')+\'</div>\'\n        +\'<div style="font-size:10px;color:var(--txt-dim);margin-top:2px">下次: \'+next+\' · 上次: \'+last+(src?\' · 来源: \'+src:\'\')+\'</div>\'\n        +\'</div><div style="display:flex;align-items:center;gap:10px">\'\n        +\'<span class="schedule-state \'+(on?\'on\':\'off\')+\'">\'+(on?\'启用\':\'禁用\')+\'</span>\'\n        +toggle\n        +\'<button class="rule-del" onclick="deleteSchedule(\\\'\'+escAttr(id)+\'\\\')">✕</button>\'\n        +\'</div></div></div>\';\n    }).join(\'\');\n  }catch(e){showAlert(a,\'err\',\'加载失败: \'+e.message)}\n}\nasync function toggleSchedule(id,enabled){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations/\'+encodeURIComponent(id)+\'/toggle\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({enabled:enabled===true||enabled===\'true\'})});\n    const d=await r.json().catch(function(){return {}});\n    if(d&&d.ok){showAlert(a,\'ok\',d.msg||\'已切换\');loadSchedules()}\n    else{showAlert(a,\'err\',(d&&d.detail)||\'切换失败\')}\n  }catch(e){showAlert(a,\'err\',\'切换失败: \'+e.message)}\n}\n',
 )
 
 path.write_text(html, encoding="utf-8")

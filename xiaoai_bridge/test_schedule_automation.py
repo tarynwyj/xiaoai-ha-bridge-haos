@@ -42,6 +42,8 @@ FUNCTIONS = (
     "_schedule_listing",
     "create_automation",
     "delete_automation",
+    "toggle_automation",
+    "ha_services",
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
           "_automation_outcomes",
@@ -51,6 +53,7 @@ TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
 CURRENT_CONFIG = {"homeassistant": {"url": "http://ha.local:8123", "token": "ha-token"}}
 CREATED_HA = []
 ROUTES = {}
+SERVICE_CALLS = []
 _REGISTRY_PATH = __import__("os").path.join(
     __import__("tempfile").gettempdir(), "xiaoai-test-schedules.json")
 
@@ -59,6 +62,7 @@ class FakeHA:
     create_ok = True
     reload_ok = True
     delete_ok = True
+    service_ok = True
 
     def __init__(self):
         self.created = []
@@ -76,6 +80,10 @@ class FakeHA:
                 self.created_ids = []
             self.created_ids.append(automation_id)
         return type(self).create_ok
+
+    async def call_service(self, domain, service, data, session):
+        SERVICE_CALLS.append((domain, service, (data or {}).get("entity_id")))
+        return type(self).service_ok
 
     async def reload_automations(self, session):
         return type(self).reload_ok
@@ -112,6 +120,13 @@ class StubApp:
         return decorator
 
     def delete(self, path):
+        def decorator(func):
+            func.route = path
+            return func
+
+        return decorator
+
+    def get(self, path):
         def decorator(func):
             func.route = path
             return func
@@ -207,6 +222,8 @@ def main() -> int:
     create = ns["_create_ha_automation"]
     create_endpoint = ns["create_automation"]
     delete_endpoint = ns["delete_automation"]
+    toggle_endpoint = ns["toggle_automation"]
+    services_endpoint = ns["ha_services"]
     checks = 0
     failures = []
 
@@ -292,6 +309,54 @@ def main() -> int:
     other_time, _ok, _created = asyncio.run(run("07:31", None))
     check("a different request gets a different config id",
           other_time not in repeated, (other_time, repeated))
+
+    # ── 暂停/启用：页面按钮最终落到 HA 的 automation.turn_off / turn_on ──
+    ROUTES.clear()
+    SERVICE_CALLS.clear()
+
+    def run_toggle(automation_id, enabled):
+        try:
+            return asyncio.run(toggle_endpoint(automation_id, {"enabled": enabled})), None
+        except HttpError as exc:
+            return None, exc
+
+    payload, error = run_toggle("xiaoai_bridge_0730_light", False)
+    check("pausing returns ok", error is None and payload and payload.get("ok"), (payload, error))
+    eq("pausing calls automation.turn_off",
+       SERVICE_CALLS[-1:], [("automation", "turn_off", "automation.xiaoai_bridge_0730_light")])
+    eq("pausing reports 已暂停", (payload or {}).get("msg"), "已暂停")
+
+    payload, error = run_toggle("xiaoai_bridge_0730_light", True)
+    check("resuming returns ok", error is None and payload and payload.get("ok"), (payload, error))
+    eq("resuming calls automation.turn_on",
+       SERVICE_CALLS[-1:], [("automation", "turn_on", "automation.xiaoai_bridge_0730_light")])
+    eq("resuming reports 已启用", (payload or {}).get("msg"), "已启用")
+
+    # HA 拒绝时必须报错，不能假装成功
+    FakeHA.service_ok = False
+    try:
+        payload, error = run_toggle("xiaoai_bridge_0730_light", False)
+    finally:
+        FakeHA.service_ok = True
+    check("a refused toggle raises instead of reporting success",
+          error is not None and payload is None, (payload, error))
+
+    # ── /api/ha/services：表单要能拿到 HA 真正提供的服务 ──
+    ROUTES["http://ha.local:8123/api/services"] = (
+        200,
+        [{"domain": "switch", "services": {"turn_on": {}, "turn_off": {}, "toggle": {}}},
+         {"domain": "light", "services": {"turn_on": {}, "turn_off": {}}},
+         {"domain": "sensor", "services": {}}],
+    )
+    try:
+        payload = asyncio.run(services_endpoint())
+        eq("services are grouped by domain",
+           sorted((payload or {}).get("services", {}).keys()), ["light", "sensor", "switch"])
+        eq("service names are listed",
+           (payload or {}).get("services", {}).get("switch"), ["toggle", "turn_off", "turn_on"])
+    except HttpError as exc:
+        check("ha services endpoint must not raise", False, str(exc))
+    ROUTES.clear()
 
     # audit P2-1: no entity -> no empty target
     _, ok, created = asyncio.run(run("07:30", None, domain="notify", service="notify", data={}))

@@ -5788,6 +5788,338 @@ replace_exact(
 """,
 )
 
+# ════════════════ 定时任务：语音中文解析 + 幂等创建 + 回读校验 ════════════════
+replace_exact(
+    "voice: fall back to the built-in Chinese schedule parser",
+    r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
+""",
+    r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
+                    if not action:
+                        # 语音定时任务：正则规则没命中时，用内置中文解析兜底，
+                        # 解析不出就明确写日志，不能让用户以为任务建好了。
+                        try:
+                            _catalog = await _ha_device_catalog(ha, _bridge_session)
+                        except Exception:
+                            _catalog = []
+                        action = _parse_schedule_command(
+                            query, _catalog, bridge_state.get("device_aliases") or {}
+                        )
+                        if action:
+                            log.info("🕐 识别为定时任务: %s → 每天/指定星期 %s %s %s",
+                                     query, action.get("schedule_time"),
+                                     action.get("schedule_days"), action.get("entity_id"))
+                        elif _looks_like_schedule(query):
+                            log.warning("⏱ 这句话像定时任务，但没能解析出时间/星期/设备: %s"
+                                        "（设备名需与 HA 中的名称一致，或用面板创建）", query)
+""",
+)
+
+replace_exact(
+    "voice: say so when nothing matched",
+    r"""                        bridge_state["command_count"] += 1
+                        bridge_state["connected"] = True
+            except asyncio.CancelledError:""",
+    r"""                        bridge_state["command_count"] += 1
+                        bridge_state["connected"] = True
+                    else:
+                        log.info("🔇 未匹配任何规则: %s", query)
+            except asyncio.CancelledError:""",
+)
+
+source = source + r"""
+
+# ════════════════ 语音定时任务（中文解析 + 幂等 + 回读校验） ════════════════
+# 这一整块覆盖上游的 _create_ha_automation：同名函数后定义者生效。
+# 上游实现只关心「提交成功」，这里补上「重复请求不重复建」和「HA 里真的存在」。
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_CN_WEEKDAY = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+               "六": "6", "日": "7", "天": "7"}
+_SCHEDULE_HINTS = ("每天", "每日", "天天", "每周", "每星期", "工作日", "周末",
+                   "明天", "后天", "今晚", "早上", "上午", "中午", "下午", "晚上")
+_automation_outcomes: dict = {}
+_ha_catalog = {"at": 0.0, "devices": []}
+
+
+def _automation_outcome(automation_id: str, status: str, ok: bool) -> None:
+    '''Remember how a create actually ended so callers can tell the truth.'''
+    globals().setdefault("_automation_outcomes", {})[automation_id] = {
+        "status": status, "ok": bool(ok)}
+
+
+def _automation_stable_id(at_time: str, weekdays, entity_id: str,
+                          domain: str, service: str) -> str:
+    '''Deterministic config id: repeating the same request cannot duplicate it.'''
+    parts = [at_time.replace(":", ""), "-".join(weekdays or ["daily"]),
+             entity_id or "none", domain, service]
+    slug = re.sub(r"[^a-z0-9]+", "_", "_".join(parts).lower()).strip("_")
+    return (_AUTOMATION_PREFIX + slug)[:60]
+
+
+async def _automation_exists(ha, automation_id: str, session):
+    '''True/False when HA answers, None when it cannot be determined.'''
+    try:
+        states = await ha.list_automation_states(session)
+    except Exception as e:
+        log.warning("回读定时任务失败: %s", type(e).__name__)
+        return None
+    if not isinstance(states, list):
+        return None
+    for state in states:
+        if isinstance(state, dict) and str(
+                (state.get("attributes") or {}).get("id") or "") == automation_id:
+            return True
+    return False
+
+
+def _cn_int(token):
+    token = str(token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    if token == "十":
+        return 10
+    if "十" in token:
+        head, _, tail = token.partition("十")
+        tens = _CN_DIGITS.get(head, 1) if head else 1
+        ones = _CN_DIGITS.get(tail, 0) if tail else 0
+        return tens * 10 + ones
+    total = 0
+    for ch in token:
+        if ch not in _CN_DIGITS:
+            return None
+        total = total * 10 + _CN_DIGITS[ch]
+    return total
+
+
+def _parse_cn_clock(text: str):
+    '''Return (HH:MM, span) for the first clock expression, else (None, None).'''
+    match = re.search(r"(\d{1,2})\s*[:：]\s*(\d{2})", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return "%02d:%02d" % (hour, minute), match.span()
+    pattern = (r"([零〇一二两三四五六七八九十\d]{1,3})\s*[点时]\s*"
+               r"(半|一刻|三刻|[零〇一二两三四五六七八九十\d]{1,3}\s*分?)?")
+    match = re.search(pattern, text)
+    if not match:
+        return None, None
+    hour = _cn_int(match.group(1))
+    if hour is None or not 0 <= hour <= 24:
+        return None, None
+    tail = (match.group(2) or "").strip()
+    minute = 0
+    if tail == "半":
+        minute = 30
+    elif tail == "一刻":
+        minute = 15
+    elif tail == "三刻":
+        minute = 45
+    elif tail:
+        parsed = _cn_int(tail.replace("分", ""))
+        if parsed is not None and 0 <= parsed <= 59:
+            minute = parsed
+    return "%02d:%02d" % (hour % 24, minute), match.span()
+
+
+def _apply_period(text: str, at_time: str) -> str:
+    '''晚上七点 -> 19:00; 下午三点 -> 15:00; 早上七点 stays 07:00.'''
+    hour_text, minute_text = at_time.split(":")
+    hour = int(hour_text)
+    if any(w in text for w in ("下午", "晚上", "傍晚", "夜里", "夜间", "今晚")) and hour < 12:
+        hour += 12
+    elif "中午" in text and hour < 12:
+        hour += 12
+    return "%02d:%s" % (hour % 24, minute_text)
+
+
+def _parse_schedule_days_cn(text: str):
+    '''Return ("daily"|"weekdays"|"weekends"|"1,3,5"|None, once).'''
+    once = any(w in text for w in ("明天", "后天", "今晚", "今天"))
+    if "工作日" in text:
+        return "weekdays", once
+    if "周末" in text:
+        return "weekends", once
+    match = re.search(r"每(?:周|星期)\s*([一二三四五六日天、,，和及\s]+)", text)
+    if match:
+        days = []
+        for ch in match.group(1):
+            if ch in _CN_WEEKDAY and _CN_WEEKDAY[ch] not in days:
+                days.append(_CN_WEEKDAY[ch])
+        return (",".join(sorted(days)), once) if days else (None, once)
+    if any(w in text for w in ("每天", "每日", "天天")):
+        return "daily", once
+    return ("daily", once) if once else (None, once)
+
+
+def _looks_like_schedule(text: str) -> bool:
+    return any(w in str(text or "") for w in _SCHEDULE_HINTS)
+
+
+def _pick_schedule_device(text: str, devices, aliases):
+    '''Longest device name/alias that appears in the sentence wins.'''
+    best = None
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        entity_id = str(device.get("entity_id") or "")
+        if not entity_id:
+            continue
+        names = [str(device.get("name") or "")]
+        for alias, target in (aliases or {}).items():
+            if target == entity_id:
+                names.append(str(alias))
+        for name in names:
+            name = name.strip()
+            if len(name) >= 2 and name in text:
+                if best is None or len(name) > len(best[0]):
+                    best = (name, device)
+    return best[1] if best else None
+
+
+def _schedule_service_for(domain: str, text: str) -> str:
+    if any(w in text for w in ("关掉", "关闭", "关上", "停止", "停掉", "关一下")):
+        return "close_cover" if domain == "cover" else "turn_off"
+    if any(w in text for w in ("切换", "翻转")):
+        return "toggle"
+    return "open_cover" if domain == "cover" else "turn_on"
+
+
+def _parse_schedule_command(text: str, devices, aliases):
+    '''Turn 「每天早上七点半打开热水器」 into a schedule action, or None.'''
+    text = str(text or "").strip()
+    if not text or not _looks_like_schedule(text):
+        return None
+    at_time, _span = _parse_cn_clock(text)
+    if not at_time:
+        return None
+    at_time = _apply_period(text, at_time)
+    days, once = _parse_schedule_days_cn(text)
+    if days is None:
+        return None
+    device = _pick_schedule_device(text, devices, aliases)
+    if not device:
+        return None
+    domain = str(device.get("domain") or str(device.get("entity_id") or "").split(".")[0])
+    service = _schedule_service_for(domain, text)
+    entity_id = str(device.get("entity_id") or "")
+    name = str(device.get("name") or entity_id)
+    verb = "打开"
+    if "off" in service or service == "close_cover":
+        verb = "关闭"
+    elif service == "toggle":
+        verb = "切换"
+    return {
+        "type": "schedule",
+        "schedule_time": at_time,
+        "schedule_days": days,
+        "once": once,
+        "domain": domain,
+        "service": service,
+        "entity_id": entity_id,
+        "reply": verb + name,
+    }
+
+
+async def _ha_device_catalog(ha, session) -> list:
+    '''Cache the HA entity list for voice schedule parsing (60s).'''
+    now = time.monotonic()
+    if _ha_catalog["devices"] and now - _ha_catalog["at"] < 60:
+        return _ha_catalog["devices"]
+    try:
+        async with session.get(
+            ha.base + "/api/states", headers=ha.headers,
+            timeout=aiohttp.ClientTimeout(total=8), allow_redirects=False
+        ) as response:
+            if response.status != 200:
+                return _ha_catalog["devices"]
+            states = await response.json()
+    except Exception as e:
+        log.warning("读取 HA 设备列表失败，语音定时任务暂不可用: %s", type(e).__name__)
+        return _ha_catalog["devices"]
+    devices = []
+    for state in states if isinstance(states, list) else []:
+        if not isinstance(state, dict):
+            continue
+        entity_id = str(state.get("entity_id") or "")
+        if not entity_id or entity_id.split(".")[0] in (
+                "automation", "scene", "sensor", "binary_sensor", "zone", "person"):
+            continue
+        attributes = state.get("attributes") or {}
+        devices.append({
+            "entity_id": entity_id,
+            "domain": entity_id.split(".")[0],
+            "name": str(attributes.get("friendly_name") or entity_id),
+            "state": state.get("state", ""),
+        })
+    _ha_catalog["devices"] = devices
+    _ha_catalog["at"] = now
+    return devices
+
+
+async def _create_ha_automation(
+    ha, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days=None,
+    session=None,
+):
+    '''Create one time-triggered automation, idempotently and verified.
+
+    Differences from the upstream version: the config id is derived from the
+    request (so saying the same thing twice cannot create two tasks), and after
+    reloading we read the automation back from HA before reporting success.
+    '''
+    at_time = _normalize_schedule_time(schedule_time)
+    if not at_time:
+        log.warning("定时任务时间格式无效: %r", schedule_time)
+        return "", False
+    entity_id = str(data.get("entity_id") or "")
+    weekdays = _normalize_schedule_weekdays(schedule_days)
+    automation_id = _automation_stable_id(at_time, weekdays, entity_id, domain, service)
+
+    action_item = {"service": "%s.%s" % (domain, service)}
+    if entity_id:
+        action_item["target"] = {"entity_id": entity_id}
+    extra = {k: v for k, v in data.items() if k != "entity_id"}
+    if extra:
+        action_item["data"] = extra
+    config = {
+        "alias": "小爱桥接-%s %s" % (at_time[:5], entity_id or domain),
+        "description": "由小爱语音桥接器自动创建",
+        "trigger": [{"platform": "time", "at": at_time}],
+        "action": [action_item],
+        "mode": "single",
+    }
+    if weekdays:
+        config["condition"] = [{"condition": "time", "weekday": weekdays}]
+
+    existing = await _automation_exists(ha, automation_id, session)
+    if existing is True:
+        log.info("定时任务已存在，跳过重复创建: %s", automation_id)
+        _automation_outcome(automation_id, "exists", True)
+        return automation_id, True
+
+    ok = await ha.create_automation(automation_id, config, session)
+    if ok:
+        ok = await ha.reload_automations(session)
+    if not ok:
+        _automation_outcome(automation_id, "failed", False)
+        return automation_id, False
+
+    verified = await _automation_exists(ha, automation_id, session)
+    if verified is True:
+        _automation_outcome(automation_id, "verified", True)
+        return automation_id, True
+    if verified is False:
+        _automation_outcome(automation_id, "missing", False)
+        log.error("定时任务已提交但 HA 里查不到: %s（请检查 configuration.yaml 的 automation 配置）",
+                  automation_id)
+        return automation_id, False
+    _automation_outcome(automation_id, "unverified", True)
+    log.warning("定时任务已创建，但无法回读确认: %s", automation_id)
+    return automation_id, True
+"""
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

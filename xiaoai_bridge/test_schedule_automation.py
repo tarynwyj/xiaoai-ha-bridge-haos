@@ -30,10 +30,14 @@ FUNCTIONS = (
     "_schedule_ha_target_error",
     "_automation_config_state",
     "_create_ha_automation",
+    "_automation_stable_id",
+    "_automation_outcome",
+    "_automation_exists",
     "create_automation",
     "delete_automation",
 )
 TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
+          "_automation_outcomes",
           "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
           "_SCHEDULE_CROSS_DOMAIN_ALLOWED", "_SCHEDULE_RESERVED_DATA_KEYS")
 
@@ -55,6 +59,13 @@ class FakeHA:
 
     async def create_automation(self, automation_id, config, session):
         self.created.append(config)
+        if type(self).create_ok:
+            # A real HA exposes the new automation through /api/states once the
+            # config is written and reloaded; mirror that so the bridge's
+            # read-back check sees what it would see on a real instance.
+            if not hasattr(self, "created_ids"):
+                self.created_ids = []
+            self.created_ids.append(automation_id)
         return type(self).create_ok
 
     async def reload_automations(self, session):
@@ -62,10 +73,18 @@ class FakeHA:
 
     async def delete_automation(self, automation_id, session):
         self.deleted.append(automation_id)
+        ids = getattr(self, "created_ids", [])
+        if automation_id in ids:
+            ids.remove(automation_id)
         return type(self).delete_ok
 
     async def list_automation_states(self, session):
-        return []
+        ids = getattr(self, "created_ids", [])
+        return [
+            {"entity_id": "automation." + item, "state": "on",
+             "attributes": {"id": item, "friendly_name": item}}
+            for item in ids
+        ]
 
 
 class HttpError(Exception):
@@ -249,13 +268,19 @@ def main() -> int:
     _, ok, created = asyncio.run(run("25:00", None))
     check("invalid time is refused", not ok and not created)
 
-    # audit P1-2: rapid (sequential) creations in the same second must not share a
-    # config id; this is a uniqueness check, not a concurrency stress test.
-    ids = set()
+    # 同一个请求必须是幂等的：重复说同一句话只会有一条任务（旧实现用时间戳+随机后缀，
+    # 同一秒连说两次会得到两条任务，正是 issue 里「重复语音产生多条任务」的成因）。
+    repeated = set()
     for _ in range(25):
-        same_second_id, _ok, _created = asyncio.run(run("07:30", None))
-        ids.add(same_second_id)
-    check("rapid sequential creations get unique config ids", len(ids) == 25, len(ids))
+        same_request_id, _ok, _created = asyncio.run(run("07:30", None))
+        repeated.add(same_request_id)
+    check("repeating the same request yields one stable config id",
+          len(repeated) == 1, repeated)
+
+    # 不同请求仍然要拿到不同的 config id
+    other_time, _ok, _created = asyncio.run(run("07:31", None))
+    check("a different request gets a different config id",
+          other_time not in repeated, (other_time, repeated))
 
     # audit P2-1: no entity -> no empty target
     _, ok, created = asyncio.run(run("07:30", None, domain="notify", service="notify", data={}))

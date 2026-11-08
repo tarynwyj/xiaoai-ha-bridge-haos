@@ -5422,6 +5422,83 @@ async def get_logs(n: int = 80):
 """,
 )
 
+# ──────────────── J: 监听全部小爱设备（issue #15） ────────────────
+# 上游只取 devices[0]：账号里有多台小爱设备时，其它音箱说的话桥接器完全收不到，
+# 表现为「只有带屏幕那台能用」。DOCS 却写着「规则对所有设备生效」。
+# 这里改为：默认监听全部小爱设备（轮流轮询，每台各自一份 last_timestamp），
+# 需要限制时用 xiaomi.device_ids；device_id / device_did 仍表示「只听这一台」。
+replace_exact(
+    "poll targets for every xiaoai device",
+    """async def bridge_loop():
+""",
+    """def _poll_targets(mi_cfg: dict, devices: list) -> list:
+    \"\"\"小爱设备里需要监听语音的那几台。
+
+    默认全部：账号里有几台小爱设备就听几台（轮流轮询，每台一份 last_timestamp）。
+    `xiaomi.device_ids` 给出白名单时只保留这些；`xiaomi.device_id` / `device_did`
+    仍然表示「只听这一台」，保持旧配置的含义不变。
+    \"\"\"
+    wanted = mi_cfg.get("device_ids")
+    if isinstance(wanted, str):
+        wanted = [part.strip() for part in wanted.replace("，", ",").split(",")
+                  if part.strip()]
+    if not isinstance(wanted, list):
+        wanted = []
+    single = str(mi_cfg.get("device_id") or mi_cfg.get("device_did") or "").strip()
+    targets = []
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        device_id = str(device.get("deviceID") or "").strip()
+        if not device_id:
+            continue
+        if wanted:
+            if device_id not in wanted and device.get("did") not in wanted:
+                continue
+        elif single and device_id != single and device.get("did") != single:
+            continue
+        targets.append(device)
+    if targets:
+        return targets
+    # 设备列表为空或全部不匹配：退回配置里的单台，保持旧行为。
+    if single:
+        return [{"deviceID": single, "hardware": mi_cfg.get("hardware", "")}]
+    if devices and isinstance(devices[0], dict) and devices[0].get("deviceID"):
+        return [devices[0]]
+    return []
+
+
+async def bridge_loop():
+""",
+)
+
+replace_exact(
+    "poll every device instead of only the first one",
+    """                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+                if not device_id and devices:
+                    device_id = devices[0].get("deviceID", "")
+                if not device_id:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                hardware = mi_cfg.get("hardware", "")
+""",
+    """                targets = _poll_targets(mi_cfg, devices)
+                if not targets:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                # 多台小爱设备轮流轮询：每台各自一份 last_timestamp，谁说都听得到。
+                cursor = int(bridge_state.get("poll_cursor") or 0) % len(targets)
+                target = targets[cursor]
+                bridge_state["poll_cursor"] = (cursor + 1) % len(targets)
+                device_id = str(target.get("deviceID") or "").strip()
+                if not device_id:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                hardware = target.get("hardware") or mi_cfg.get("hardware", "")
+""",
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

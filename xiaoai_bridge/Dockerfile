@@ -53,6 +53,9 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'def _refresh_interval_seconds' /app/bridge.py \
     && grep -Fq 'def _token_age_seconds' /app/bridge.py \
     && grep -Fq 'def _log_file_handler' /app/bridge.py \
+    && grep -Fq 'def _poll_targets' /app/bridge.py \
+    && grep -Fq 'bridge_state["poll_cursor"]' /app/bridge.py \
+    && ! grep -Fq 'device_id = devices[0].get("deviceID", "")' /app/bridge.py \
     && grep -Fq 'def _log_lines_from_file' /app/bridge.py \
     && grep -Fq 'next_refresh_at = time.time()' /app/bridge.py \
     && grep -Fq 'token_data["issued_at"]' /app/bridge.py \

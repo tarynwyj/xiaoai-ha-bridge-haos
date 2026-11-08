@@ -55,6 +55,7 @@ WANTED_FUNCS = [
     "_wait_for_relogin",
     "_refresh_interval_seconds",
     "_token_age_seconds",
+    "_poll_targets",
     "_read_saved_credential",
     "_save_auth_and_token",
     "_merge_xiaomi_credentials",
@@ -174,6 +175,8 @@ class FakeAccount:
 
 
 class FakeMiNAService:
+    devices = None  # None -> the default single speaker
+
     def __init__(self, account):
         self.account = account
         FakeMiNAService.created.append(self)
@@ -190,6 +193,8 @@ class FakeMiNAService:
             # Emulate miservice: a 401 clears the in-memory token.
             self.account.token = None
             raise RuntimeError("HTTP 401")
+        if FakeMiNAService.devices is not None:
+            return list(FakeMiNAService.devices)
         return [{"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅音箱"}]
 
     async def text_to_speech(self, device_id, text):
@@ -262,6 +267,7 @@ class Harness:
         self.saved_configs = []
         self.sleeps = []
         self.verified_calls = []
+        self.polled_devices = []
         self.log = Logger()
         self.poll_script = []
         self.bridge_state = {
@@ -312,6 +318,7 @@ class Harness:
         )
 
     async def fake_poll(self, session, device_id, hardware, last_ts):
+        self.polled_devices.append(device_id)
         if self.poll_script:
             records, need_relogin = self.poll_script.pop(0)
         else:
@@ -848,6 +855,68 @@ def scenario_device_id_stays_stable(root: Path):
     return "a missing deviceId is generated once and then reused"
 
 
+def scenario_every_xiaoai_device_is_polled(root: Path):
+    """issue #15: with several speakers, every one of them must be listened to."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+        {"deviceID": "speaker-2", "hardware": "L05C", "name": "卧室"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 6:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    polled = harness.polled_devices
+    assert "speaker-1" in polled, f"the first speaker must be polled, got {polled}"
+    assert "speaker-2" in polled, (
+        f"issue #15: the second speaker must be polled too, got {polled}"
+    )
+    return "every xiaoai device is polled, not just devices[0]"
+
+
+def scenario_poll_target_filtering(root: Path):
+    """device_ids narrows the set; device_did still means "only this one"."""
+    harness = Harness(root)
+    targets = harness.namespace["_poll_targets"]
+    devices = [{"deviceID": "a", "hardware": "L05C"}, {"deviceID": "b", "did": "2"}]
+
+    ids = lambda cfg, devs=devices: [item["deviceID"] for item in targets(cfg, devs)]
+    assert ids({}) == ["a", "b"], f"default must be every device, got {ids({})}"
+    assert ids({"device_ids": ["b"]}) == ["b"], "device_ids must act as an allow-list"
+    assert ids({"device_ids": "a, b"}) == ["a", "b"], "a comma string must be accepted"
+    assert ids({"device_did": "a"}) == ["a"], "device_did must still mean one device"
+    assert ids({"device_did": "2"}) == ["b"], "device_did may also match the miot did"
+    assert ids({"device_ids": ["zz"]}) == ["a"], (
+        "an allow-list matching nothing must fall back to the first device, not poll nothing"
+    )
+    assert targets({"device_did": "zz"}, []) == [
+        {"deviceID": "zz", "hardware": ""}
+    ], "an empty device list must fall back to the configured speaker"
+    assert targets({}, []) == [], "no devices and no config must poll nothing"
+    return "poll targets honour device_ids / device_did / fallbacks"
+
+
 def scenario_save_credentials_never_blank(root: Path):
     harness = Harness(root)
     harness.write_token(
@@ -1032,6 +1101,8 @@ def main():
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
         scenario_device_id_stays_stable,
+        scenario_every_xiaoai_device_is_polled,
+        scenario_poll_target_filtering,
         scenario_runtime_refresh_failure,
         scenario_runtime_refresh_rejected,
         scenario_save_credentials_never_blank,

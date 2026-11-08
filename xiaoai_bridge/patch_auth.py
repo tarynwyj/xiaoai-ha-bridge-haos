@@ -155,6 +155,19 @@ async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
     if not user_id or not pass_token:
         raise ValueError("登录结果缺少 userId 或 passToken")
 
+    # 小米把「没见过的 deviceId」当成一次新设备登录：每次换票都换一个 deviceId 会被
+    # 风控盯上（社区实测：固定 deviceId 的会话能长期免验证，随机 deviceId 会持续触发
+    # 70016）。调用方没给就沿用内存里已有的，再没有才生成；生成后由
+    # _persist_sms_credentials 落盘，之后一直复用同一个。
+    device_id = str(device_id or "").strip()
+    if not device_id:
+        previous_token = getattr(account, "token", None)
+        if isinstance(previous_token, dict):
+            device_id = str(previous_token.get("deviceId") or "").strip()
+    if not device_id:
+        from miservice.miaccount import get_random
+        device_id = get_random(16).upper()
+
     account.token = {
         "deviceId": device_id,
         "userId": str(user_id),

@@ -261,6 +261,7 @@ class Harness:
         }
         self.saved_configs = []
         self.sleeps = []
+        self.verified_calls = []
         self.log = Logger()
         self.poll_script = []
         self.bridge_state = {
@@ -388,6 +389,8 @@ class Harness:
                                          user_agent=""):
             # Simulate the TLS-verified transport, not the pinned library's
             # _serviceLogin implementation (which explicitly disables TLS).
+            self.verified_calls.append({"device_id": device_id,
+                                        "token": dict(token or {})})
             if FakeAccount.transport_error:
                 raise RuntimeError("访问小米账号服务失败（网络错误）")
             if FakeAccount.reject_service_login:
@@ -806,6 +809,45 @@ def scenario_renewal_failure_stays_quiet(root: Path):
     return "a failed renewal retries quietly instead of demanding a new login"
 
 
+def scenario_device_id_stays_stable(root: Path):
+    """A missing deviceId must not become a brand-new device on every exchange.
+
+    Xiaomi treats an unknown deviceId as a new device login; the community fix for
+    persistent 70016 is to pin one deviceId and reuse it forever. Our token file
+    normally carries it, but an older/partial file may not.
+    """
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "micoapi": ["old-ssecurity", "expired-service"],
+        }
+    )
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1"})
+    harness.poll_script = [([], False), ([], False), ([], False)]
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    harness.run()
+
+    used = [call["device_id"] for call in harness.verified_calls]
+    assert used, "the missing deviceId case must still exchange a token"
+    assert all(used), f"the exchange must never send an empty deviceId, got {used}"
+    assert len(set(used)) == 1, (
+        f"every exchange must reuse one deviceId, got {sorted(set(used))}"
+    )
+    saved = harness.read_token()
+    assert saved.get("deviceId") == used[0], (
+        f"the deviceId must be persisted for the next restart, got {saved.get('deviceId')!r}"
+    )
+    return "a missing deviceId is generated once and then reused"
+
+
 def scenario_save_credentials_never_blank(root: Path):
     harness = Harness(root)
     harness.write_token(
@@ -989,6 +1031,7 @@ def main():
         scenario_runtime_refresh_recovers,
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
+        scenario_device_id_stays_stable,
         scenario_runtime_refresh_failure,
         scenario_runtime_refresh_rejected,
         scenario_save_credentials_never_blank,

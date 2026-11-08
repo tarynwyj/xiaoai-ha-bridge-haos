@@ -567,6 +567,13 @@ def scenario_source_contract():
           "the loop must not set the retry banner unconditionally")
     check("raise MicoapiLoginRejected(code, description)" in built,
           "a rejected exchange must carry its Xiaomi code to the loop")
+    # 401 恢复已经换过一次票，必须把续期计划往后推；两处都要有这行，缺一处就会连着换票。
+    check(built.count("next_refresh_at = time.time() + refresh_interval") >= 2,
+          "401 recovery must re-arm the proactive renewal clock, not just the scheduler")
+    check('bridge_state["renewal"]' in built,
+          "a failed renewal must be visible without declaring the session expired")
+    check("def _unsaved_refresh(" in built,
+          "a failed save must be retried without a second exchange")
     return "built bridge.py classifies a rejected exchange and disables redirects"
 
 

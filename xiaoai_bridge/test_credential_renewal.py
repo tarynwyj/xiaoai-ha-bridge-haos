@@ -157,7 +157,13 @@ def build_namespace(bridge_path: Path, root: Path, log: Log):
             return list(Exchange.devices)
 
     miservice = SimpleNamespace(MiNAService=FakeMiNAService)
-    miaccount = SimpleNamespace(get_random=lambda n: "RANDOMDEVICEID00")
+    counter = {"n": 0}
+
+    def fake_get_random(_n):
+        counter["n"] += 1
+        return "RANDOMDEVICE%04d" % counter["n"]
+
+    miaccount = SimpleNamespace(get_random=fake_get_random)
     # The functions under test import these lazily, so they must resolve through
     # sys.modules as well as through the exec namespace.
     sys.modules["miservice"] = miservice
@@ -293,6 +299,9 @@ def scenario_rotation(reporter, make_ns):
     }
     outcome = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
     assert outcome["ok"] is True, outcome
+    assert outcome["saved"] is True, (
+        "the renewal must still be persisted, got %r" % (outcome,)
+    )
     assert read_token(ns)["passToken"] == "keep-me", read_token(ns)
     reporter.ok("A4 a blank passToken never overwrites the stored one")
 

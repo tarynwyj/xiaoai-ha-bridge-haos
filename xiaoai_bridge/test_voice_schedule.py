@@ -430,6 +430,13 @@ def scenario_listing(reporter, ns):
     reporter.eq("after delete the registry is empty", ns["_schedule_listing"]([]), [])
 
     # ── one-shot tasks: done after firing, expired when HA never ran them ──
+    # The fixture is built in the *local* timezone: HA's last_triggered is an
+    # ISO timestamp with an offset, and the bridge converts it to local time.
+    # A hard-coded +08:00 value would only match a machine in that timezone
+    # (CI runners are UTC), so derive the offset from the running machine.
+    from datetime import datetime as _datetime
+    fired_at = _datetime.now().astimezone().replace(
+        year=2026, month=11, day=1, hour=8, minute=0, second=2)
     ns["_schedule_registry_add"]("xiaoai_bridge_once_done", "08:00", [],
                                  "switch.reshui", "switch", "turn_on", "voice", True,
                                  once_at="2026-11-01 08:00")
@@ -438,7 +445,7 @@ def scenario_listing(reporter, ns):
         "state": "on",
         "attributes": {"id": "xiaoai_bridge_once_done",
                        "friendly_name": "小爱桥接-2026-11-01 08:00 switch.reshui",
-                       "last_triggered": "2026-11-01T08:00:02+08:00"},
+                       "last_triggered": fired_at.isoformat()},
     }]
     done_entry = [item for item in ns["_schedule_listing"](fired_states)
                   if item["config_id"] == "xiaoai_bridge_once_done"][0]

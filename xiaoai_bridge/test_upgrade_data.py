@@ -165,6 +165,8 @@ NEW_ONLY_FUNCTIONS = (
     "_saved_credential_pair_conflicted",
     "_write_last_timestamp_atomic",
     "_load_or_create_access_token",
+    # 1.0.17: token accounts carry no password (kills the 87001 fallback).
+    "_build_token_account",
     # 1.0.17: proactive session renewal, per-device polling, durable log tail.
     "_relogin_failure_from",
     "_relogin_retry_plan",

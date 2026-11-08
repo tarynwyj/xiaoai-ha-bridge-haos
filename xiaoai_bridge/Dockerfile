@@ -49,6 +49,10 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
     && grep -Fq 'class MicoapiLoginRejected' /app/bridge.py \
     && grep -Fq 'async def _relogin_retry_plan' /app/bridge.py \
+    && grep -Fq 'def _refresh_interval_seconds' /app/bridge.py \
+    && grep -Fq 'def _token_age_seconds' /app/bridge.py \
+    && grep -Fq 'next_refresh_at = time.time()' /app/bridge.py \
+    && grep -Fq 'token_data["issued_at"]' /app/bridge.py \
     && grep -Fq '_wait_for_relogin(wait_seconds, fatal)' /app/bridge.py \
     && ! grep -Fq 'await asyncio.sleep(relogin_backoff)' /app/bridge.py \
     && grep -Fq 'async def _enforce_access_control' /app/bridge.py \

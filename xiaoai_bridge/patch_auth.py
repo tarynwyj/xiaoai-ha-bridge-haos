@@ -5227,6 +5227,106 @@ replace_exact(
 """,
 )
 
+# ──────────────── H: 登录态主动续期（不等过期，不让用户重新扫码） ────────────────
+# 现状问题：桥接器只在轮询收到 401 之后才去换票。等会话真的过期了，换票这一步一旦
+# 被小米拒绝（70016），就再也没有别的路径，只能让用户重新扫码——这正是「过几天就要
+# 重新登录」的来源。真正该做的是**在过期之前**把会话续上：每次换票都会拿到新的
+# serviceToken（以及小米轮换后的 passToken），只要续期成功，登录态就不会自然中断。
+replace_exact(
+    "record when the service token was issued",
+    """    token_data = dict(identity)
+    token_data["micoapi"] = [creds.get("ssecurity") or "", creds["serviceToken"]]
+""",
+    """    token_data = dict(identity)
+    token_data["micoapi"] = [creds.get("ssecurity") or "", creds["serviceToken"]]
+    # 签发时间：轮询循环据此在过期之前主动续期，而不是等 401 再救。
+    # 只有「换了新 serviceToken」才算新签发；否则每次启动写回同一张票时，
+    # 会把年龄清零，让本该续期的旧票被误判成刚签发。
+    _previous = _read_saved_credential(TOKEN_PATH)
+    _previous_micoapi = _previous.get("micoapi")
+    if (isinstance(_previous_micoapi, (list, tuple)) and len(_previous_micoapi) == 2
+            and _previous_micoapi[1] == creds["serviceToken"]
+            and isinstance(_previous.get("issued_at"), (int, float))):
+        token_data["issued_at"] = int(_previous["issued_at"])
+    else:
+        token_data["issued_at"] = int(time.time())
+""",
+)
+
+replace_exact(
+    "proactive session renewal helpers",
+    """def _token_snapshot(account) -> dict:
+""",
+    """# 续期失败后的重试间隔：续期失败不代表登录失败（手里的 token 还能用），
+# 所以只按短间隔重试，绝不因此把面板变红、把用户赶去重新扫码。
+TOKEN_REFRESH_RETRY = 300
+
+
+def _refresh_interval_seconds(mi_cfg: dict | None = None) -> int:
+    \"\"\"How often to renew the micoapi session before it expires (default 6h).\"\"\"
+    raw = (mi_cfg or {}).get("token_refresh_hours")
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = 6.0
+    if hours <= 0:
+        hours = 6.0
+    return max(900, int(hours * 3600))
+
+
+def _token_age_seconds() -> float:
+    \"\"\"Age of the saved service token; an unknown age means "renew right away".\"\"\"
+    saved = _read_saved_credential(TOKEN_PATH)
+    try:
+        issued = float(saved.get("issued_at"))
+    except (TypeError, ValueError):
+        return float("inf")
+    return max(0.0, time.time() - issued)
+
+
+def _token_snapshot(account) -> dict:
+""",
+)
+
+replace_exact(
+    "renew the session before it expires",
+    """        bridge_state["error"] = None
+        relogin_backoff = RELOGIN_BACKOFF_START
+
+        while bridge_state["running"]:
+            try:
+                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+""",
+    """        bridge_state["error"] = None
+        relogin_backoff = RELOGIN_BACKOFF_START
+        # 主动续期：serviceToken 还在有效期内就换一张新的，登录态不因自然过期中断。
+        refresh_interval = _refresh_interval_seconds(mi_cfg)
+        next_refresh_at = time.time() + max(0.0, refresh_interval - _token_age_seconds())
+
+        while bridge_state["running"]:
+            try:
+                if time.time() >= next_refresh_at:
+                    next_refresh_at = time.time() + refresh_interval
+                    log.info("登录态主动续期（每 %d 小时一次）",
+                             max(1, refresh_interval // 3600))
+                    renewed = await _relogin_and_refresh(account, cfg)
+                    if renewed:
+                        na, fresh_devices = renewed
+                        if not devices and fresh_devices:
+                            devices = fresh_devices
+                        _apply_cookie_to_session(_bridge_session, cfg)
+                        log.info("登录态续期成功，已保存新的 serviceToken")
+                    else:
+                        # 续期失败不等于登录失败：当前 serviceToken 还能用，先重试，
+                        # 不要把它写成面板错误，否则用户会被误导去重新扫码。
+                        next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
+                        log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
+                                    TOKEN_REFRESH_RETRY)
+
+                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+""",
+)
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
 import ast
 _tree = ast.parse(source)

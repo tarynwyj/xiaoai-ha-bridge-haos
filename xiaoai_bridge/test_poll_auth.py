@@ -25,6 +25,7 @@ import asyncio
 import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -103,6 +104,9 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         "_relogin_retry_plan",
         "_credential_fingerprint",
         "_wait_for_relogin",
+        "_read_saved_credential",
+        "_refresh_interval_seconds",
+        "_token_age_seconds",
     )
     namespace = {
         "TOKEN_PATH": token_path,
@@ -115,6 +119,7 @@ def build_namespace(root: Path, cfg: dict, log: Logger):
         "json": json,
         "log": log,
         "asyncio": asyncio,
+        "time": time,
         "bridge_state": {"running": True},
         "load_config": lambda: cfg,
         "aiohttp": SimpleNamespace(
@@ -500,6 +505,40 @@ def scenario_new_login_wakes_the_terminal_wait(root):
     return "a new login (or a stopped bridge) ends the terminal wait immediately"
 
 
+def scenario_renewal_schedule_is_defensive(root):
+    """The renewal clock must be safe on unknown, tiny or garbage intervals."""
+    cfg = make_data(root)
+    log = Logger()
+    namespace = build_namespace(root, cfg, log)
+    interval = namespace["_refresh_interval_seconds"]
+    age = namespace["_token_age_seconds"]
+
+    check(interval({}) == 6 * 3600, f"default renewal interval must be 6h, got {interval({})}")
+    check(interval({"token_refresh_hours": 1}) == 3600, "the interval must be configurable")
+    check(interval({"token_refresh_hours": 0.1}) == 900,
+          "a tiny interval must clamp to 15 minutes")
+    check(interval({"token_refresh_hours": "abc"}) == 6 * 3600,
+          "a garbage interval must fall back to the default")
+    check(interval({"token_refresh_hours": -5}) == 6 * 3600,
+          "a negative interval must fall back to the default")
+
+    # make_data wrote .mi.token without issued_at: the age is unknown -> renew now
+    check(age() == float("inf"), f"an unstamped token must renew immediately, got {age()}")
+
+    token_path = root / "config" / ".mi.token"
+    token_path.write_text(
+        json.dumps({"userId": "u", "passToken": "p",
+                    "issued_at": int(time.time()) - 7200}),
+        encoding="utf-8",
+    )
+    check(7100 < age() < 7300, f"a two hour old token must report ~7200s, got {age()}")
+
+    token_path.write_text(json.dumps({"userId": "u", "issued_at": "yesterday"}),
+                          encoding="utf-8")
+    check(age() == float("inf"), "a garbage issued_at must renew immediately")
+    return "the renewal interval and token age are computed defensively"
+
+
 def scenario_source_contract():
     check("cookies = _poll_auth_cookies(device_id)" in built,
           "the poll request must build its cookies through _poll_auth_cookies()")
@@ -529,6 +568,7 @@ def main():
         scenario_login_and_refresh_still_get_pass_token,
         scenario_rejected_pass_token_is_terminal,
         scenario_new_login_wakes_the_terminal_wait,
+        scenario_renewal_schedule_is_defensive,
     ]
     for scenario in scenarios:
         with tempfile.TemporaryDirectory() as temp_dir:

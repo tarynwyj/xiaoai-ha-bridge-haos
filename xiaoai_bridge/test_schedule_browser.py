@@ -60,6 +60,8 @@ def main() -> int:
 
     httpd, url = serve(html.parent)
     result = Result()
+    result.eq("built page contains one active schedule list function",
+              html.read_text(encoding="utf-8").count("async function loadSchedules("), 1)
     errors: list[str] = []
     posted: list[dict] = []
     toggles: list[dict] = []
@@ -72,6 +74,11 @@ def main() -> int:
             request = route.request
             path = request.url.split("://", 1)[-1]
             path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+            if path.startswith("/api/automations/") and request.method == "DELETE":
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "ok": True, "ha_deleted": True, "registry_updated": False, "reloaded": True,
+                    "msg": "HA 任务配置已删除，但本地登记清理失败，原登记表已保留"}))
+                return
             if path == "/api/automations/cleanup":
                 cleanups.append(request.method)
                 route.fulfill(status=200, content_type="application/json",
@@ -383,11 +390,33 @@ def main() -> int:
             page.wait_for_timeout(400)
             result.eq("saving retains seconds in the API payload",
                       (updated[0] if updated else {}).get('time'), '10:01:10')
+            page.on('dialog', lambda dialog: dialog.accept())
+            page.evaluate("deleteSchedule('xiaoai_bridge_partial')")
+            page.wait_for_timeout(400)
+            alert = page.inner_text('#schedules-alert')
+            result.check("partial deletion tells the user HA config was deleted", '已删除' in alert)
+            result.check("partial deletion explains the remaining registry failure", '登记清理失败' in alert)
+            result.check("partial deletion is a warning", 'warn' in page.locator('#schedules-alert').get_attribute('class'))
+            result.check("partial deletion never claims total failure", '删除失败' not in alert and '保存' not in alert)
+            state['automations'] = [{'config_id': 'xiaoai_bridge_uncertain', 'entity': 'light.kitchen',
+                'domain': 'light', 'service': 'turn_on', 'time': '10:01:10', 'weekdays': [],
+                'once': True, 'status': 'unconfirmed', 'expired': True, 'loaded': True}]
+            page.evaluate('loadSchedules()')
+            result.check("near-boundary execution is shown as awaiting confirmation",
+                         '待核对' in page.inner_text('#schedule-list'))
+            result.check("near-boundary execution is never labelled missed",
+                         '已过期未执行' not in page.inner_text('#schedule-list'))
+            result.eq("unconfirmed task has no pause control",
+                      page.locator('#schedule-list button[onclick^="toggleSchedule("]').count(), 0)
             state['fail_list']=True
             page.evaluate('loadSchedules()')
             page.wait_for_timeout(400)
             result.check("HA outage is shown as unknown, not not-loaded",
                          '状态未知' in page.inner_text('#schedules-alert'))
+            result.check("HA outage preserves the API detail message",
+                         '无法读取 HA 自动化状态' in page.inner_text('#schedules-alert'))
+            result.check("HA outage never shows undefined",
+                         'undefined' not in page.inner_text('#schedules-alert'))
             result.eq("HA outage clears misleading cached task rows",
                       page.inner_text('#schedule-count'), '状态未知')
             result.check("HA outage leaves an explicit retry message",

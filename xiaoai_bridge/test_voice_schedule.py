@@ -375,7 +375,17 @@ def scenario_seconds_precision(reporter, ns):
         next_run = ns["_schedule_next_run"](row["time"], [], True, now, once_at=row["once_at"])
         reporter.eq("next run retains the exact second", ns["_schedule_parse_moment"](next_run), expected)
         reporter.eq("a trigger before the target is not counted as execution",
-                    ns["_schedule_once_state"](row, (expected - timedelta(seconds=1)).isoformat(), expected), "expired")
+                    ns["_schedule_once_state"](row, (expected - timedelta(seconds=1)).isoformat(), expected), "unconfirmed")
+        for seconds, state in ((0.5, "unconfirmed"), (2, "unconfirmed"), (3, "expired"),
+                               (120, "expired"), (0, "done"), (-1, "done")):
+            reporter.eq("completion boundary at %s seconds early" % seconds,
+                        ns["_schedule_once_state"](row, (expected - timedelta(seconds=seconds)).isoformat(), expected), state)
+        kept = await ns["_schedule_purge_expired"](ha, None, [
+            {"config_id": aid, "status": "unconfirmed", "expired": True}])
+        reporter.eq("unconfirmed execution is retained during cleanup", len(kept), 1)
+        reporter.eq("unconfirmed execution never reloads HA", ha.reload_calls, 1)
+        reporter.check("unconfirmed execution keeps its registry entry",
+                       any(x["id"] == aid for x in ns["_schedule_registry_read"]()))
     try:
         for now, delay in cases:
             asyncio.run(run(now, delay))

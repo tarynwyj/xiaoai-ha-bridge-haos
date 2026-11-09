@@ -460,6 +460,9 @@ class FakeHAHandler(BaseHTTPRequestHandler):
             return self._send_json(200, {"result": "ok"})
         if path == "/api/services/automation/reload":
             self.store.record_service("automation", "reload", payload)
+            status = getattr(self.store, "reload_status", 200)
+            if status != 200:
+                return self._send_json(status, {"message": "injected reload failure"})
             self.store.reload_automations()
             return self._send_json(200, [])
         if path.startswith("/api/services/"):
@@ -1212,6 +1215,60 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
         eq("registry: corrupt bytes are preserved exactly", path.read_bytes(), bad)
     path.write_bytes(original_registry)
     eq("registry: restoring the original registry recovers listing", client2.get("/api/automations").status_code, 200)
+
+    # The HA DELETE and local registry update can succeed independently.
+    original_write = restarted._schedule_registry_write
+    def fail_registry_write(_rows):
+        raise restarted.ScheduleRegistryError("injected registry write failure")
+    for reload_status in (200, 503):
+        created = client2.post("/api/automations", headers=UI_HEADER, json_body={
+            "time": "12:37", "domain": "light", "service": "turn_on", "entity_id": "light.kitchen"})
+        eq("partial delete: fixture creation succeeds", created.status_code, 200)
+        partial_id = created.json()["automation_id"]
+        original_bytes = path.read_bytes()
+        restarted._schedule_registry_write = fail_registry_write
+        store.reload_status = reload_status
+        try:
+            response = client2.delete("/api/automations/" + partial_id, headers=UI_HEADER)
+            body = response.json()
+            eq("partial delete: acknowledged HA deletion returns 200", response.status_code, 200)
+            check("partial delete: structured outcome distinguishes local failure",
+                  body.get("ok") is True and body.get("ha_deleted") is True
+                  and body.get("registry_updated") is False, body)
+            eq("partial delete: reload result is accurate", body.get("reloaded"), reload_status == 200)
+            check("partial delete: message describes deletion rather than saving",
+                  "已删除" in body.get("msg", "") and "登记" in body.get("msg", "")
+                  and "保存" not in body.get("msg", ""), body)
+            if reload_status != 200:
+                check("partial delete: warns that runtime may still be active", "仍在运行" in body.get("msg", ""), body)
+            check("partial delete: HA config is actually gone", partial_id not in store.configs)
+            eq("partial delete: registry bytes are preserved", path.read_bytes(), original_bytes)
+        finally:
+            restarted._schedule_registry_write = original_write
+            store.reload_status = 200
+        retry = client2.delete("/api/automations/" + partial_id, headers=UI_HEADER)
+        eq("partial delete: retry clears local remnants even when HA config is missing", retry.status_code, 200)
+        check("partial delete: retry removes the registry row", registry_entry(root, partial_id) is None)
+
+    store.put_config(purge_id, {"alias": "partial cleanup", "trigger": [], "action": []})
+    store.set_last_triggered(purge_id, past.isoformat(timespec="seconds"))
+    restarted._schedule_registry_add(purge_id, past.strftime("%H:%M"), [], "light.kitchen",
+                                    "light", "turn_on", "form", True,
+                                    once_at=past.strftime("%Y-%m-%d %H:%M"))
+    original_bytes = path.read_bytes()
+    restarted._schedule_registry_write = fail_registry_write
+    try:
+        partial = client2.post("/api/automations/cleanup", headers=UI_HEADER, json_body={})
+        eq("partial cleanup: HA deletion is acknowledged", partial.status_code, 200)
+        eq("partial cleanup: pending registry row is reported", partial.json().get("registry_pending"), 1)
+        eq("partial cleanup: no fully cleaned row is claimed", partial.json().get("removed"), 0)
+        check("partial cleanup: message describes the completed HA deletion", "已删除" in partial.json().get("msg", ""))
+        check("partial cleanup: HA config is gone", purge_id not in store.configs)
+        eq("partial cleanup: registry bytes are retained", path.read_bytes(), original_bytes)
+    finally:
+        restarted._schedule_registry_write = original_write
+    eq("partial cleanup: individual delete can finish the cleanup",
+       client2.delete("/api/automations/" + purge_id, headers=UI_HEADER).status_code, 200)
 
     # ── I: nothing reached HA's config store without the configured token ──
     denied_path = "/api/config/automation/config/" + denied_id

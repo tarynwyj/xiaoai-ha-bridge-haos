@@ -1140,7 +1140,7 @@ replace_exact(
 replace_exact(
     "schedules delete warns when the reload failed",
     "if(d.ok){showAlert(a,'ok','已删除');loadSchedules()}else showAlert(a,'err',d.detail||'失败')",
-    "if(d.ok){showAlert(a,d.reloaded===false?'warn':'ok',d.reloaded===false?('⚠ '+(d.msg||'配置已删除，但 HA 重新加载失败')):'已删除');loadSchedules()}else showAlert(a,'err',d.detail||'失败')",
+    "if(d.ok){const partial=d.registry_updated===false||d.reloaded===false;showAlert(a,partial?'warn':'ok',partial?('⚠ '+(d.msg||(d.registry_updated===false?'HA 配置已删除，但本地登记清理失败':'配置已删除，但 HA 重新加载失败，请手动重载自动化'))):'已删除');loadSchedules()}else showAlert(a,'err',d.detail||d.msg||'删除结果无法确认')",
 )
 replace_exact(
     "schedules empty state mentions the new-task form",
@@ -1475,7 +1475,7 @@ replace_exact(
 replace_exact(
     "schedules list shows next run, source, HA-not-loaded and can pause",
     'async function loadSchedules(){const a=document.getElementById(\'schedules-alert\');try{const r=await fetch(\'/api/automations\');const d=await r.json();if(!d.ok){showAlert(a,\'err\',d.msg);return}document.getElementById(\'schedule-count\').textContent=d.count+\'个\';const list=document.getElementById(\'schedule-list\');if(!d.automations.length){list.innerHTML=\'<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>\';return}list.innerHTML=d.automations.map(s=>{const name=escHtml(s.alias||s.entity_id);const eid=escHtml(s.entity_id);const id=(s.config_id||\'\').trim()||s.entity_id.replace(\'automation.\',\'\');const st=s.state===\'on\';const last=s.last_triggered?new Date(s.last_triggered).toLocaleString(\'zh-CN\'):\'从未\';return\'<div class="rule-item"><div class="device-item"><div class="device-info"><div class="device-name">\'+name+\'</div><div class="device-meta">\'+eid+\'</div><div style="font-size:10px;color:var(--txt-dim);margin-top:2px">上次: \'+last+\'</div></div><div style="display:flex;align-items:center;gap:10px"><span class="schedule-state \'+(st?\'on\':\'off\')+\'">\'+(st?\'启用\':\'禁用\')+\'</span><button class="rule-del" onclick="deleteSchedule(\\\'\'+escAttr(id)+\'\\\')">✕</button></div></div></div>\'}).join(\'\')}catch(e){showAlert(a,\'err\',\'加载失败: \'+e.message)}}\n',
-    'async function loadSchedules(){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations\');\n    const d=await r.json();\n    if(!d.ok){showAlert(a,\'err\',d.msg);return}\n    document.getElementById(\'schedule-count\').textContent=d.count+\'个\';\n    const list=document.getElementById(\'schedule-list\');\n    if(!d.automations.length){\n      list.innerHTML=\'<div class="empty-state">暂无<br><span style="font-size:11px">对小爱说「每天七点半打开热水器」，或点上方「＋ 新建定时任务」</span></div>\';\n      return;\n    }\n    list.innerHTML=d.automations.map(function(s){\n      const name=escHtml(s.alias||s.entity_id||\'（未命名任务）\');\n      const eid=escHtml(s.entity_id||\'\');\n      const id=(s.config_id||\'\').trim()||String(s.entity_id||\'\').replace(\'automation.\',\'\');\n      const on=s.state===\'on\';\n      const last=s.last_triggered?new Date(s.last_triggered).toLocaleString(\'zh-CN\'):\'从未\';\n      const next=s.next_run?escHtml(s.next_run):\'—\';\n      const missing=s.status===\'not_loaded\';\n      const src=s.source===\'voice\'?\'语音\':(s.source===\'form\'?\'面板\':\'\');\n      const badge=missing?\'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>\':\'\';\n      const toggle=missing?\'\':\'<button class="rule-del" title="暂停/启用" data-id="\'+escAttr(id)+\'" data-on="\'+(on?\'false\':\'true\')+\'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">\'+(on?\'⏸\':\'▶\')+\'</button>\';\n      return \'<div class="rule-item"><div class="device-item"><div class="device-info">\'\n        +\'<div class="device-name">\'+name+badge+\'</div>\'\n        +\'<div class="device-meta">\'+(eid||\'（配置已写入，HA 尚未加载）\')+\'</div>\'\n        +\'<div style="font-size:10px;color:var(--txt-dim);margin-top:2px">下次: \'+next+\' · 上次: \'+last+(src?\' · 来源: \'+src:\'\')+\'</div>\'\n        +\'</div><div style="display:flex;align-items:center;gap:10px">\'\n        +\'<span class="schedule-state \'+(on?\'on\':\'off\')+\'">\'+(on?\'启用\':\'禁用\')+\'</span>\'\n        +toggle\n        +\'<button class="rule-del" onclick="deleteSchedule(\\\'\'+escAttr(id)+\'\\\')">✕</button>\'\n        +\'</div></div></div>\';\n    }).join(\'\');\n  }catch(e){showAlert(a,\'err\',\'加载失败: \'+e.message)}\n}\nasync function toggleSchedule(id,enabled){\n  const a=document.getElementById(\'schedules-alert\');\n  try{\n    const r=await fetch(\'/api/automations/\'+encodeURIComponent(id)+\'/toggle\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},body:JSON.stringify({enabled:enabled===true||enabled===\'true\'})});\n    const d=await r.json().catch(function(){return {}});\n    if(d&&d.ok){showAlert(a,\'ok\',d.msg||\'已切换\');loadSchedules()}\n    else{showAlert(a,\'err\',(d&&d.detail)||\'切换失败\')}\n  }catch(e){showAlert(a,\'err\',\'切换失败: \'+e.message)}\n}\n',
+    "async function toggleSchedule(id,enabled){\n  const a=document.getElementById('schedules-alert');\n  try{\n    const r=await fetch('/api/automations/'+encodeURIComponent(id)+'/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled===true||enabled==='true'})});\n    const d=await r.json().catch(function(){return {}});\n    if(d&&d.ok){showAlert(a,'ok',d.msg||'已切换');loadSchedules()}\n    else{showAlert(a,'err',(d&&d.detail)||'切换失败')}\n  }catch(e){showAlert(a,'err','切换失败: '+e.message)}\n}\n",
 )
 
 # ════════════════ 定时任务 v2：房间筛选 + 一次性任务 + 编辑 ════════════════
@@ -1788,7 +1788,7 @@ async function cleanupSchedules(){
     const r=await fetch('/api/automations/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     const d=await r.json();
     if(!r.ok||!d.ok)throw new Error(d.detail||d.msg||'清理失败');
-    showAlert(a,'ok','已清理 '+d.removed+' 个已完成任务');
+    showAlert(a,d.registry_pending?'warn':'ok',d.registry_pending?d.msg:('已清理 '+d.removed+' 个已完成任务'));
     await loadSchedules();
   }catch(e){showAlert(a,'err','清理失败: '+e.message);}
 }
@@ -1816,11 +1816,12 @@ async function loadSchedules(){
       const missing=s.status==='not_loaded';
       const done=s.status==='done';
       const expired=s.status==='expired';
+      const unconfirmed=s.status==='unconfirmed';
       const src=s.source==='voice'?'语音':(s.source==='form'?'面板':'');
       const onceTag=s.once?' · 一次性':'';
-      const label=done?'已完成':(expired?'已过期':(on?'启用':'禁用'));
-      const badge=missing?'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>':(expired?'<span class="schedule-state off" style="margin-left:6px">已过期未执行</span>':'');
-      const pause=(missing||done||expired)?'':'<button class="rule-del" title="暂停/启用" data-id="'+escAttr(id)+'" data-on="'+(on?'false':'true')+'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">'+(on?'⏸':'▶')+'</button>';
+      const label=done?'已完成':(unconfirmed?'待核对':(expired?'已过期':(on?'启用':'禁用')));
+      const badge=missing?'<span class="schedule-state off" style="margin-left:6px">HA 未加载</span>':(unconfirmed?'<span class="schedule-state off" style="margin-left:6px">执行记录接近计划时刻，需核对</span>':(expired?'<span class="schedule-state off" style="margin-left:6px">已过期未执行</span>':''));
+      const pause=(missing||done||expired||unconfirmed)?'':'<button class="rule-del" title="暂停/启用" data-id="'+escAttr(id)+'" data-on="'+(on?'false':'true')+'" onclick="toggleSchedule(this.dataset.id,this.dataset.on)">'+(on?'⏸':'▶')+'</button>';
       const edit=done?'':'<button class="rule-del" title="修改任务" data-id="'+escAttr(id)+'" onclick="editSchedule(this.dataset.id)">✎</button>';
       return '<div class="rule-item"><div class="device-item"><div class="device-info">'
         +'<div class="device-name">'+name+badge+'</div>'

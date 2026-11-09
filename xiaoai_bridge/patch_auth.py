@@ -5221,24 +5221,32 @@ replace_exact(
         _schedule_registry_read()  # refuse mutation if the registry cannot be read
         ok = await ha.delete_automation(automation_id, s)
         reloaded = False
-        if ok:
-            _schedule_registry_remove(automation_id)
-        if ok:
-            reloaded = await ha.reload_automations(s)
-        else:
+        registry_updated = True
+        if not ok:
             # 删除请求本身失败也可能是“响应在网络上丢了，配置其实已删掉”：
             # 复用创建侧的配置状态查询，区分 missing / created / unknown。
             config_state = await _automation_config_state(ha, automation_id, s)
             if config_state == "missing":
                 ok = True
-                _schedule_registry_remove(automation_id)
-                reloaded = await ha.reload_automations(s)
             elif config_state == "unknown":
                 raise HTTPException(
                     504, "删除结果暂时无法确认：HA 没有返回明确结果。"
                          "请先在 HA 的「自动化」里核对是否还存在，再决定是否重试。")
+        if ok:
+            try:
+                _schedule_registry_remove(automation_id)
+            except ScheduleRegistryError:
+                registry_updated = False
+                log.warning("HA 任务配置 %s 已删除，但本地登记清理失败，保留原登记表", automation_id)
+            reloaded = await ha.reload_automations(s)
     if not ok:
         raise HTTPException(500, "删除失败")
+    if not registry_updated:
+        message = "HA 任务配置已删除，但本地登记清理失败，原登记表已保留；请修复存储后再次删除以清理残留登记"
+        if not reloaded:
+            message += "；HA 重新加载也未成功，旧任务可能仍在运行，请在 HA 中核对"
+        return {"ok": True, "ha_deleted": True, "registry_updated": False,
+                "reloaded": reloaded, "msg": message}
     if not reloaded:
         log.warning("定时任务 %s 的配置已删除，但重新加载自动化失败", automation_id)
         return {"ok": True, "reloaded": False,
@@ -6602,7 +6610,7 @@ def _schedule_registry_write(items: list) -> None:
             pass
     except Exception as e:
         log.warning("定时任务登记表写入失败: %s", type(e).__name__)
-        raise ScheduleRegistryError("定时任务登记表写入失败，原文件已保留；HA 配置可能已保存，请核对后重试") from e
+        raise ScheduleRegistryError("定时任务登记表写入失败，原文件已保留；HA 操作可能已完成，请核对后重试") from e
     finally:
         if temporary:
             try:
@@ -6684,6 +6692,10 @@ def _schedule_once_state(meta, last_triggered, now=None):
     fired = _schedule_local_naive(last_triggered)
     if fired is not None and fired >= when:
         return "done"
+    # A near-boundary timestamp is insufficient evidence either way. Never
+    # restore the old two-minute grace, which could count an earlier manual run.
+    if fired is not None and when - _td(seconds=2) <= fired < when:
+        return "unconfirmed"
     return "expired"
 
 
@@ -6825,9 +6837,14 @@ async def _schedule_purge_expired(ha, session, entries):
             log.warning("一次性任务已执行，但自动清理失败: %s", config_id)
             kept.append(entry)
             continue
-        _schedule_registry_remove(config_id)
+        purged += 1  # HA changed even if the subsequent local write fails
+        try:
+            _schedule_registry_remove(config_id)
+        except ScheduleRegistryError:
+            log.warning("HA 一次性任务配置 %s 已删除，但本地登记清理失败", config_id)
+            kept.append(dict(entry, registry_pending=True))
+            continue
         log.info("一次性任务已执行，自动清理: %s", config_id)
-        purged += 1
     if purged:
         try:
             await ha.reload_automations(session)
@@ -6874,7 +6891,11 @@ async def cleanup_automations():
                 raise HTTPException(502, "无法读取 HA 自动化状态，未清理任何任务")
             entries = _schedule_listing(states)
             kept = await _schedule_purge_expired(ha, session, entries)
-        return {"ok": True, "removed": len(entries) - len(kept)}
+        pending = sum(bool(item.get("registry_pending")) for item in kept)
+        message = ("HA 任务配置已删除，但 %s 条本地登记未能清理；请修复存储后删除残留登记" % pending
+                   if pending else "已清理完成")
+        return {"ok": True, "removed": len(entries) - len(kept),
+                "registry_pending": pending, "msg": message}
 
 
 _SCHEDULE_AREAS_TEMPLATE = (

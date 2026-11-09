@@ -123,6 +123,7 @@ jobs:
             exit 1
           fi
           python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
+          python xiaoai_bridge/test_entrypoint.py /tmp/app/bridge.py
           python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
           python xiaoai_bridge/test_sms_login.py /tmp/app/bridge.py \
             --html /tmp/app/web/index.html
@@ -203,6 +204,9 @@ jobs:
           IMAGE="${{ steps.app.outputs.image }}:${{ steps.app.outputs.version }}"
           docker run --rm --entrypoint python "$IMAGE" -c "from pathlib import Path; w=Path('/app/web/index.html').read_text(); b=Path('/app/bridge.py').read_text(); assert 'window.fetch=function(input,init)' in w; assert 'id=\"rules-dirty\"' in w; assert 'revealDirectToken' in w; assert '_enforce_access_control' in b; assert 'reveal_direct_token' in b; assert 'proxy_headers=False' in b; assert 'ssl=False' not in b; assert 'str(TOKEN_PATH)' not in b"
           test "$(docker inspect "$IMAGE" --format '{{ index .Config.Labels "io.hass.version" }}')" = "${{ steps.app.outputs.version }}"
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_entrypoint.py:/tmp/test_entrypoint.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_entrypoint.py /app/bridge.py
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py

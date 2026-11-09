@@ -675,11 +675,12 @@ replace_exact(
           仅在扫码与账号密码都不可用时使用：浏览器已登录小米时，可以复制 Cookie 手动登录。<br>
           ① 打开 <a href="https://account.xiaomi.com" target="_blank" style="color:var(--accent)">account.xiaomi.com</a> 并登录<br>
           ② <b style="color:var(--txt-secondary)">F12</b> &rarr; <b style="color:var(--txt-secondary)">Application</b> &rarr; <b style="color:var(--txt-secondary)">Cookies</b><br>
-          ③ 复制 <b style="color:var(--txt-secondary)">userId</b> 与 <b style="color:var(--txt-secondary)">passToken</b> 两行；<b>不要</b>复制 serviceToken（浏览器里那个属于网页登录，粘进来会导致校验失败）<br>
-          ④ 把这两行分别填到下面两个框里（不用写 userId= 这种前缀）&rarr; 点「验证 Cookie」
+          ③ 从同一登录会话复制 <b style="color:var(--txt-secondary)">userId</b> 与 <b style="color:var(--txt-secondary)">passToken</b>；若有 <b>deviceId</b>，一起填写。普通网页登录的 serviceToken 不保证能用于音箱接口。<br>
+          ④ 分别填入下方（不用写 userId= 这种前缀）&rarr; 点「验证 Cookie」。小米拒绝换票时请改用扫码登录，不必反复提交同一凭据。
         </div>
         <div class="field"><label>userId</label><input id="mi-cookie-userid" placeholder="数字，例如 1234567890" autocomplete="off" oninput="syncCookieText()"></div>
-        <div class="field" style="margin-top:8px"><label>passToken</label><input id="mi-cookie-passtoken" placeholder="V1: 开头的那一串" autocomplete="off" oninput="syncCookieText()"></div>
+        <div class="field" style="margin-top:8px"><label>passToken</label><input type="password" id="mi-cookie-passtoken" placeholder="V1: 开头的那一串" autocomplete="off" oninput="syncCookieText()"></div>
+        <div class="field" style="margin-top:8px"><label>deviceId（可选，同一浏览器会话）</label><input id="mi-cookie-deviceid" autocomplete="off" oninput="syncCookieText()"></div>
         <textarea id="mi-cookie-text" style="display:none"></textarea>
         <div class="input-row" style="margin-top:8px">
           <button class="btn btn-primary" id="mi-cookie-submit" onclick="verifyCookieLogin()">&#10003; 验证 Cookie</button>
@@ -878,8 +879,9 @@ function cookieFieldValue(id,key){
 function syncCookieText(){
   const user=cookieFieldValue('mi-cookie-userid','userId');
   const token=cookieFieldValue('mi-cookie-passtoken','passToken');
+  const device=cookieFieldValue('mi-cookie-deviceid','deviceId');
   const box=otpEl('mi-cookie-text');
-  if(box)box.value=(user&&token)?('userId='+user+'; passToken='+token):'';
+  if(box)box.value=(user&&token)?('userId='+user+'; passToken='+token+(device?'; deviceId='+device:'')):'';
 }
 function prefillCookieFields(){
   try{
@@ -888,10 +890,13 @@ function prefillCookieFields(){
     const text=String(box.value||'');
     const user=(text.match(/userId\s*=\s*([^;\s]+)/)||[])[1]||'';
     const token=(text.match(/passToken\s*=\s*([^;\s]+)/)||[])[1]||'';
+    const device=(text.match(/deviceId\s*=\s*([^;\s]+)/)||[])[1]||'';
     const userInput=otpEl('mi-cookie-userid');
     const tokenInput=otpEl('mi-cookie-passtoken');
+    const deviceInput=otpEl('mi-cookie-deviceid');
     if(userInput&&!userInput.value)userInput.value=user;
     if(tokenInput&&!tokenInput.value)tokenInput.value=token;
+    if(deviceInput&&!deviceInput.value)deviceInput.value=device;
   }catch(e){}
 }
 function bindCookiePrefill(){
@@ -911,7 +916,8 @@ async function verifyCookieLogin(){
     showAlert(alertBox,'err','✗ 请分别填写 userId 与 passToken（userId 与 passToken 都是必需的）');
     return;
   }
-  const text='userId='+user+'; passToken='+token;
+  const device=cookieFieldValue('mi-cookie-deviceid','deviceId');
+  const text='userId='+user+'; passToken='+token+(device?'; deviceId='+device:'');
   otpText('mi-cookie-status','⟳ 正在校验 Cookie...');
   const btn=otpEl('mi-cookie-submit');if(btn)btn.disabled=true;
   try{
@@ -921,13 +927,14 @@ async function verifyCookieLogin(){
       otpReset();
       const userInput=otpEl('mi-cookie-userid');if(userInput)userInput.value='';
       const tokenInput=otpEl('mi-cookie-passtoken');if(tokenInput)tokenInput.value='';
+      const deviceInput=otpEl('mi-cookie-deviceid');if(deviceInput)deviceInput.value='';
       const box=otpEl('mi-cookie-text');if(box)box.value='';
       otpText('mi-cookie-status','');
       showAlert(alertBox,'ok','✓ '+(d.msg||'Cookie 登录成功'));
       if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
       return;
     }
-    otpText('mi-cookie-status','✗ '+((d&&d.action==='fix_cookie')?'请检查 userId 与 passToken':'Cookie 可能已过期，可重试'));
+    otpText('mi-cookie-status','✗ '+((d&&(d.msg||d.detail))||'Cookie 登录失败，请查看加载项日志'));
     showAlert(alertBox,'err','✗ '+((d&&d.msg)||'Cookie 登录失败'));
   }catch(e){
     otpText('mi-cookie-status','✗ '+e.message);
@@ -1782,11 +1789,19 @@ async function createSchedule(){
   finally{if(btn)btn.disabled=false;}
 }
 
+async function readScheduleResponse(r){
+  let d;
+  try{d=await r.json()}catch(e){
+    throw new Error((r.status>=500?'服务内部错误':'服务响应格式异常')+'（HTTP '+r.status+'），请查看加载项日志');
+  }
+  if(!d||typeof d!=='object'||Array.isArray(d))throw new Error('服务响应格式异常（HTTP '+r.status+'），请查看加载项日志');
+  return d;
+}
 async function cleanupSchedules(){
   const a=document.getElementById('schedules-alert');
   try{
     const r=await fetch('/api/automations/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    const d=await r.json();
+    const d=await readScheduleResponse(r);
     if(!r.ok||!d.ok)throw new Error(d.detail||d.msg||'清理失败');
     showAlert(a,d.registry_pending?'warn':'ok',d.registry_pending?d.msg:('已清理 '+d.removed+' 个已完成任务'));
     await loadSchedules();
@@ -1797,7 +1812,7 @@ async function loadSchedules(){
   const a=document.getElementById('schedules-alert');
   try{
     const r=await fetch('/api/automations');
-    const d=await r.json();
+    const d=await readScheduleResponse(r);
     if(!r.ok||!d.ok)throw new Error(d.detail||d.msg||'读取任务状态失败');
     scheduleItems=Array.isArray(d.automations)?d.automations:[];
     document.getElementById('schedule-count').textContent=d.count+'个';

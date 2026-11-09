@@ -166,6 +166,16 @@ check(
     "release.yml must derive the version from xiaoai_bridge/config.yaml",
 )
 
+for workflow, document in (("ci.yml", ci), ("release.yml", release)):
+    scripts = run_scripts(document)
+    check("python xiaoai_bridge/test_entrypoint.py /tmp/app/bridge.py" in scripts,
+          workflow + " must test the complete script entrypoint on the host")
+    check('--entrypoint python "$IMAGE" /tmp/test_entrypoint.py /app/bridge.py' in scripts,
+          workflow + " must test the complete script entrypoint inside the image")
+dockerfile = (REPO_ROOT / "xiaoai_bridge" / "Dockerfile").read_text(encoding="utf-8")
+check("python /tmp/test_entrypoint.py /app/bridge.py" in dockerfile,
+      "Docker builds must reject broken script entrypoints")
+
 # ───────────────────────────────────── report ─────────────────────────────────────
 if failures:
     print(f"workflow policy: {checks} checks, {len(failures)} FAILED")

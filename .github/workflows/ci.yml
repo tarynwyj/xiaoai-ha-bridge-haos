@@ -67,6 +67,7 @@ jobs:
             xiaoai_bridge/patch_auth.py \
             xiaoai_bridge/patch_web.py \
             xiaoai_bridge/test_startup_patch.py \
+            xiaoai_bridge/test_entrypoint.py \
             xiaoai_bridge/test_api_auth.py \
             xiaoai_bridge/test_web_patch.py \
             xiaoai_bridge/test_rules_browser.py \
@@ -154,6 +155,9 @@ jobs:
 
       - name: Login, token refresh and credential lifecycle
         run: python xiaoai_bridge/test_startup_patch.py /tmp/app/bridge.py
+
+      - name: Complete container entrypoint and application lifespan
+        run: python xiaoai_bridge/test_entrypoint.py /tmp/app/bridge.py
 
       - name: Conversation polling authentication
         run: python xiaoai_bridge/test_poll_auth.py /tmp/app/bridge.py
@@ -292,6 +296,9 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE="xiaoai-ha-bridge-ci:${{ github.sha }}"
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_entrypoint.py:/tmp/test_entrypoint.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_entrypoint.py /app/bridge.py
           docker run --rm \
             -v "$PWD/xiaoai_bridge/test_startup_patch.py:/tmp/test_startup_patch.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_startup_patch.py /app/bridge.py

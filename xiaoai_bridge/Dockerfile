@@ -88,15 +88,16 @@ RUN python -m py_compile /tmp/patch_auth.py \
 # access control, the HAOS Ingress contract and the two Xiaomi login flows
 # (password + verification code, manual Cookie). They only need the runtime
 # dependencies, so a broken patch fails the build instead of reaching users.
-COPY test_startup_patch.py test_api_auth.py test_ingress_contract.py test_poll_auth.py test_sms_login.py test_xiaomi_login.py /tmp/
+COPY test_entrypoint.py test_startup_patch.py test_api_auth.py test_ingress_contract.py test_poll_auth.py test_sms_login.py test_xiaomi_login.py /tmp/
 RUN python /tmp/test_startup_patch.py /app/bridge.py \
+    && python /tmp/test_entrypoint.py /app/bridge.py \
     && python /tmp/test_api_auth.py /app \
     && python /tmp/test_ingress_contract.py \
          --bridge /app/bridge.py --html /app/web/index.html --no-node \
     && python /tmp/test_poll_auth.py /app/bridge.py \
     && python /tmp/test_sms_login.py /app/bridge.py \
     && python /tmp/test_xiaomi_login.py /app/bridge.py --html /app/web/index.html \
-    && rm /tmp/test_startup_patch.py /tmp/test_api_auth.py \
+    && rm /tmp/test_entrypoint.py /tmp/test_startup_patch.py /tmp/test_api_auth.py \
           /tmp/test_ingress_contract.py /tmp/test_poll_auth.py \
           /tmp/test_sms_login.py /tmp/test_xiaomi_login.py
 

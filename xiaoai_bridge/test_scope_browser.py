@@ -181,6 +181,12 @@ def main() -> int:
             page.click('.sidebar-item[data-page="xiaomi"]')
             page.wait_for_selector("#page-xiaomi", state="visible")
 
+            # Regression: the card used to stay hidden until a login response arrived,
+            # so after a refresh there was no way back to the listening range.
+            page.wait_for_selector("#mi-scope-card", state="visible", timeout=5000)
+            result.check("the scope card is visible without a fresh login",
+                         page.is_visible("#mi-scope-card"))
+
             # ── default: everything, nothing pinned ──
             page.evaluate("devices => renderDeviceList(devices)", DEVICES)
             page.wait_for_selector("#mi-scope-card", state="visible")

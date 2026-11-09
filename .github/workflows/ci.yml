@@ -77,7 +77,9 @@ jobs:
             xiaoai_bridge/test_xiaomi_login.py \
             xiaoai_bridge/test_tls_handshake.py \
             xiaoai_bridge/test_schedule_automation.py \
+            xiaoai_bridge/test_schedule_http.py \
             xiaoai_bridge/test_clear_login_files.py \
+            xiaoai_bridge/test_credential_renewal.py \
             xiaoai_bridge/test_workflow_policy.py
 
       - name: Workflow policy (CI never publishes; release is manual, main-only, no :latest)
@@ -102,6 +104,19 @@ jobs:
           python xiaoai_bridge/patch_auth.py /tmp/app/bridge.py
           python xiaoai_bridge/patch_web.py /tmp/app/web/index.html
           python -m py_compile /tmp/app/bridge.py
+
+      - name: The shipped page script must parse
+        # A patch that closes a JS string early still passes grep and the Python
+        # checks; only a real parser catches it.
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          html = open('/tmp/app/web/index.html', encoding='utf-8').read()
+          script = max(re.findall(r'<script>(.*?)</script>', html, re.S), key=len)
+          open('/tmp/app/page.js', 'w', encoding='utf-8').write(script)
+          PY
+          node --check /tmp/app/page.js
 
       - name: Reject forbidden patterns in the patched app
         # `! grep ...` under `set -e` exits non-zero only for the negated command and
@@ -159,8 +174,17 @@ jobs:
       - name: Scheduled voice rules build HA automations (HH:MM:SS + weekday arrays)
         run: python xiaoai_bridge/test_schedule_automation.py /tmp/app/bridge.py
 
+      - name: Voice-created schedule tasks (Chinese parsing, idempotency, read-back)
+        run: python xiaoai_bridge/test_voice_schedule.py /tmp/app/bridge.py
+
+      - name: Schedule page and HA REST contract over real HTTP (local fake HA)
+        run: python xiaoai_bridge/test_schedule_http.py /tmp/app/bridge.py
+
       - name: Clearing the Xiaomi login fails when a credential file survives
         run: python xiaoai_bridge/test_clear_login_files.py /tmp/app/bridge.py
+
+      - name: Credential rotation, renewal and persistence (fault injection)
+        run: python xiaoai_bridge/test_credential_renewal.py /tmp/app/bridge.py
 
       - name: HTTP access control
         run: python xiaoai_bridge/test_api_auth.py /tmp/app
@@ -177,6 +201,15 @@ jobs:
 
       - name: Rules page in a real browser (Playwright + Chromium)
         run: python xiaoai_bridge/test_rules_browser.py --html /tmp/app/web/index.html
+
+      - name: Render the shipped rooms template with sandboxed Jinja
+        run: python xiaoai_bridge/test_schedule_template.py /tmp/app/bridge.py
+
+      - name: Listening scope in a real browser (Playwright + Chromium)
+        run: python xiaoai_bridge/test_scope_browser.py --html /tmp/app/web/index.html
+
+      - name: Schedule form in a real browser (Playwright + Chromium)
+        run: python xiaoai_bridge/test_schedule_browser.py --html /tmp/app/web/index.html
 
       - name: HAOS Ingress contract
         run: |
@@ -279,9 +312,15 @@ jobs:
             -v "$PWD/xiaoai_bridge/test_schedule_automation.py:/tmp/test_schedule_automation.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_schedule_automation.py /app/bridge.py
           docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_schedule_http.py:/tmp/test_schedule_http.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_schedule_http.py /app/bridge.py
+          docker run --rm \
             -v "$PWD/xiaoai_bridge/test_ingress_contract.py:/tmp/test_ingress_contract.py:ro" \
             --entrypoint python "$IMAGE" /tmp/test_ingress_contract.py \
               --bridge /app/bridge.py --html /app/web/index.html --no-node
+          docker run --rm \
+            -v "$PWD/xiaoai_bridge/test_credential_renewal.py:/tmp/test_credential_renewal.py:ro" \
+            --entrypoint python "$IMAGE" /tmp/test_credential_renewal.py /app/bridge.py
 
       - name: Rules-page JS from the shipped image
         shell: bash

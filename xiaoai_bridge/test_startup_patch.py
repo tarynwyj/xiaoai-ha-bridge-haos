@@ -25,6 +25,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -37,7 +38,24 @@ assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in sou
 
 MASKED = "\u2022" * 8
 WANTED_FUNCS = [
+    "_schedule_parse_moment",
+    "_schedule_format_moment",
+    "_create_ha_automation",
+    "_automation_stable_id",
+    "_automation_exists",
+    "_automation_outcome",
+    "_schedule_targets",
+    "_normalize_schedule_time",
+    "_normalize_schedule_weekdays",
+    "_normalize_schedule_date",
+    "_schedule_once_at",
+    "_schedule_registry_path",
+    "_schedule_registry_read",
+    "_schedule_registry_write",
+    "_schedule_registry_add",
+    "_validate_listening_scope",
     "_set_token",
+    "_build_token_account",
     "_load_saved_xiaomi_identity",
     "_get_cookie",
     "_valid_saved_cookie_text",
@@ -47,7 +65,27 @@ WANTED_FUNCS = [
     "_token_snapshot",
     "_restore_token",
     "_apply_cookie_to_session",
+    "_poll_auth_cookies",
+    "_looks_like_schedule",
+    "_parse_schedule_command",
+    "_schedule_now",
+    "_parse_relative_offset",
+    "_cn_int",
+    "_parse_cn_clock",
+    "_apply_period",
+    "_parse_schedule_days_cn",
+    "_parse_once_date",
+    "_pick_schedule_device",
+    "_schedule_service_for",
     "_relogin_and_refresh",
+    "_relogin_failure_from",
+    "_relogin_retry_plan",
+    "_credential_fingerprint",
+    "_wait_for_relogin",
+    "_refresh_interval_seconds",
+    "_token_age_seconds",
+    "_poll_targets",
+    "_warn_poll_scope_empty",
     "_read_saved_credential",
     "_save_auth_and_token",
     "_merge_xiaomi_credentials",
@@ -55,6 +93,15 @@ WANTED_FUNCS = [
     "_enforce_access_control",
     "post_config",
     "bridge_loop",
+    "_plausible_credential",
+    "_adopt_login_identity",
+    "_login_device_id",
+    "_refresh_lock_obj",
+    "_refresh_outcome",
+    "_recent_refresh",
+    "_remember_refresh",
+    "_unsaved_refresh",
+    "_save_refreshed_credentials",
 ]
 nodes = {}
 for node in tree.body:
@@ -62,6 +109,24 @@ for node in tree.body:
         nodes[node.name] = node
 missing = [name for name in WANTED_FUNCS if name not in nodes]
 assert not missing, f"patched bridge.py is missing expected functions: {missing}"
+
+rejected_class = next(
+    (node for node in tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "MicoapiLoginRejected"),
+    None,
+)
+assert rejected_class is not None, (
+    "patched bridge.py must classify a rejected exchange with MicoapiLoginRejected"
+)
+identity_class = next(
+    (node for node in tree.body
+     if isinstance(node, ast.ClassDef) and node.name == "CredentialIdentityMismatch"),
+    None,
+)
+assert identity_class is not None, (
+    "patched bridge.py must refuse a mismatched account identity with "
+    "CredentialIdentityMismatch"
+)
 
 # FastAPI decorators cannot be evaluated here; keep the plain function bodies.
 for name in ("post_config", "bridge_loop"):
@@ -123,6 +188,7 @@ class FakeAccount:
 
     instances = []
     reject_service_login = False
+    transport_error = False
 
     def __init__(self, session, username, password, token_store=None):
         assert token_store is None, "MiService must never own the saved token file"
@@ -157,6 +223,8 @@ class FakeAccount:
 
 
 class FakeMiNAService:
+    devices = None  # None -> the default single speaker
+
     def __init__(self, account):
         self.account = account
         FakeMiNAService.created.append(self)
@@ -173,6 +241,8 @@ class FakeMiNAService:
             # Emulate miservice: a 401 clears the in-memory token.
             self.account.token = None
             raise RuntimeError("HTTP 401")
+        if FakeMiNAService.devices is not None:
+            return list(FakeMiNAService.devices)
         return [{"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅音箱"}]
 
     async def text_to_speech(self, device_id, text):
@@ -244,6 +314,8 @@ class Harness:
         }
         self.saved_configs = []
         self.sleeps = []
+        self.verified_calls = []
+        self.polled_devices = []
         self.log = Logger()
         self.poll_script = []
         self.bridge_state = {
@@ -291,9 +363,11 @@ class Harness:
             to_thread=to_thread,
             CancelledError=real_asyncio.CancelledError,
             TimeoutError=real_asyncio.TimeoutError,
+            Lock=real_asyncio.Lock,
         )
 
     async def fake_poll(self, session, device_id, hardware, last_ts):
+        self.polled_devices.append(device_id)
         if self.poll_script:
             records, need_relogin = self.poll_script.pop(0)
         else:
@@ -327,6 +401,19 @@ class Harness:
             identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
             token = dict(identity)
             token["micoapi"] = [creds.get("ssecurity", ""), creds["serviceToken"]]
+            # Mirror production: only a new serviceToken restamps issued_at.
+            previous = {}
+            try:
+                previous = json.loads(self.token_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                previous = {}
+            previous_micoapi = previous.get("micoapi")
+            if (isinstance(previous_micoapi, list) and len(previous_micoapi) == 2
+                    and previous_micoapi[1] == creds["serviceToken"]
+                    and isinstance(previous.get("issued_at"), (int, float))):
+                token["issued_at"] = int(previous["issued_at"])
+            else:
+                token["issued_at"] = int(time.time())
             self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
             self.token_path.write_text(json.dumps(token), encoding="utf-8")
             self.cfg.setdefault("xiaomi", {})["cookie_text"] = (
@@ -358,6 +445,10 @@ class Harness:
                                          user_agent=""):
             # Simulate the TLS-verified transport, not the pinned library's
             # _serviceLogin implementation (which explicitly disables TLS).
+            self.verified_calls.append({"device_id": device_id,
+                                        "token": dict(token or {})})
+            if FakeAccount.transport_error:
+                raise RuntimeError("访问小米账号服务失败（网络错误）")
             if FakeAccount.reject_service_login:
                 return {"code": 70016, "description": "passToken 已失效"}
             return {
@@ -367,11 +458,17 @@ class Harness:
                 "passToken": "pass-token-rotated",
             }
 
+        async def synced_clock(*args):
+            return True  # synthetic HA uses this harness's local clock
+
         namespace = {
+            "_sync_schedule_clock": synced_clock,
+            "_schedule_clock": {"zone": None, "key": None, "at": 0.0},
             "_mi_service_login_verified": verified_service_login,
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
             "_delayed_tasks": set(),
+            "_last_refresh_failure": {},
             "clear_xiaomi_login": clear_synthetic_login,
             "_otp_password_login": fake_otp_password_login,
             "_reset_otp_state": reset_otp_login,
@@ -387,6 +484,11 @@ class Harness:
             "re": re,
             "os": __import__("os"),
             "time": __import__("time"),
+            "REFRESH_COALESCE_SECONDS": 60,
+            "_refresh_lock": None,
+            "_poll_scope_warned": "",
+            "_process_login_device_id": "",
+            "_refresh_cache": {},
             "datetime": real_datetime.datetime,
             "log": self.log,
             "load_config": self.load_config,
@@ -408,6 +510,9 @@ class Harness:
             "JSONResponse": object,
             "HTMLResponse": object,
         }
+        registry_error = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                              and node.name == "ScheduleRegistryError")
+        exec(compile(ast.Module(body=[registry_error], type_ignores=[]), str(source_path), "exec"), namespace)
         # Module level constants the extracted functions read at call time
         # (e.g. POLL_COOKIE_KEYS). Explicit values above win.
         for node in tree.body:
@@ -429,6 +534,14 @@ class Harness:
         )
         exec(
             compile(ast.Module(body=[intent_node], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        exec(
+            compile(ast.Module(body=[rejected_class], type_ignores=[]), str(source_path), "exec"),
+            namespace,
+        )
+        exec(
+            compile(ast.Module(body=[identity_class], type_ignores=[]), str(source_path), "exec"),
             namespace,
         )
         for name in WANTED_FUNCS:
@@ -482,7 +595,13 @@ def scenario_normal_start(root: Path):
     assert harness.bridge_state["error"] is None, harness.bridge_state["error"]
     assert harness.bridge_state["devices"][0]["deviceID"] == "speaker-1"
     assert harness.log.has("已使用保存的 micoapi Token 登录")
-    assert harness.read_token() == before, "valid cached token must be reused, not rewritten"
+    # An unstamped token (upgrade from an older version) is renewed once so the
+    # renewal clock starts from a known point; the account identity must not move.
+    after = harness.read_token()
+    assert (after["userId"], after["passToken"], after["deviceId"]) == (
+        before["userId"], before["passToken"], before["deviceId"]
+    ), "a proactive renewal must never change the account identity"
+    assert after["micoapi"][1], "the renewed token must still be usable"
     return "normal start with valid cached token"
 
 
@@ -580,6 +699,181 @@ def scenario_runtime_refresh_recovers(root: Path):
     return "runtime 401 -> refresh -> polling resumes and command executes"
 
 
+def scenario_scheduled_rule_never_executes_now(root: Path):
+    for index, query in enumerate(("明天八点打开客厅灯", "十分钟后打开客厅灯",
+                                    "每天早上七点打开客厅灯", "每天二十五点打开客厅灯")):
+        harness = Harness(root / str(index))
+        harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                             "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                             "issued_at": int(time.time())})
+        targets = ["light.ceiling", "light.floor"]
+        harness.cfg["intent_rules"] = [{
+            "pattern": "(打开|开)(客厅灯|客厅的灯)",
+            "action": {"domain": "light", "service": "turn_on", "entity_id": targets,
+                       "brightness_pct": 35, "reply": "好的"}}]
+        harness.poll_script = [([{"time": 1_700_000_000_000,
+                                  "query": query, "answer": "好的"}], False)]
+        scheduled = []
+        configs = []
+        builder = harness.namespace["_create_ha_automation"]
+        class RecordingHA:
+            async def create_automation(self, aid, config, session):
+                configs.append((aid, config))
+                return True
+            async def reload_automations(self, session):
+                return True
+            async def list_automation_states(self, session):
+                return [{"attributes": {"id": aid}} for aid, _ in configs]
+        async def capture(ha, domain, service, data, at, days, session):
+            scheduled.append((domain, service, dict(data), at, days))
+            return await builder(RecordingHA(), domain, service, data, at, days, session)
+        async def stop(delay):
+            harness.bridge_state["running"] = False
+        harness.namespace["_create_ha_automation"] = capture
+        harness.namespace["asyncio"].sleep = stop
+        if index == 3:
+            harness.cfg["ai_mode"] = True
+            harness.cfg["openai"] = {"api_key": "synthetic-key"}
+            async def unsafe_ai(query):
+                return {"domain": "light", "service": "turn_on", "entity_id": "light.ceiling"}
+            harness.namespace["ai_parse_command"] = unsafe_ai
+        FakeHAClient.calls.clear()
+        harness.run()
+        assert not FakeHAClient.calls, (query, FakeHAClient.calls)
+        assert harness.bridge_state["error"] is None, harness.log.messages
+        if index == 3:
+            assert not scheduled, (query, scheduled)
+        else:
+            assert len(scheduled) == 1, (query, harness.log.messages)
+            assert scheduled[0][2]["entity_id"] == targets, scheduled
+            assert scheduled[0][2]["brightness_pct"] == 35, scheduled
+            assert scheduled[0][2]["once"] is (index < 2), scheduled
+            assert configs[0][1]["action"][0]["target"]["entity_id"] == targets, configs
+            assert configs[0][1]["action"][0]["data"] == {"brightness_pct": 35}, configs
+    return "scheduled speech keeps time and rule parameters instead of executing now"
+
+
+def scenario_schedule_ai_fallback_keeps_time(root: Path):
+    harness = Harness(root)
+    harness.cfg["ai_mode"] = True
+    harness.cfg["openai"] = {"api_key": "synthetic-key"}
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": int(time.time())})
+    harness.poll_script = [([{"time": 1_700_000_000_000,
+                              "query": "每天七点打开书房灯"}], False)]
+    scheduled = []
+    async def empty_catalog(*args):
+        return []
+    async def safe_ai(query):
+        return {"domain": "light", "service": "turn_on", "entity_id": "light.study",
+                "type": "schedule", "schedule_time": "07:00", "schedule_days": "daily"}
+    async def capture(*args):
+        scheduled.append(args)
+        return "xiaoai_bridge_test", True
+    async def stop(delay):
+        harness.bridge_state["running"] = False
+    harness.namespace["_ha_device_catalog"] = empty_catalog
+    harness.namespace["ai_parse_command"] = safe_ai
+    harness.namespace["_create_ha_automation"] = capture
+    harness.namespace["asyncio"].sleep = stop
+    harness.run()
+    assert len(scheduled) == 1 and not FakeHAClient.calls, (scheduled, harness.log.messages)
+    return "valid AI schedule fallback remains available without permitting immediate actions"
+
+
+def scenario_renewal_updates_device_scope(root: Path):
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": 0})
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"})
+    discoveries = []
+    original = FakeMiNAService.device_list
+    async def discover(service):
+        devices = [{"deviceID": "speaker-1", "hardware": "L05C"}]
+        if discoveries:
+            devices.append({"deviceID": "speaker-2", "hardware": "L05C"})
+        discoveries.append(devices)
+        return devices
+    async def stop(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 4:
+            harness.bridge_state["running"] = False
+    FakeMiNAService.device_list = discover
+    harness.namespace["asyncio"].sleep = stop
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.device_list = original
+    assert "speaker-2" in harness.polled_devices, (discoveries, harness.polled_devices)
+    assert len(harness.bridge_state["devices"]) == 2, harness.bridge_state
+    return "newly discovered speakers join both polling and the displayed device cache"
+
+
+def scenario_unsaved_renewal_retries_persistence(root: Path):
+    harness = Harness(root)
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": 0})
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"})
+    persist = harness.namespace["_persist_sms_credentials"]
+    writes = []
+    clock = [time.time()]
+    observed = []
+    def flaky(creds):
+        if creds["serviceToken"] == "fresh-service-token" and not writes:
+            writes.append("failed")
+            raise OSError("disk full")
+        persist(creds)
+    async def advance(delay):
+        observed.append(harness.namespace["_poll_auth_cookies"]("speaker-1"))
+        clock[0] += 301
+        if len(observed) >= 3:
+            harness.bridge_state["running"] = False
+    harness.namespace["_persist_sms_credentials"] = flaky
+    harness.namespace["time"] = SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
+    harness.namespace["asyncio"].sleep = advance
+    harness.run()
+    assert len(harness.verified_calls) == 1, harness.verified_calls
+    assert observed[0]["serviceToken"] == "fresh-service-token", observed
+    assert "passToken" not in observed[0], observed
+    assert harness.read_token()["passToken"] == "pass-token-rotated", harness.read_token()
+    assert harness.bridge_state.get("renewal") is None, harness.bridge_state
+    return "a failed renewal write is retried after five minutes while polling uses the new token"
+
+
+def scenario_clock_failure_is_announced(root: Path):
+    for enabled in (True, False):
+        harness = Harness(root / str(enabled))
+        harness.cfg["xiaomi"]["tts_reply"] = enabled
+        harness.cfg["intent_rules"] = [{"pattern": "打开客厅灯", "action": {
+            "domain": "light", "service": "turn_on", "entity_id": "light.ceiling"}}]
+        harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                             "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                             "issued_at": int(time.time())})
+        harness.poll_script = [([{"time": 1_700_000_000_000,
+                                  "query": "明天八点打开客厅灯"}], False)]
+        async def unavailable(*args):
+            return False
+        async def stop(delay):
+            harness.bridge_state["running"] = False
+        harness.namespace["_sync_schedule_clock"] = unavailable
+        harness.namespace["asyncio"].sleep = stop
+        FakeMiNAService.said.clear()
+        FakeHAClient.calls.clear()
+        harness.run()
+        assert not FakeHAClient.calls, FakeHAClient.calls
+        assert "时区" in harness.bridge_state["error"], harness.bridge_state
+        if enabled:
+            assert len(FakeMiNAService.said) == 1 and "时区" in FakeMiNAService.said[0], FakeMiNAService.said
+            assert "稍后" in FakeMiNAService.said[0], FakeMiNAService.said
+        else:
+            assert not FakeMiNAService.said, FakeMiNAService.said
+    return "unknown HA timezone is announced and shown in panel without executing, unless TTS is disabled"
+
+
 def scenario_runtime_refresh_failure(root: Path):
     harness = Harness(root)
     # Startup succeeds from the cached token; only the runtime refresh fails.
@@ -597,7 +891,8 @@ def scenario_runtime_refresh_failure(root: Path):
     token_before = harness.read_token()
     auth_before = json.loads(harness.auth_path.read_text(encoding="utf-8"))
     harness.poll_script = [([], True), ([], True), ([], True)]
-    FakeAccount.reject_service_login = True
+    # A network failure is transient: it must keep the exponential backoff.
+    FakeAccount.transport_error = True
 
     # The loop would retry forever; stop it after the second backoff sleep.
     async def bounded_sleep(delay):
@@ -609,9 +904,14 @@ def scenario_runtime_refresh_failure(root: Path):
     try:
         harness.run()
     finally:
-        FakeAccount.reject_service_login = False
+        FakeAccount.transport_error = False
 
-    assert token_before == harness.read_token(), "failed refresh must not rewrite .mi.token"
+    assert token_before["passToken"] == harness.read_token()["passToken"], (
+        "failed refresh must not rewrite .mi.token"
+    )
+    assert token_before["micoapi"] == harness.read_token()["micoapi"], (
+        "failed refresh must keep the working service token"
+    )
     assert auth_before == json.loads(harness.auth_path.read_text(encoding="utf-8")), (
         "failed refresh must not rewrite auth.json"
     )
@@ -619,7 +919,325 @@ def scenario_runtime_refresh_failure(root: Path):
     backoffs = [delay for delay in harness.sleeps if delay >= 10]
     assert backoffs[:2] == [10, 20], f"expected exponential backoff, got {harness.sleeps}"
     assert harness.bridge_state["error"], "a persistent failure must be surfaced"
-    return "runtime 401 -> refresh fails -> backoff, credentials untouched"
+    return "runtime 401 -> transient refresh failure -> exponential backoff"
+
+
+def scenario_runtime_refresh_rejected(root: Path):
+    """A rejected passToken must not be retried on the 5-minute ladder forever."""
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    token_before = harness.read_token()
+    harness.poll_script = [([], True), ([], True), ([], True)]
+    FakeAccount.reject_service_login = True
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    assert token_before["passToken"] == harness.read_token()["passToken"], (
+        "a rejected refresh must not rewrite .mi.token"
+    )
+    assert token_before["micoapi"] == harness.read_token()["micoapi"], (
+        "a rejected refresh must keep the working service token"
+    )
+    message = harness.bridge_state["error"] or ""
+    assert "70016" in message, f"the panel must show the Xiaomi code, got {message!r}"
+    assert "重新扫码" in message, f"the panel must name the fix, got {message!r}"
+    assert "正在自动重试" not in message, (
+        f"a rejected passToken must not claim it is retrying, got {message!r}"
+    )
+    backoffs = [delay for delay in harness.sleeps if delay >= 10]
+    assert 10 not in backoffs and 20 not in backoffs, (
+        f"a rejected passToken must not use the retry ladder, got {harness.sleeps}"
+    )
+    assert backoffs, f"the loop must still wait before the next attempt, got {harness.sleeps}"
+    return "runtime 401 -> rejected passToken -> 'log in again', no retry ladder"
+
+
+def scenario_proactive_renewal_keeps_session_alive(root: Path):
+    """An expiring session must be renewed before it dies, with no 401 and no alarm.
+
+    The whole point: as long as a renewal succeeds every few hours, the user never
+    has to scan the QR code again. A renewal failure while the current token still
+    works must stay a log line, not a panel error.
+    """
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    token_before = harness.read_token()
+    # The poll never returns 401: the renewal must happen purely on the clock.
+    harness.poll_script = [([], False), ([], False), ([], False)]
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    harness.run()
+
+    token_after = harness.read_token()
+    assert token_after["micoapi"][1] == "fresh-service-token", (
+        f"an old token must be renewed without waiting for a 401, got {token_after}"
+    )
+    assert token_after["issued_at"] > token_before["issued_at"], (
+        "the renewal must restamp issued_at so the next one is scheduled from it"
+    )
+    assert harness.bridge_state["error"] is None, (
+        f"a successful renewal must not raise a panel error, got {harness.bridge_state['error']!r}"
+    )
+    return "an old token is renewed on schedule: no 401, no panel error"
+
+
+def scenario_renewal_failure_stays_quiet(root: Path):
+    """A failed renewal while the token still works must not alarm the user."""
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False), ([], False), ([], False)]
+    FakeAccount.transport_error = True
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 3:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.transport_error = False
+
+    assert harness.bridge_state["error"] is None, (
+        "a failed renewal must not become a panel error while polling still works, "
+        f"got {harness.bridge_state['error']!r}"
+    )
+    assert harness.log.has("登录态续期失败"), "the failure must still be visible in the log"
+    attempts = [m for m in harness.log.messages if "登录态主动续期" in m]
+    assert len(attempts) == 1, (
+        f"a failed renewal must back off, not retry on every poll, got {attempts}"
+    )
+    return "a failed renewal retries quietly instead of demanding a new login"
+
+
+def scenario_device_id_stays_stable(root: Path):
+    """A missing deviceId must not become a brand-new device on every exchange.
+
+    Xiaomi treats an unknown deviceId as a new device login; the community fix for
+    persistent 70016 is to pin one deviceId and reuse it forever. Our token file
+    normally carries it, but an older/partial file may not.
+    """
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "micoapi": ["old-ssecurity", "expired-service"],
+        }
+    )
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1"})
+    harness.poll_script = [([], False), ([], False), ([], False)]
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    harness.run()
+
+    used = [call["device_id"] for call in harness.verified_calls]
+    assert used, "the missing deviceId case must still exchange a token"
+    assert all(used), f"the exchange must never send an empty deviceId, got {used}"
+    assert len(set(used)) == 1, (
+        f"every exchange must reuse one deviceId, got {sorted(set(used))}"
+    )
+    saved = harness.read_token()
+    assert saved.get("deviceId") == used[0], (
+        f"the deviceId must be persisted for the next restart, got {saved.get('deviceId')!r}"
+    )
+    return "a missing deviceId is generated once and then reused"
+
+
+def scenario_every_xiaoai_device_is_polled(root: Path):
+    """issue #15: with several speakers, every one of them must be listened to."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+        {"deviceID": "speaker-2", "hardware": "L05C", "name": "卧室"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 6:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    polled = harness.polled_devices
+    assert "speaker-1" in polled, f"the first speaker must be polled, got {polled}"
+    assert "speaker-2" in polled, (
+        f"issue #15: the second speaker must be polled too, got {polled}"
+    )
+    return "every xiaoai device is polled, not just devices[0]"
+
+
+def scenario_poll_target_filtering(root: Path):
+    """device_ids narrows the set; device_did still means "only this one"."""
+    harness = Harness(root)
+    targets = harness.namespace["_poll_targets"]
+    devices = [{"deviceID": "a", "hardware": "L05C"}, {"deviceID": "b", "did": "2"}]
+
+    ids = lambda cfg, devs=devices: [item["deviceID"] for item in targets(cfg, devs)]
+    assert ids({}) == ["a", "b"], f"default must be every device, got {ids({})}"
+    assert ids({"device_ids": ["b"]}) == ["b"], "device_ids must act as an allow-list"
+    assert ids({"device_ids": "a, b"}) == ["a", "b"], "a comma string must be accepted"
+    assert ids({"device_did": "a"}) == ["a"], "device_did must still mean one device"
+    assert ids({"device_did": "2"}) == ["b"], "device_did may also match the miot did"
+    assert ids({"device_ids": ["zz"]}) == [], (
+        "an explicit allow-list matching nothing must poll nothing, never an unselected device"
+    )
+    assert targets({"device_did": "zz"}, []) == [
+        {"deviceID": "zz", "hardware": ""}
+    ], "an empty device list must fall back to the configured speaker"
+    assert targets({}, []) == [], "no devices and no config must poll nothing"
+    return "poll targets honour device_ids / device_did / fallbacks"
+
+
+def scenario_scope_limits_polling(root: Path):
+    """A saved allow-list must decide which speakers are actually polled."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.cfg["xiaomi"]["device_ids"] = ["speaker-1", "speaker-3"]
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+        {"deviceID": "speaker-2", "hardware": "L05C", "name": "卧室"},
+        {"deviceID": "speaker-3", "hardware": "L06A", "name": "书房"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 6:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    polled = set(harness.polled_devices)
+    assert "speaker-1" in polled, f"the first selected speaker must be polled, got {polled}"
+    assert "speaker-3" in polled, f"the second selected speaker must be polled, got {polled}"
+    assert "speaker-2" not in polled, (
+        f"an unselected speaker must never be polled, got {polled}"
+    )
+    return "only the speakers in the saved allow-list are polled"
+
+
+def scenario_scope_unmatched_polls_nothing(root: Path):
+    """An allow-list that matches nothing must wait, not fall back to devices[0]."""
+    harness = Harness(root)
+    harness.cfg["xiaomi"]["device_did"] = ""
+    harness.cfg["xiaomi"]["device_ids"] = ["gone-1", "gone-2"]
+    FakeMiNAService.devices = [
+        {"deviceID": "speaker-1", "hardware": "L05C", "name": "客厅"},
+    ]
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["ssecurity-value", "valid-service"],
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 4:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeMiNAService.devices = None
+
+    assert harness.polled_devices == [], (
+        f"an unmatched allow-list must poll nothing, got {harness.polled_devices}"
+    )
+    assert harness.log.has("一台都没发现"), harness.log.messages
+    return "an unmatched allow-list waits for the selected speakers"
 
 
 def scenario_save_credentials_never_blank(root: Path):
@@ -803,7 +1421,20 @@ def main():
         scenario_startup_refresh,
         scenario_qr_only_start,
         scenario_runtime_refresh_recovers,
+        scenario_scheduled_rule_never_executes_now,
+        scenario_clock_failure_is_announced,
+        scenario_schedule_ai_fallback_keeps_time,
+        scenario_renewal_updates_device_scope,
+        scenario_unsaved_renewal_retries_persistence,
+        scenario_proactive_renewal_keeps_session_alive,
+        scenario_renewal_failure_stays_quiet,
+        scenario_device_id_stays_stable,
+        scenario_every_xiaoai_device_is_polled,
+        scenario_poll_target_filtering,
+        scenario_scope_limits_polling,
+        scenario_scope_unmatched_polls_nothing,
         scenario_runtime_refresh_failure,
+        scenario_runtime_refresh_rejected,
         scenario_save_credentials_never_blank,
         scenario_post_config_credentials,
         scenario_background_otp_must_not_count_as_login,

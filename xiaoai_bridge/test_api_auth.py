@@ -413,6 +413,88 @@ def main():
             assert os.stat(root / "config" / "config.yaml").st_mode & 0o777 == 0o600
         ok("scoped Xiaomi/HA saves retain hidden settings and config stays mode 0600")
 
+        # ── listening scope: save -> disk -> reload -> poll targets ──
+        cookie_before = read_config(root)["xiaomi"].get("cookie_text", "")
+        scope_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        scope_save = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": scope_rev,
+                       "config": {
+                "xiaomi": {"username": FAKE_USER, "password": bridge.MASKED_VALUE,
+                           "cookie_text": bridge.MASKED_VALUE,
+                           "hardware": "L05C",
+                           "device_scope": "selected",
+                           "device_ids": ["speaker-A", "speaker-C"],
+                           "device_id": "", "device_did": ""}}},
+        )
+        assert scope_save.status_code == 200 and scope_save.json()["ok"] is True, \
+            scope_save.text
+        on_disk = read_config(root)["xiaomi"]
+        assert on_disk["device_scope"] == "selected", on_disk
+        assert on_disk["device_ids"] == ["speaker-A", "speaker-C"], on_disk
+        assert on_disk["username"] == FAKE_USER, on_disk
+        assert on_disk.get("cookie_text", "") == cookie_before, (
+            "saving the listening scope must not rewrite the stored cookie"
+        )
+        reloaded = client.get("/api/config").json()
+        assert reloaded["xiaomi"]["device_ids"] == ["speaker-A", "speaker-C"], \
+            "the saved scope must read back through the API"
+        devices = [
+            {"deviceID": "speaker-A", "hardware": "L05C"},
+            {"deviceID": "speaker-B", "hardware": "L05C"},
+            {"deviceID": "speaker-C", "hardware": "L06A"},
+        ]
+        targets = bridge._poll_targets(on_disk, devices)
+        assert [t["deviceID"] for t in targets] == ["speaker-A", "speaker-C"], targets
+        ok("a saved listening scope survives the round trip and drives _poll_targets")
+
+        before_scope = (root / "config" / "config.yaml").read_bytes()
+        for invalid in ([], [" "], [None], 42):
+            refused = client.post("/api/config", headers=UI_HEADER, json_body={
+                "section": "xiaomi",
+                "revision": client.get("/api/config").json()["_section_revisions"]["xiaomi"],
+                "config": {"xiaomi": {"device_scope": "selected", "device_ids": invalid,
+                                       "device_id": "", "device_did": ""}}})
+            assert refused.status_code == 400, refused.text
+            assert (root / "config" / "config.yaml").read_bytes() == before_scope
+        legacy_refused = client.post("/api/config", headers=UI_HEADER, json_body={
+            "config": {"xiaomi": {"device_scope": "selected", "device_ids": []}}})
+        assert legacy_refused.status_code == 400, legacy_refused.text
+        assert bridge._poll_targets({"device_scope": "selected", "device_ids": []}, devices) == []
+        ok("empty/invalid selections are refused by scoped and legacy APIs and fail closed at runtime")
+
+        all_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        all_save = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": all_rev,
+                       "config": {
+                "xiaomi": {"username": FAKE_USER, "password": bridge.MASKED_VALUE,
+                           "cookie_text": bridge.MASKED_VALUE,
+                           "device_scope": "all", "device_ids": [],
+                           "device_id": "", "device_did": ""}}},
+        )
+        assert all_save.status_code == 200 and all_save.json()["ok"] is True, all_save.text
+        back_to_all = read_config(root)["xiaomi"]
+        assert back_to_all["device_scope"] == "all", back_to_all
+        assert back_to_all["device_ids"] == [], back_to_all
+        assert [t["deviceID"] for t in bridge._poll_targets(back_to_all, devices)] == \
+            ["speaker-A", "speaker-B", "speaker-C"], "all mode must poll every device"
+        stale_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
+        conflict = client.post(
+            "/api/config", headers=UI_HEADER,
+            json_body={"section": "xiaomi", "revision": "v1:stale",
+                       "config": {"xiaomi": {"device_scope": "selected",
+                                             "device_ids": ["speaker-B"]}}},
+        )
+        assert conflict.status_code == 409, (
+            "a stale revision must be rejected, not silently overwrite the scope"
+        )
+        assert read_config(root)["xiaomi"]["device_scope"] == "all", (
+            "a rejected save must leave the stored scope untouched"
+        )
+        assert stale_rev != "v1:stale"
+        ok("switching back to all clears the allow list and a stale save is rejected")
+
         # ── real CAS semantics: same section conflicts, other sections do not ──
         page_a = client.get("/api/config").json()["_section_revisions"].copy()
         page_b = client.get("/api/config").json()["_section_revisions"].copy()

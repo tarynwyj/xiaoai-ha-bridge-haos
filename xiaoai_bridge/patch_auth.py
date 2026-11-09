@@ -149,11 +149,89 @@ replace_exact(
     return {}
 
 
+class CredentialIdentityMismatch(RuntimeError):
+    '''serviceLogin answered for a different account than the one we asked about.'''
+
+
+def _plausible_credential(value) -> str:
+    '''Return a usable credential string, or "" when the value is not usable.
+
+    Xiaomi rotates passToken on some responses and omits it on others; a blank or
+    malformed value must never replace the working credential we already hold.
+    '''
+    text = str(value or "").strip()
+    if not text or len(text) > 4096:
+        return ""
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in text):
+        return ""
+    return text
+
+
+def _adopt_login_identity(resp: dict, requested_user_id: str,
+                          requested_pass_token: str) -> dict:
+    '''Decide which identity fields to keep after a serviceLogin response.
+
+    Rules (defensive, they do not assume any particular server behaviour):
+    - a non-empty userId that differs from the requested one is a hard error:
+      adopting it would silently switch accounts;
+    - a missing/blank userId keeps the requested one;
+    - a non-empty, well formed passToken replaces the old one (the server rotates
+      it); a missing/blank one keeps the old one instead of blanking it.
+    '''
+    requested_user = str(requested_user_id or "").strip()
+    response_user = str(resp.get("userId") or "").strip()
+    if response_user and requested_user and response_user != requested_user:
+        raise CredentialIdentityMismatch(
+            "serviceLogin 返回的账号与已保存账号不一致，已拒绝写入"
+        )
+    adopted_pass = _plausible_credential(resp.get("passToken"))
+    return {
+        "userId": response_user or requested_user,
+        "passToken": adopted_pass or requested_pass_token,
+        "rotated": bool(adopted_pass) and adopted_pass != requested_pass_token,
+    }
+
+
+# 进程内稳定的登录客户端标识：一次生成，之后所有换票（含失败重试）都用同一个。
+# 落盘后由 .mi.token 的 deviceId 接管，重启也沿用。它只是登录客户端标识，与音箱的
+# deviceID/did 完全是两回事，二者不得混用。
+_process_login_device_id = ""
+
+
+def _login_device_id(saved: dict, account) -> str:
+    '''The stable login-client identifier, reused across retries and callers.'''
+    global _process_login_device_id
+    token = getattr(account, "token", None)
+    for candidate in ((saved or {}).get("deviceId"),
+                      token.get("deviceId") if isinstance(token, dict) else None,
+                      _process_login_device_id):
+        device_id = str(candidate or "").strip()
+        if device_id:
+            _process_login_device_id = device_id
+            return device_id
+    from miservice.miaccount import get_random
+    _process_login_device_id = get_random(16).upper()
+    return _process_login_device_id
+
+
 async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
                                   device_id: str) -> str:
     \"\"\"Exchange an account passToken for a fresh micoapi serviceToken.\"\"\"
     if not user_id or not pass_token:
         raise ValueError("登录结果缺少 userId 或 passToken")
+
+    # 小米把「没见过的 deviceId」当成一次新设备登录：每次换票都换一个 deviceId 会被
+    # 风控盯上（社区实测：固定 deviceId 的会话能长期免验证，随机 deviceId 会持续触发
+    # 70016）。调用方没给就沿用内存里已有的，再没有才生成；生成后由
+    # _persist_sms_credentials 落盘，之后一直复用同一个。
+    device_id = str(device_id or "").strip()
+    if not device_id:
+        previous_token = getattr(account, "token", None)
+        if isinstance(previous_token, dict):
+            device_id = str(previous_token.get("deviceId") or "").strip()
+    if not device_id:
+        from miservice.miaccount import get_random
+        device_id = get_random(16).upper()
 
     account.token = {
         "deviceId": device_id,
@@ -180,8 +258,12 @@ async def _refresh_micoapi_token(account, user_id: str, pass_token: str,
     if not service_token:
         raise RuntimeError("小米 STS 未返回 micoapi serviceToken")
 
-    account.token["userId"] = str(resp.get("userId", user_id))
-    account.token["passToken"] = resp.get("passToken", pass_token)
+    # 只采用「非空且格式正常」的新值：服务端没返回 passToken 时保留调用方手里那张，
+    # 返回别的 userId 时直接拒绝（不能静默切账号）。
+    adopted = _adopt_login_identity(resp, user_id, pass_token)
+    account.token["userId"] = adopted["userId"]
+    account.token["passToken"] = adopted["passToken"]
+    account.token["pass_token_rotated"] = adopted["rotated"]
     account.token["micoapi"] = (resp["ssecurity"], service_token)
     return service_token
 
@@ -221,6 +303,13 @@ def _poll_auth_cookies(device_id: str) -> dict:
     conversation host, even when the user pasted a full browser cookie.
     '''
     saved = _get_cookie(load_config()) or {}
+    identity = _load_saved_xiaomi_identity()
+    pending_refresh = _unsaved_refresh((identity.get("userId"), identity.get("passToken")))
+    if pending_refresh is not None:
+        # A rotated token must be usable even while /data is temporarily unwritable.
+        pending = pending_refresh[1]
+        if pending.get("userId") and pending.get("serviceToken"):
+            saved = pending
     cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     cookies["deviceId"] = device_id
     return cookies
@@ -237,7 +326,7 @@ def _apply_cookie_to_session(session, cfg: dict) -> bool:
     A plain dict is used per domain on purpose: reusing one SimpleCookie across
     domains stores every cookie under the first host (see _poll_auth_cookies).
     '''
-    saved = _get_cookie(cfg) or {}
+    saved = _poll_auth_cookies("")
     cookies = {key: saved[key] for key in POLL_COOKIE_KEYS if saved.get(key)}
     if not cookies:
         return False
@@ -251,12 +340,104 @@ def _apply_cookie_to_session(session, cfg: dict) -> bool:
         return False
 
 
-async def _relogin_and_refresh(account, cfg: dict):
-    '''Unified recovery after a 401: exchange the saved passToken for a new micoapi token.
+# 后台续期与 401 恢复共用的协调状态：
+# - 同一时刻只允许一次换票，避免拿同一张旧 passToken 并发换票；
+# - 成功后短时间内复用结果，避免「刚换完又立刻再换一次」。
+REFRESH_COALESCE_SECONDS = 60
+_refresh_lock = None
+_refresh_cache: dict = {}
 
-    Works with QR / Cookie only installs (no username/password). Returns
-    (na, devices) on success and None on failure; a failed refresh never writes
-    to auth.json / .mi.token and leaves the previously working token in memory.
+
+def _refresh_lock_obj():
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
+
+
+def _refresh_outcome(ok: bool, stage: str, na=None, devices=None, saved: bool = False,
+                     rotated: bool = False, reused: bool = False,
+                     message: str = "") -> dict:
+    '''Result of one credential renewal.
+
+    `stage` separates the four things that used to collapse into one bool:
+    exchange (did the server accept the passToken), device_list, persist, ok.
+    '''
+    return {"ok": ok, "stage": stage, "na": na, "devices": devices,
+            "saved": saved, "rotated": rotated, "reused": reused,
+            "message": message}
+
+
+def _recent_refresh(started: tuple):
+    cached = _refresh_cache.get("outcome")
+    if not cached or not cached.get("ok") or not cached.get("saved"):
+        return None
+    if _refresh_cache.get("identity") != started:
+        return None
+    if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_COALESCE_SECONDS:
+        return None
+    return dict(cached, reused=True)
+
+
+def _unsaved_refresh(started: tuple):
+    '''Keep rotated credentials until saved or superseded, without a time limit.'''
+    cached = _refresh_cache.get("outcome")
+    if not cached or not cached.get("ok") or cached.get("saved"):
+        return None
+    if _refresh_cache.get("identity") != started:
+        return None
+    return dict(cached), dict(_refresh_cache.get("pending") or {})
+
+
+def _remember_refresh(started: tuple, outcome: dict,
+                      pending: dict | None = None) -> None:
+    global _refresh_cache
+    identity = started
+    if outcome.get("saved") and pending:
+        identity = (pending["userId"], pending["passToken"])
+    _refresh_cache = {"identity": identity, "at": time.monotonic(),
+                      "outcome": dict(outcome), "pending": dict(pending or {})}
+
+
+def _save_refreshed_credentials(account, started: tuple,
+                                pending: dict | None = None) -> bool:
+    '''Persist a background renewal only while it still describes the same login.
+
+    磁盘上的凭据本身就是「代际」：换票期间用户重新登录或清除凭据后，
+    (userId, passToken) 已经变了，此时写入只会把新登录覆盖成旧账号的票。
+    '''
+    current = _load_saved_xiaomi_identity()
+    if (current.get("userId"), current.get("passToken")) != started:
+        log.warning("后台续期期间登录凭据已变化，丢弃本次续期结果（不覆盖新的登录）")
+        return False
+    if pending:
+        if pending.get("userId") and pending["userId"] != started[0]:
+            log.warning("续期返回的账号与已保存账号不一致，拒绝写入")
+            return False
+        try:
+            _persist_sms_credentials(dict(pending))
+            return True
+        except Exception as e:
+            log.warning("保存续期凭据失败 (%s)", type(e).__name__)
+            return False
+    token = getattr(account, "token", None)
+    account_user = str(token.get("userId") or "") if isinstance(token, dict) else ""
+    # 只有当我们确实知道当前账号、而它与续期目标不一致时才拒绝；
+    # 刚构造出来的 account 还没有 userId，不该因此放弃保存。
+    if account_user and account_user != started[0]:
+        log.warning("续期返回的账号与已保存账号不一致，拒绝写入")
+        return False
+    return bool(_save_auth_and_token(account).get("ok"))
+
+
+async def _relogin_and_refresh(account, cfg: dict) -> dict:
+    '''Renew the micoapi session for the *saved* account identity.
+
+    Works with QR / Cookie only installs (no username/password). Returns a status
+    dict (see _refresh_outcome) instead of a bare tuple so callers can tell apart
+    "server accepted the passToken", "credentials persisted", "device discovery
+    worked" and "the session is usable". A failed exchange never writes to
+    auth.json / .mi.token and leaves the previously working token in memory.
     '''
     from miservice import MiNAService
     from miservice.miaccount import get_random
@@ -364,7 +545,7 @@ replace_exact(
 """,
     """        # Persistence is handled by _save_auth_and_token after validation.
         # MiService deletes its token file when login fails, so never hand it TOKEN_PATH.
-        account = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"], None)
+        account = _build_token_account(_bridge_session, mi_cfg)
 """,
 )
 
@@ -476,7 +657,7 @@ replace_exact(
                         account = account2
 """,
     """                    if cookies.get('userId') and cookies.get('passToken'):
-                        account2 = MiAccount(_bridge_session, mi_cfg["username"], mi_cfg["password"], None)
+                        account2 = _build_token_account(_bridge_session, mi_cfg)
                         await _refresh_micoapi_token(
                             account2,
                             cookies['userId'],
@@ -1218,12 +1399,21 @@ replace_exact(
                         _bridge_session.cookie_jar.clear_domain("account.xiaomi.com")
                         _bridge_session.cookie_jar.clear_domain("mina.mi.com")
                         recovered = await _relogin_and_refresh(account, cfg)
-                        if recovered:
-                            na, devices = recovered
+                        if recovered.get("ok"):
+                            if recovered.get("na") is not None:
+                                na = recovered["na"]
+                            if recovered.get("devices"):
+                                devices = recovered["devices"]
                             # 刷新成功后同步 MiNAService 与轮询 Cookie
                             _apply_cookie_to_session(_bridge_session, cfg)
                             relogin_backoff = RELOGIN_BACKOFF_START
                             bridge_state["error"] = None
+                            bridge_state["renewal"] = None
+                            # 401 恢复已经换过一次票：把续期计划往后推，
+                            # 否则主动续期会紧接着再换一次同一份凭据。
+                            next_refresh_at = time.time() + (
+                                refresh_interval if recovered.get("saved") else TOKEN_REFRESH_RETRY)
+                            credential_mark = _credential_fingerprint()
                             log.info("Token 刷新成功，已恢复轮询")
                             await asyncio.sleep(poll_interval)
                         else:
@@ -1274,18 +1464,21 @@ replace_exact(
     return {}
 
 
-def _save_auth_and_token(account) -> None:
+def _save_auth_and_token(account) -> dict:
     """保存登录成功后得到的凭据，且永不把有效字段写成空值。
 
     只写回非空的身份字段；缺失字段回退到磁盘上已有的值，因此一次不完整的
     刷新不会销毁仍然可用的 passToken。
+
+    返回 {"ok": bool, "reason": str}：调用方必须据此决定「已保存」的文案，
+    写盘失败不能被当成成功（否则面板会在没落盘时报告已保存）。
     """
     if not _credential_write_allowed():
         log.warning("已取消的登录请求不得重新保存凭据")
-        return
+        return {"ok": False, "reason": "cancelled"}
     token = getattr(account, "token", None)
     if not isinstance(token, dict) or not token:
-        return
+        return {"ok": False, "reason": "empty"}
     previous_token = _read_saved_credential(TOKEN_PATH)
     previous_auth = _read_saved_credential(AUTH_PATH)
     candidate_user = str(token.get("userId") or "").strip()
@@ -1302,14 +1495,14 @@ def _save_auth_and_token(account) -> None:
     }
     if not identity["userId"] or not identity["passToken"]:
         log.warning("跳过保存登录信息：凭据不完整，保留已有文件")
-        return
+        return {"ok": False, "reason": "incomplete"}
     token_data = dict(identity)
     micoapi = token.get("micoapi") or (previous_token.get("micoapi") if same_identity else None)
     if isinstance(micoapi, (list, tuple)) and len(micoapi) == 2 and micoapi[1]:
         token_data["micoapi"] = [micoapi[0], micoapi[1]]
     if "micoapi" not in token_data:
         log.warning("登录没有有效 micoapi serviceToken，拒绝覆盖原有凭据")
-        return
+        return {"ok": False, "reason": "no-service-token"}
     try:
         _persist_sms_credentials({
             "userId": identity["userId"], "passToken": identity["passToken"],
@@ -1319,6 +1512,8 @@ def _save_auth_and_token(account) -> None:
         })
     except Exception as e:
         log.warning("保存小米登录凭据失败 (%s)", type(e).__name__)
+        return {"ok": False, "reason": "write-failed"}
+    return {"ok": True, "reason": ""}
 ''',
 )
 
@@ -4639,7 +4834,46 @@ replace_exact(
                     for s in states
                     if s.get("entity_id", "").startswith("automation.xiaoai_bridge_")
                 ]''',
-    '                return _automation_entries(states)',
+    '                return states if isinstance(states, list) else None',
+)
+
+replace_exact(
+    "HA state lookup distinguishes request failure from an empty HA",
+    '''                if r.status != 200:
+                    return []
+                states = await r.json()''',
+    '''                if r.status != 200:
+                    log.warning("读取 HA 自动化状态失败 (HTTP %s)", r.status)
+                    return None
+                states = await r.json()''',
+)
+replace_exact(
+    "HA state transport errors remain unknown",
+    '''            log.error("获取自动化列表异常: %s", e)
+            return []''',
+    '''            log.error("获取自动化列表异常: %s", e)
+            return None''',
+)
+replace_exact(
+    "HA state lookup has a nullable result contract",
+    '    async def list_automation_states(self, session: aiohttp.ClientSession) -> list[dict]:',
+    '    async def list_automation_states(self, session: aiohttp.ClientSession) -> list[dict] | None:',
+)
+
+# GET /api/automations must map the raw states through _schedule_listing (which
+# merges the local registry). Cleanup is an explicit POST, never a GET side effect.
+replace_exact(
+    "automation list endpoint merges the registry without deleting tasks",
+    '''    async with aiohttp.ClientSession() as s:
+        automations = await ha.list_automation_states(s)
+    return {"ok": True, "automations": automations, "count": len(automations)}''',
+    '''    async with aiohttp.ClientSession() as s:
+        clock_known = await _sync_schedule_clock(ha, s)
+        states = await ha.list_automation_states(s)
+        if states is None:
+            raise HTTPException(502, "无法读取 HA 自动化状态，任务是否已加载暂时未知，请稍后重试")
+        automations = _schedule_listing(states, clock_known=clock_known)
+    return {"ok": True, "automations": automations, "count": len(automations)}''',
 )
 
 # 审计修复②：没有实体时不要生成空 target（HA 只认真实 entity_id / all / none）。
@@ -4710,8 +4944,10 @@ class ScheduleAutomationRequest(BaseModel):
     days: str | None = None
     domain: str = "light"
     service: str = "turn_on"
-    entity_id: str = ""
+    entity_id: str | list[str] = ""
     data: dict | None = None
+    once: bool = False
+    date: str | None = None
 
 
 def _schedule_form_days(value) -> tuple:
@@ -4759,20 +4995,22 @@ def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     """
     domain_text = str(domain or "").strip().lower()
     service_text = str(service or "").strip().lower()
-    entity_text = str(entity_id or "").strip()
+    try:
+        entity_text = _schedule_targets(entity_id)
+    except ValueError as e:
+        return {}, str(e)
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", domain_text):
         return {}, "域(domain)应为 HA 的英文名，如 light / switch / climate"
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", service_text):
         return {}, "服务(service)应为 HA 的英文服务名，如 turn_on / turn_off"
-    if entity_text and not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", entity_text):
-        return {}, "实体 ID 应形如 light.xiaomi_xxx"
     data = {}
     if entity_text:
         data["entity_id"] = entity_text
-        entity_domain = entity_text.split(".", 1)[0]
-        if domain_text not in _SCHEDULE_CROSS_DOMAIN_ALLOWED and entity_domain != domain_text:
-            return {}, ("服务 " + domain_text + "." + service_text + " 不能作用于 "
-                        + entity_text + "（实体域是 " + entity_domain + "）")
+        for entity in entity_text if isinstance(entity_text, list) else [entity_text]:
+            entity_domain = entity.split(".", 1)[0]
+            if domain_text not in _SCHEDULE_CROSS_DOMAIN_ALLOWED and entity_domain != domain_text:
+                return {}, ("服务 " + domain_text + "." + service_text + " 不能作用于 "
+                            + entity + "（实体域是 " + entity_domain + "）")
     elif domain_text not in _SCHEDULE_TARGET_OPTIONAL_DOMAINS:
         return {}, "这个服务必须填写实体 entity_id（如 light.xiaomi_xxx）"
     return data, ""
@@ -4857,16 +5095,17 @@ async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
         if missing:
             return ("服务 " + domain + "." + service + " 还需要参数: "
                     + ", ".join(missing) + "（写在「服务参数」JSON 里）")
-    entity_id = str((action or {}).get("entity_id") or "").strip()
-    if not entity_id:
+    targets = _schedule_targets((action or {}).get("entity_id"))
+    if not targets:
         return ""
-    try:
-        async with session.get(base + "/api/states/" + entity_id, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if getattr(r, "status", 0) == 404:
-                return "HA 里找不到实体: " + entity_id
-    except Exception:
-        return ""
+    for entity_id in targets if isinstance(targets, list) else [targets]:
+        try:
+            async with session.get(base + "/api/states/" + entity_id, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if getattr(r, "status", 0) == 404:
+                    return "HA 里找不到实体: " + entity_id
+        except Exception:
+            return ""
     return ""
 
 
@@ -4911,9 +5150,20 @@ async def create_automation(req: ScheduleAutomationRequest):
     schedule_time = _normalize_schedule_time(getattr(req, "time", ""))
     if not schedule_time:
         raise HTTPException(400, "时间格式无效，请用 HH:MM（24 小时制）")
-    days, days_error = _schedule_form_days(getattr(req, "days", None))
-    if days_error:
-        raise HTTPException(400, days_error)
+    once = bool(getattr(req, "once", False))
+    once_date = ""
+    days = None
+    if once:
+        async with aiohttp.ClientSession() as clock_session:
+            if not await _sync_schedule_clock(HAClient(ha_cfg["url"], ha_cfg["token"]), clock_session):
+                raise HTTPException(503, "无法读取 HA 时区，暂时不能创建一次性任务")
+        once_date, date_error = _schedule_form_date(getattr(req, "date", None), schedule_time)
+        if date_error:
+            raise HTTPException(400, date_error)
+    else:
+        days, days_error = _schedule_form_days(getattr(req, "days", None))
+        if days_error:
+            raise HTTPException(400, days_error)
     extra_data, data_error = _schedule_form_data(getattr(req, "data", None))
     if data_error:
         raise HTTPException(400, data_error)
@@ -4923,9 +5173,6 @@ async def create_automation(req: ScheduleAutomationRequest):
     if error:
         raise HTTPException(400, error)
     action.update(extra_data)
-    if action.get("entity_id") and str(action["entity_id"]).strip() != str(
-            getattr(req, "entity_id", "") or "").strip():
-        raise HTTPException(400, "服务参数不能改写目标实体")
     ha = HAClient(ha_cfg["url"], ha_cfg["token"])
     async with aiohttp.ClientSession() as s:
         target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
@@ -4933,6 +5180,7 @@ async def create_automation(req: ScheduleAutomationRequest):
             raise HTTPException(400, target_error)
         automation_id, ok = await _create_ha_automation(
             ha, domain, service, action, schedule_time, days, s,
+            once=once, once_date=once_date or None, source="form",
         )
         config_state = "created"
         if not ok:
@@ -4948,10 +5196,12 @@ async def create_automation(req: ScheduleAutomationRequest):
         # 否则用户会重复提交并制造重复任务。
         log.warning("定时任务 %s 已写入 HA，但重新加载自动化失败", automation_id)
         return {"ok": True, "automation_id": automation_id, "reloaded": False,
-                "msg": "已创建定时任务，但 HA 重新加载失败；稍后可在 HA 里重载或重启"}
+                "msg": "任务配置已保存，但尚未确认 HA 已加载，请稍后刷新核对"}
     log.info("已创建定时任务 %s（手动）", automation_id)
+    when_text = (once_date + " ") if once else ""
     return {"ok": True, "automation_id": automation_id, "reloaded": True,
-            "msg": "已创建定时任务 " + schedule_time[:5]}
+            "msg": ("已创建一次性任务 " if once else "已创建定时任务 ")
+                   + when_text + (schedule_time[:5] if schedule_time.endswith(":00") else schedule_time)}
 
 
 @app.delete("/api/automations/{automation_id}")''',
@@ -4968,23 +5218,35 @@ replace_exact(
         raise HTTPException(500, "删除失败")
     return {"ok": True}''',
     r'''    async with aiohttp.ClientSession() as s:
+        _schedule_registry_read()  # refuse mutation if the registry cannot be read
         ok = await ha.delete_automation(automation_id, s)
         reloaded = False
-        if ok:
-            reloaded = await ha.reload_automations(s)
-        else:
+        registry_updated = True
+        if not ok:
             # 删除请求本身失败也可能是“响应在网络上丢了，配置其实已删掉”：
             # 复用创建侧的配置状态查询，区分 missing / created / unknown。
             config_state = await _automation_config_state(ha, automation_id, s)
             if config_state == "missing":
                 ok = True
-                reloaded = await ha.reload_automations(s)
             elif config_state == "unknown":
                 raise HTTPException(
                     504, "删除结果暂时无法确认：HA 没有返回明确结果。"
                          "请先在 HA 的「自动化」里核对是否还存在，再决定是否重试。")
+        if ok:
+            try:
+                _schedule_registry_remove(automation_id)
+            except ScheduleRegistryError:
+                registry_updated = False
+                log.warning("HA 任务配置 %s 已删除，但本地登记清理失败，保留原登记表", automation_id)
+            reloaded = await ha.reload_automations(s)
     if not ok:
         raise HTTPException(500, "删除失败")
+    if not registry_updated:
+        message = "HA 任务配置已删除，但本地登记清理失败，原登记表已保留；请修复存储后再次删除以清理残留登记"
+        if not reloaded:
+            message += "；HA 重新加载也未成功，旧任务可能仍在运行，请在 HA 中核对"
+        return {"ok": True, "ha_deleted": True, "registry_updated": False,
+                "reloaded": reloaded, "msg": message}
     if not reloaded:
         log.warning("定时任务 %s 的配置已删除，但重新加载自动化失败", automation_id)
         return {"ok": True, "reloaded": False,
@@ -4992,7 +5254,1801 @@ replace_exact(
     return {"ok": True, "reloaded": True}''',
 )
 
+# ──────────────── G: 换票被小米拒绝时不再无限重试 ────────────────
+# 现象：小米服务端会话（serviceToken）到期后，轮询收到 401，桥接器用保存的 passToken
+# 换票；若小米直接拒绝这个 passToken（code=70016「登录验证失败」等），换票永远不可能
+# 成功，但旧实现仍按 10→20→…→300s 无限重试，面板只显示「正在自动重试」，用户看不出
+# 这是需要重新登录的终态。本段把「凭据被拒绝」与「网络/STS 抖动」分开。
+replace_exact(
+    "a rejected credential exchange carries its Xiaomi code",
+    """    if resp.get("code") != 0:
+        code = resp.get("code", "unknown")
+        description = resp.get("description") or resp.get("desc") or "登录验证失败"
+        raise RuntimeError(f"micoapi 登录失败 (code={code}): {description}")
+""",
+    """    if resp.get("code") != 0:
+        raw_code = resp.get("code", "unknown")
+        try:
+            code = int(raw_code)
+        except (TypeError, ValueError):
+            code = raw_code
+        description = resp.get("description") or resp.get("desc") or "登录验证失败"
+        raise MicoapiLoginRejected(code, description)
+""",
+)
+
+replace_exact(
+    "retry decision helpers for a failed credential refresh",
+    """def _token_snapshot(account) -> dict:
+""",
+    """class MicoapiLoginRejected(RuntimeError):
+    \"\"\"Xiaomi answered serviceLogin with a non-zero code (credentials rejected).\"\"\"
+
+    def __init__(self, code, description: str):
+        super().__init__("micoapi 登录失败 (code=%s): %s" % (code, description))
+        self.xiaomi_code = code
+
+
+# 小米账号服务对「这个 passToken 不被接受」给出的错误码。这类失败重试多少次都是同一个
+# 结果，只会把「401 → 换票 → 401」拖成每 5 分钟一次的噪声，因此必须与网络抖动、STS
+# 抖动分开：前者直接给出「需要重新登录」的结论。
+RELOGIN_FATAL_CODES = {70001, 70002, 70016}
+# 致命失败的等待窗口：足够用户看到面板提示并重新扫码，又不至于永不再试（风控解除后
+# 同一份凭据仍可能恢复）。窗口内按片检查凭据文件，用户重新登录后立即重试。
+RELOGIN_FATAL_BACKOFF = 1800
+RELOGIN_FATAL_WAIT_SLICE = 60
+
+# 最近一次换票失败的原因，供轮询循环决定「重试」还是「要求重新登录」。
+_last_refresh_failure: dict = {}
+
+
+def _relogin_failure_from(exc: BaseException) -> dict:
+    \"\"\"Turn a failed exchange into a retry decision: {code, message, fatal, kind}.\"\"\"
+    code = getattr(exc, "xiaomi_code", None)
+    if isinstance(exc, CredentialIdentityMismatch):
+        kind = "identity"
+    elif isinstance(exc, ValueError):
+        # 本地凭据不完整（缺 userId/passToken）：重试多少次都是同一个结果。
+        kind = "missing"
+    elif code in RELOGIN_FATAL_CODES:
+        kind = "rejected"
+    else:
+        kind = "transient"
+    return {
+        "code": code,
+        "message": str(exc) or type(exc).__name__,
+        "fatal": kind != "transient",
+        "kind": kind,
+    }
+
+
+def _relogin_retry_plan(failure: dict | None, backoff: int) -> tuple:
+    \"\"\"(fatal, wait_seconds, panel_message) for one failed credential refresh.\"\"\"
+    failure = failure or {}
+    code = failure.get("code")
+    if failure.get("fatal"):
+        kind = failure.get("kind") or ("rejected" if code is not None else "missing")
+        if kind == "identity":
+            return (
+                True, RELOGIN_FATAL_BACKOFF,
+                "小米返回的账号与已保存账号不一致：为避免写错账号已停止自动换票，"
+                "请到「小米账号」页确认账号后重新登录",
+            )
+        if kind == "missing":
+            return (
+                True, RELOGIN_FATAL_BACKOFF,
+                "小米登录凭据缺失或已失效：无法自动换取 Token，"
+                "请到「小米账号」页重新扫码登录",
+            )
+        return (
+            True, RELOGIN_FATAL_BACKOFF,
+            "小米登录凭据已失效（code=%s）：自动换票被小米拒绝，重试不会恢复，"
+            "请到「小米账号」页重新扫码登录" % code,
+        )
+    return (
+        False, backoff,
+        "小米登录已过期，正在自动重试（当前间隔 %ss）" % backoff,
+    )
+
+
+def _credential_fingerprint() -> tuple:
+    \"\"\"Identity of the saved credential files; changes when the user logs in again.\"\"\"
+    fingerprint = []
+    for saved_path in (TOKEN_PATH, AUTH_PATH):
+        try:
+            info = saved_path.stat()
+        except OSError:
+            fingerprint.append(None)
+            continue
+        fingerprint.append((info.st_mtime_ns, info.st_size))
+    return tuple(fingerprint)
+
+
+async def _wait_for_relogin(seconds: int, watch_credentials: bool) -> None:
+    \"\"\"Sleep before the next refresh; stop early when a new login was just saved.\"\"\"
+    if not watch_credentials:
+        await asyncio.sleep(seconds)
+        return
+    before = _credential_fingerprint()
+    waited = 0
+    while bridge_state["running"] and waited < seconds:
+        slice_seconds = min(RELOGIN_FATAL_WAIT_SLICE, seconds - waited)
+        await asyncio.sleep(slice_seconds)
+        waited += slice_seconds
+        if _credential_fingerprint() != before:
+            log.info("检测到新的登录凭据，立即重试换取 Token")
+            return
+
+
+def _token_snapshot(account) -> dict:
+""",
+)
+
+replace_exact(
+    "record why a credential refresh failed",
+    """    saved = _load_saved_xiaomi_identity()
+    if not saved:
+        log.warning("没有可用的扫码或 Cookie 凭据，无法自动刷新 Token")
+        return None
+
+    snapshot = _token_snapshot(account)
+    try:
+        await _refresh_micoapi_token(
+            account,
+            saved["userId"],
+            saved["passToken"],
+            saved.get("deviceId") or get_random(16).upper(),
+        )
+        na = MiNAService(account)
+        devices = await na.device_list()
+        if not devices:
+            raise RuntimeError("设备列表为空")
+    except Exception as e:
+        log.warning("Token 刷新失败: %s", e)
+        _restore_token(account, snapshot)
+        return None
+
+    _save_auth_and_token(account)
+    return na, devices
+""",
+    """    global _last_refresh_failure
+    saved = _load_saved_xiaomi_identity()
+    if not saved:
+        log.warning("没有可用的扫码或 Cookie 凭据，无法自动刷新 Token")
+        _last_refresh_failure = {"code": None,
+                                 "message": "没有可用的扫码或 Cookie 凭据",
+                                 "fatal": True, "kind": "missing"}
+        return _refresh_outcome(False, "no-identity", message="没有可用的登录凭据")
+
+    started = (saved["userId"], saved["passToken"])
+    cached = _recent_refresh(started)
+    if cached is not None:
+        return cached
+
+    async with _refresh_lock_obj():
+        # 另一个任务可能刚刚换完票：直接复用，别在成功后立刻再换一次。
+        current = _load_saved_xiaomi_identity()
+        cached = _recent_refresh((current.get("userId"), current.get("passToken")))
+        if cached is not None:
+            return cached
+        # 上一次换票成功但写盘失败：只重试保存，不再向小米换一次票。
+        retry = _unsaved_refresh(started)
+        if retry is not None:
+            retry_outcome, pending = retry
+            if _save_refreshed_credentials(account, started, pending):
+                retry_outcome = dict(retry_outcome, saved=True, message="")
+                _remember_refresh(started, retry_outcome, pending)
+            return retry_outcome
+
+        # The lock may have been held across a user login or a previous rotation.
+        saved = _load_saved_xiaomi_identity()
+        if (saved.get("userId"), saved.get("passToken")) != started:
+            return _refresh_outcome(False, "superseded", message="登录凭据已变化，等待切换新登录态")
+        snapshot = _token_snapshot(account)
+        device_id = _login_device_id(saved, account)
+        try:
+            await _refresh_micoapi_token(
+                account, saved["userId"], saved["passToken"], device_id
+            )
+        except Exception as e:
+            log.warning("Token 刷新失败: %s", e)
+            _last_refresh_failure = _relogin_failure_from(e)
+            _restore_token(account, snapshot)
+            return _refresh_outcome(False, "exchange", message=str(e))
+
+        rotated = bool((getattr(account, "token", None) or {}).get("pass_token_rotated"))
+        # 换票已经成功。设备发现是独立的一步：暂时失败或返回空列表都不能把刚拿到的
+        # 轮换凭据丢掉（空列表只说明「还没发现可监听设备」，不是认证失败）。
+        na = MiNAService(account)
+        devices = None
+        stage = "device_list"
+        try:
+            devices = await na.device_list()
+            if devices:
+                stage = "ok"
+        except Exception as e:
+            log.warning("换票成功，但获取设备列表失败: %s", e)
+
+        token = getattr(account, "token", None) or {}
+        micoapi = token.get("micoapi") or ("", "")
+        pending = {
+            "userId": str(token.get("userId") or ""),
+            "passToken": str(token.get("passToken") or ""),
+            "deviceId": str(token.get("deviceId") or ""),
+            "ssecurity": micoapi[0] if len(micoapi) > 1 else "",
+            "serviceToken": micoapi[1] if len(micoapi) > 1 else "",
+        }
+        current = _load_saved_xiaomi_identity()
+        if (current.get("userId"), current.get("passToken")) != started:
+            _restore_token(account, snapshot)
+            return _refresh_outcome(False, "superseded", message="登录凭据已变化，丢弃旧续期结果")
+        saved_ok = _save_refreshed_credentials(account, started, pending)
+        _last_refresh_failure = {}
+        outcome = _refresh_outcome(
+            True, stage, na=na, devices=devices, saved=saved_ok, rotated=rotated,
+            message="" if saved_ok else "已换取新 Token，但未能写入 /data",
+        )
+        _remember_refresh(started, outcome, pending)
+        return outcome
+""",
+)
+
+replace_exact(
+    "a rejected passToken is terminal, not a retry loop",
+    """                        else:
+                            bridge_state["error"] = "小米登录已过期，正在自动重试（当前间隔 %ss）" % relogin_backoff
+                            log.warning("Token 刷新失败，%ss 后重试；若持续失败请重新扫码登录",
+                                        relogin_backoff)
+                            await asyncio.sleep(relogin_backoff)
+                            relogin_backoff = min(relogin_backoff * 2, RELOGIN_BACKOFF_MAX)
+                        continue
+""",
+    """                        else:
+                            fatal, wait_seconds, message = _relogin_retry_plan(
+                                _last_refresh_failure, relogin_backoff)
+                            bridge_state["error"] = message
+                            if fatal:
+                                # 凭据被小米拒绝：继续按 5 分钟一次重试没有意义，把结论
+                                # 直接写到面板上，并在等待窗口里盯着凭据文件，用户重新
+                                # 登录后立刻重试，不必等满窗口。
+                                log.error("%s", message)
+                            else:
+                                log.warning("Token 刷新失败，%ss 后重试；若持续失败请重新扫码登录",
+                                            relogin_backoff)
+                            await _wait_for_relogin(wait_seconds, fatal)
+                            if not fatal:
+                                relogin_backoff = min(relogin_backoff * 2,
+                                                      RELOGIN_BACKOFF_MAX)
+                        continue
+""",
+)
+
+replace_exact(
+    "a fallback cookie login warns that the passToken was never accepted",
+    """        if not service_token and pasted_service_token:
+            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            service_token = pasted_service_token
+            ssecurity = pasted_ssecurity
+""",
+    """        fallback_note = ""
+        if not service_token and pasted_service_token:
+            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            # 兜底保存的 passToken 从未通过校验：等浏览器 serviceToken 到期，换票还会
+            # 被拒。必须当场说清楚，否则用户几天后只会看到「登录已过期」。
+            log.warning("Cookie 登录：passToken 换票被小米拒绝，本次保存的 passToken "
+                        "未经校验；浏览器 serviceToken 到期后需要重新登录")
+            fallback_note = ("；注意：passToken 换票被小米拒绝，当前只能用浏览器的 "
+                             "serviceToken 临时运行，它到期后需要重新登录")
+            service_token = pasted_service_token
+            ssecurity = pasted_ssecurity
+""",
+)
+
+replace_exact(
+    "fallback cookie login reports the warning to the caller",
+    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+""",
+    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）")
+                   + fallback_note,
+""",
+)
+
+# ──────────────── H: 登录态主动续期（不等过期，不让用户重新扫码） ────────────────
+# 现状问题：桥接器只在轮询收到 401 之后才去换票。等会话真的过期了，换票这一步一旦
+# 被小米拒绝（70016），就再也没有别的路径，只能让用户重新扫码——这正是「过几天就要
+# 重新登录」的来源。真正该做的是**在过期之前**把会话续上：每次换票都会拿到新的
+# serviceToken（以及小米轮换后的 passToken），只要续期成功，登录态就不会自然中断。
+replace_exact(
+    "record when the service token was issued",
+    """    token_data = dict(identity)
+    token_data["micoapi"] = [creds.get("ssecurity") or "", creds["serviceToken"]]
+""",
+    """    token_data = dict(identity)
+    token_data["micoapi"] = [creds.get("ssecurity") or "", creds["serviceToken"]]
+    # 签发时间：轮询循环据此在过期之前主动续期，而不是等 401 再救。
+    # 只有「换了新 serviceToken」才算新签发；否则每次启动写回同一张票时，
+    # 会把年龄清零，让本该续期的旧票被误判成刚签发。
+    _previous = _read_saved_credential(TOKEN_PATH)
+    _previous_micoapi = _previous.get("micoapi")
+    if (isinstance(_previous_micoapi, (list, tuple)) and len(_previous_micoapi) == 2
+            and _previous_micoapi[1] == creds["serviceToken"]
+            and isinstance(_previous.get("issued_at"), (int, float))):
+        token_data["issued_at"] = int(_previous["issued_at"])
+    else:
+        token_data["issued_at"] = int(time.time())
+""",
+)
+
+replace_exact(
+    "proactive session renewal helpers",
+    """def _token_snapshot(account) -> dict:
+""",
+    """# 续期失败后的重试间隔：续期失败不代表登录失败（手里的 token 还能用），
+# 所以只按短间隔重试，绝不因此把面板变红、把用户赶去重新扫码。
+TOKEN_REFRESH_RETRY = 300
+
+
+def _refresh_interval_seconds(mi_cfg: dict | None = None) -> int:
+    \"\"\"How often to renew the micoapi session before it expires (default 6h).\"\"\"
+    import math
+
+    raw = (mi_cfg or {}).get("token_refresh_hours")
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = 6.0
+    # NaN / inf / 0 / 负数 / 荒谬的大值都必须落回默认，否则 int() 会抛异常，
+    # 或者把续期排到几百年之后。
+    if not math.isfinite(hours) or hours <= 0:
+        hours = 6.0
+    return max(900, min(int(hours * 3600), 7 * 24 * 3600))
+
+
+def _token_age_seconds() -> float:
+    \"\"\"Age of the saved service token; an unknown age means "renew right away".\"\"\"
+    import math
+
+    saved = _read_saved_credential(TOKEN_PATH)
+    try:
+        issued = float(saved.get("issued_at"))
+    except (TypeError, ValueError):
+        return float("inf")
+    # NaN 会让所有比较都变成 False（于是永远不续期），必须当成「年龄未知」。
+    if not math.isfinite(issued):
+        return float("inf")
+    return max(0.0, time.time() - issued)
+
+
+def _token_snapshot(account) -> dict:
+""",
+)
+
+replace_exact(
+    "renew the session before it expires",
+    """        bridge_state["error"] = None
+        relogin_backoff = RELOGIN_BACKOFF_START
+
+        while bridge_state["running"]:
+            try:
+                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+""",
+    """        bridge_state["error"] = None
+        bridge_state["renewal"] = None
+        relogin_backoff = RELOGIN_BACKOFF_START
+        # 主动续期：serviceToken 还在有效期内就换一张新的，登录态不因自然过期中断。
+        refresh_interval = _refresh_interval_seconds(mi_cfg)
+        next_refresh_at = time.time() + max(0.0, refresh_interval - _token_age_seconds())
+        credential_mark = _credential_fingerprint()
+
+        while bridge_state["running"]:
+            try:
+                # 用户重新登录 / 清除凭据后磁盘上的凭据会变：立即切到新身份，
+                # 不要让桥接器继续无限期使用旧账号的会话。
+                if _credential_fingerprint() != credential_mark:
+                    credential_mark = _credential_fingerprint()
+                    next_refresh_at = 0.0
+                    identity = _load_saved_xiaomi_identity()
+                    if str((getattr(account, "token", None) or {}).get("userId") or "") != str(identity.get("userId") or ""):
+                        devices = []
+                        bridge_state["devices"] = []
+                    log.info("检测到登录凭据变化，立即切换到新的登录态")
+
+                if time.time() >= next_refresh_at:
+                    next_refresh_at = time.time() + refresh_interval
+                    log.info("登录态主动续期（每 %d 小时一次）",
+                             max(1, refresh_interval // 3600))
+                    outcome = await _relogin_and_refresh(account, cfg)
+                    if outcome.get("ok"):
+                        if outcome.get("na") is not None:
+                            na = outcome["na"]
+                        if outcome.get("devices"):
+                            devices = outcome["devices"]
+                            bridge_state["devices"] = devices
+                        _apply_cookie_to_session(_bridge_session, cfg)
+                        credential_mark = _credential_fingerprint()
+                        if outcome.get("saved"):
+                            bridge_state["renewal"] = None
+                            log.info("登录态续期成功，已保存新的 serviceToken")
+                        else:
+                            next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
+                            # 换票成功但没写进 /data：本次运行可用，重启后仍用旧票。
+                            bridge_state["renewal"] = (
+                                "已换取新 Token，但未能写入 /data（重启后可能需要重新登录）"
+                            )
+                            log.error("登录态已续期但未能持久化: %s",
+                                      outcome.get("message") or "写入失败")
+                    else:
+                        # 续期失败不等于登录失败：当前 serviceToken 还能用，先重试，
+                        # 不要把它写成面板错误，否则用户会被误导去重新扫码。
+                        next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
+                        bridge_state["renewal"] = (
+                            "当前登录仍可用，但自动续期异常（%s），%ss 后重试"
+                            % (outcome.get("message") or "未知原因", TOKEN_REFRESH_RETRY)
+                        )
+                        log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
+                                    TOKEN_REFRESH_RETRY)
+
+                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+""",
+)
+
+# ──────────────── I: 日志可追溯（轮转 + 面板读文件尾部） ────────────────
+# 面板的「实时日志」原先只读内存里的最近 200 条、页面又固定只要 80 条，等于几分钟的
+# 流量；而「登录态续期是否每天都成功」需要回看数天。磁盘上的 logs/bridge.log 才是
+# durable 的那份，所以：① 给它加轮转，长期运行不会写满 SD 卡；② /api/logs 改为读文件
+# 尾部（最多 1000 行），读不到才退回内存缓冲。
+replace_exact(
+    "rotating log handler helper",
+    """logging.basicConfig(
+""",
+    """import logging.handlers
+
+
+def _log_file_handler(path):
+    \"\"\"Rotate the on-disk log so a long-running install cannot fill the SD card.
+
+    2 MB × 4 files keeps weeks of the sparse INFO traffic, which is what
+    "did the session renewal keep succeeding every day?" needs.
+    \"\"\"
+    return logging.handlers.RotatingFileHandler(
+        path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+
+
+logging.basicConfig(
+""",
+)
+
+replace_exact(
+    "use the rotating log handler",
+    """        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+""",
+    """        _log_file_handler(LOG_PATH),
+""",
+)
+
+replace_exact(
+    "panel logs read the on-disk file",
+    """@app.get("/api/logs")
+async def get_logs(n: int = 80):
+    return log_records[-n:]
+""",
+    """_LOG_LINE_RE = re.compile(
+    r"^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}) \\[(\\w+)\\] (.*)$")
+
+
+def _log_lines_from_file(limit: int) -> list:
+    \"\"\"Tail the rotated log file so the panel is not limited to the memory buffer.
+
+    The memory buffer holds 200 records and the page used to request 80 — minutes
+    of traffic, far too short to answer "did the renewal succeed every day this
+    week?". Fall back to the memory buffer when the file cannot be read.
+    \"\"\"
+    try:
+        from collections import deque
+        with open(LOG_PATH, encoding="utf-8", errors="replace") as stream:
+            tail = list(deque(stream, maxlen=limit))
+    except OSError:
+        return []
+    parsed = []
+    for line in tail:
+        text = line.rstrip("\\n")
+        if not text.strip():
+            continue
+        match = _LOG_LINE_RE.match(text)
+        if match:
+            stamp, level, message = match.groups()
+            parsed.append({"time": stamp[11:], "level": level, "msg": message})
+        else:
+            parsed.append({"time": "", "level": "INFO", "msg": text})
+    return parsed
+
+
+@app.get("/api/logs")
+async def get_logs(n: int = 80):
+    try:
+        limit = max(1, min(int(n), 1000))
+    except (TypeError, ValueError):
+        limit = 80
+    from_file = _log_lines_from_file(limit)
+    return from_file or log_records[-limit:]
+""",
+)
+
+# ──────────────── J: 监听全部小爱设备（issue #15） ────────────────
+# 上游只取 devices[0]：账号里有多台小爱设备时，其它音箱说的话桥接器完全收不到，
+# 表现为「只有带屏幕那台能用」。DOCS 却写着「规则对所有设备生效」。
+# 这里改为：默认监听全部小爱设备（轮流轮询，每台各自一份 last_timestamp），
+# 需要限制时用 xiaomi.device_ids；device_id / device_did 仍表示「只听这一台」。
+replace_exact(
+    "poll targets for every xiaoai device",
+    """async def bridge_loop():
+""",
+    """def _validate_listening_scope(mi_cfg: dict) -> str:
+    mode = mi_cfg.get("device_scope")
+    if mode is not None and mode not in ("all", "selected"):
+        return "监听范围必须是 all 或 selected"
+    if mode == "all":
+        mi_cfg.update(device_ids=[], device_id="", device_did="")
+        return ""
+    raw = mi_cfg.get("device_ids", [])
+    if isinstance(raw, str):
+        raw = raw.replace("，", ",").split(",")
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        return "监听音箱 ID 必须是字符串数组"
+    ids = list(dict.fromkeys(item.strip() for item in raw if item.strip()))
+    if mode == "selected" and not ids:
+        return "仅监听所选音箱时至少要选一台"
+    if "device_ids" in mi_cfg:
+        mi_cfg["device_ids"] = ids
+    return ""
+
+
+def _poll_targets(mi_cfg: dict, devices: list) -> list:
+    \"\"\"小爱设备里需要监听语音的那几台。
+
+    默认全部：账号里有几台小爱设备就听几台（轮流轮询，每台一份 last_timestamp）。
+    `xiaomi.device_ids` 给出白名单时只保留这些；`xiaomi.device_id` / `device_did`
+    仍然表示「只听这一台」，保持旧配置的含义不变。
+    \"\"\"
+    mi_cfg = dict(mi_cfg)
+    if _validate_listening_scope(mi_cfg):
+        return []
+    wanted = mi_cfg.get("device_ids")
+    if isinstance(wanted, str):
+        wanted = [part.strip() for part in wanted.replace("，", ",").split(",")
+                  if part.strip()]
+    if not isinstance(wanted, list):
+        wanted = []
+    single = str(mi_cfg.get("device_id") or mi_cfg.get("device_did") or "").strip()
+    targets = []
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        device_id = str(device.get("deviceID") or "").strip()
+        if not device_id:
+            continue
+        if wanted:
+            if device_id not in wanted and device.get("did") not in wanted:
+                continue
+        elif single and device_id != single and device.get("did") != single:
+            continue
+        targets.append(device)
+    if targets:
+        return targets
+    if wanted:
+        # 显式白名单但当前没有匹配设备：什么都不轮询，绝不回退到未勾选的音箱。
+        # 回退会让「面板上选了什么」和「实际在听哪台」不一致。
+        return []
+    # 没有白名单时的旧行为：退回配置里的单台，再退回第一台。
+    if single:
+        return [{"deviceID": single, "hardware": mi_cfg.get("hardware", "")}]
+    if devices and isinstance(devices[0], dict) and devices[0].get("deviceID"):
+        return [devices[0]]
+    return []
+
+
+_poll_scope_warned = ""
+
+
+def _warn_poll_scope_empty(mi_cfg: dict, devices: list) -> None:
+    '''Explain an empty poll scope once per distinct situation.'''
+    global _poll_scope_warned
+    wanted = mi_cfg.get("device_ids")
+    if isinstance(wanted, str):
+        wanted = [part.strip() for part in wanted.replace("，", ",").split(",") if part.strip()]
+    if isinstance(wanted, list) and wanted:
+        message = (
+            "监听范围设置了 %d 台音箱，但当前一台都没发现；等待设备上线（不会改听未选中的设备）"
+            % len(wanted)
+        )
+    else:
+        message = "还没有发现可轮询的小爱音箱设备"
+    if message != _poll_scope_warned:
+        _poll_scope_warned = message
+        log.warning("%s", message)
+
+
+async def bridge_loop():
+""",
+)
+
+replace_exact(
+    "validate listening scope on every config write, including legacy clients",
+    '''    _merge_xiaomi_credentials(cfg, existing, masked)
+    save_config(cfg)''',
+    '''    scope_error = _validate_listening_scope(cfg.get("xiaomi") or {})
+    if scope_error:
+        return JSONResponse({"ok": False, "msg": scope_error}, status_code=400)
+    _merge_xiaomi_credentials(cfg, existing, masked)
+    save_config(cfg)''',
+)
+
+replace_exact(
+    "poll every device instead of only the first one",
+    """                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
+                if not device_id and devices:
+                    device_id = devices[0].get("deviceID", "")
+                if not device_id:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                hardware = mi_cfg.get("hardware", "")
+""",
+    """                targets = _poll_targets(mi_cfg, devices)
+                if not targets:
+                    _warn_poll_scope_empty(mi_cfg, devices)
+                    await asyncio.sleep(poll_interval)
+                    continue
+                # 多台小爱设备轮流轮询：每台各自一份 last_timestamp，谁说都听得到。
+                cursor = int(bridge_state.get("poll_cursor") or 0) % len(targets)
+                target = targets[cursor]
+                bridge_state["poll_cursor"] = (cursor + 1) % len(targets)
+                device_id = str(target.get("deviceID") or "").strip()
+                if not device_id:
+                    await asyncio.sleep(poll_interval)
+                    continue
+                hardware = target.get("hardware") or mi_cfg.get("hardware", "")
+""",
+)
+
+# ════════════════ 定时任务：语音中文解析 + 幂等创建 + 回读校验 ════════════════
+replace_exact(
+    "voice: fall back to the built-in Chinese schedule parser",
+    r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
+""",
+    r"""                    if _looks_like_schedule(query) and not await _sync_schedule_clock(ha, _bridge_session):
+                        message = "暂时无法读取 Home Assistant 时区，未创建定时任务，请稍后再试"
+                        bridge_state["error"] = message
+                        log.warning("%s: %s", message, query)
+                        if mi_cfg.get("tts_reply", True):
+                            try:
+                                await na.text_to_speech(device_id, message)
+                            except Exception as e:
+                                log.warning("播报定时任务失败原因失败: %s", type(e).__name__)
+                        continue
+                    if _looks_like_schedule(query) and bridge_state.get("error") == "暂时无法读取 Home Assistant 时区，未创建定时任务，请稍后再试":
+                        bridge_state["error"] = None
+                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
+                    if _looks_like_schedule(query) and not (
+                            action and (action.get("type") == "schedule" or action.get("delay_minutes"))):
+                        # Existing instant rules still resolve the action, but must
+                        # not discard a date/relative time and execute immediately.
+                        _rule_action = action
+                        if _rule_action and _rule_action.get("entity_id"):
+                            _catalog = [{"name": query, "entity_id": _rule_action["entity_id"],
+                                         "domain": _rule_action.get("domain", "")}]
+                        else:
+                            try:
+                                _catalog = await _ha_device_catalog(ha, _bridge_session)
+                            except Exception:
+                                _catalog = []
+                        _scheduled = _parse_schedule_command(
+                            query, _catalog, load_config().get("device_aliases") or {}
+                        )
+                        action = _scheduled
+                        if _scheduled and _rule_action:
+                            action = dict(_rule_action)
+                            for _key in ("type", "schedule_time", "schedule_days", "once", "once_date"):
+                                if _key in _scheduled:
+                                    action[_key] = _scheduled[_key]
+                        if action:
+                            log.info("🕐 识别为定时任务: %s → 每天/指定星期 %s %s %s",
+                                     query, action.get("schedule_time"),
+                                     action.get("schedule_days"), action.get("entity_id"))
+                        elif _looks_like_schedule(query):
+                            log.warning("⏱ 这句话像定时任务，但没能解析出时间/星期/设备: %s"
+                                        "（设备名需与 HA 中的名称一致，或用面板创建）", query)
+""",
+)
+
+replace_exact(
+    "an unparsed schedule cannot fall through to an immediate AI action",
+    '''                        if ai_result:
+                            action = ai_result''',
+    '''                        if ai_result and _looks_like_schedule(query) and not (
+                                (ai_result.get("type") == "schedule" and ai_result.get("schedule_time"))
+                                or ai_result.get("delay_minutes")):
+                            log.warning("定时指令的 AI 结果缺少时间，拒绝立即执行: %s", query)
+                            ai_result = None
+                        if ai_result:
+                            action = ai_result''',
+)
+
+replace_exact(
+    "voice: announce one-shot tasks with their date",
+    '''                            if ok:
+                                reply = f"好的，已创建定时任务：{schedule_time} {schedule_days or '每天'} {reply}"''',
+    '''                            if ok:
+                                _when = (str(action.get("once_date")) + " "
+                                         if action.get("once_date") else "")
+                                reply = (f"好的，已创建一次性任务：{_when}{schedule_time} {reply}"
+                                         if action.get("once")
+                                         else f"好的，已创建定时任务：{schedule_time} {schedule_days or '每天'} {reply}")''',
+)
+
+replace_exact(
+    "voice: say so when nothing matched",
+    r"""                        bridge_state["command_count"] += 1
+                        bridge_state["connected"] = True
+            except asyncio.CancelledError:""",
+    r"""                        bridge_state["command_count"] += 1
+                        bridge_state["connected"] = True
+                    else:
+                        log.info("🔇 未匹配任何规则: %s", query)
+            except asyncio.CancelledError:""",
+)
+
+replace_exact(
+    "voice schedule registry failures are reported to the user",
+    '''                            automation_id, ok = await _create_ha_automation(
+                                ha, domain, service, action,
+                                schedule_time, schedule_days, _bridge_session,
+                            )''',
+    '''                            registry_failure = ""
+                            try:
+                                automation_id, ok = await _create_ha_automation(
+                                    ha, domain, service, action,
+                                    schedule_time, schedule_days, _bridge_session,
+                                )
+                            except ScheduleRegistryError as e:
+                                automation_id, ok = "", False
+                                registry_failure = str(e)
+                                bridge_state["error"] = registry_failure''',
+)
+replace_exact(
+    "voice schedule failure text distinguishes unavailable readback and registry errors",
+    '''                                reply = "抱歉，创建定时任务失败了"''',
+    '''                                if registry_failure:
+                                    reply = "定时任务登记表无法读写，未能完成创建，请在面板查看原因"
+                                elif _automation_outcomes.get(automation_id, {}).get("status") == "unverified":
+                                    reply = "定时任务已提交，但暂时无法确认是否生效，请在面板核对"
+                                else:
+                                    reply = "抱歉，创建定时任务失败了"''',
+)
+
+source = source + r"""
+
+# ════════════════ 语音定时任务（中文解析 + 幂等 + 回读校验） ════════════════
+# 这一整块覆盖上游的 _create_ha_automation：同名函数后定义者生效。
+# 上游实现只关心「提交成功」，这里补上「重复请求不重复建」和「HA 里真的存在」。
+
+_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_CN_WEEKDAY = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+               "六": "6", "日": "7", "天": "7"}
+_SCHEDULE_HINTS = ("每天", "每日", "天天", "每周", "每星期", "工作日", "周末",
+                   "明天", "后天", "今晚", "早上", "上午", "中午", "下午", "晚上",
+                   "分钟后", "小时后", "半小时后", "秒钟后",
+                   "分钟以后", "小时以后", "分钟之后", "小时之后")
+_automation_outcomes: dict = {}
+_ha_catalog = {"at": 0.0, "devices": []}
+_schedule_clock = {"zone": None, "key": None, "at": 0.0}
+_schedule_cleanup_lock = None
+# Keys that describe the request itself, never the HA service call payload.
+_SCHEDULE_INTERNAL_KEYS = {
+    "entity_id", "once", "once_date", "__once", "__once_date", "__source",
+    "type", "schedule_time", "schedule_days", "reply", "delay_minutes",
+}
+
+
+class ScheduleRegistryError(RuntimeError):
+    '''The local task registry is unavailable; never treat it as an empty file.'''
+
+
+@app.exception_handler(ScheduleRegistryError)
+async def _schedule_registry_error_response(request, exc):
+    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=503)
+
+
+def _automation_outcome(automation_id: str, status: str, ok: bool) -> None:
+    '''Remember how a create actually ended so callers can tell the truth.'''
+    globals().setdefault("_automation_outcomes", {})[automation_id] = {
+        "status": status, "ok": bool(ok)}
+
+
+async def _sync_schedule_clock(ha, session) -> bool:
+    '''Use HA's IANA timezone for natural dates, validation and task status.'''
+    from zoneinfo import ZoneInfo
+    key = (ha.base, ha.headers.get("Authorization"))
+    if _schedule_clock["key"] != key:
+        _schedule_clock.update(zone=None, key=key, at=0.0)
+    if _schedule_clock["zone"] is not None and time.monotonic() - _schedule_clock["at"] < 300:
+        return True
+    try:
+        async with session.get(ha.base + "/api/config", headers=ha.headers,
+                               timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False) as response:
+            if response.status != 200:
+                raise ValueError("HA config unavailable")
+            config = await response.json()
+        zone = ZoneInfo(config["time_zone"])
+        if _schedule_clock["key"] != key:
+            return False  # configuration changed while this HTTP request was in flight
+        _schedule_clock.update(zone=zone, at=time.monotonic())
+        return True
+    except Exception as e:
+        log.warning("读取 HA 时区失败: %s", type(e).__name__)
+        return _schedule_clock["zone"] is not None
+
+
+def _schedule_targets(value):
+    '''Preserve HA target arrays; never stringify a Python list into an entity id.'''
+    if value is None or value == "":
+        return ""
+    array = isinstance(value, list)
+    if not array and not isinstance(value, str):
+        raise ValueError("实体 ID 必须是字符串或字符串数组")
+    values = value if array else value.split(",")
+    targets = []
+    for item in values:
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", item.strip()):
+            raise ValueError("实体 ID 应形如 light.xiaomi_xxx，多个实体请用数组或逗号分隔")
+        if item.strip() not in targets:
+            targets.append(item.strip())
+    return targets if array or len(targets) > 1 else (targets[0] if targets else "")
+
+
+def _automation_stable_id(at_time: str, weekdays, entity_id: str | list[str],
+                          domain: str, service: str, once_date=None, data=None) -> str:
+    '''Deterministic config id: repeating the same request cannot duplicate it.'''
+    identity = sorted(entity_id) if isinstance(entity_id, list) else entity_id
+    label = ",".join(identity) if isinstance(identity, list) else identity
+    parts = [at_time.replace(":", ""), "-".join(weekdays or ["daily"]),
+             label or "none", domain, service]
+    if once_date:
+        # Same time/device on a different day is a different one-shot task.
+        parts.insert(0, str(once_date).replace("-", ""))
+    slug = re.sub(r"[^a-z0-9]+", "_", "_".join(parts).lower()).strip("_")
+    candidate = _AUTOMATION_PREFIX + slug
+    # Preserve existing short, parameter-free ids. Long targets and parameterised
+    # actions keep a digest of the *whole* request, including fields beyond 60 chars.
+    if len(candidate) <= 60 and not data and not isinstance(identity, list):
+        return candidate
+    import hashlib
+    canonical = json.dumps([at_time, weekdays or [], identity, domain, service,
+                            once_date or "", data or {}],
+                           sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return candidate[:35] + "_" + digest
+
+
+async def _automation_exists(ha, automation_id: str, session):
+    '''True/False when HA answers, None when it cannot be determined.'''
+    try:
+        states = await ha.list_automation_states(session)
+    except Exception as e:
+        log.warning("回读定时任务失败: %s", type(e).__name__)
+        return None
+    if not isinstance(states, list):
+        return None
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        attributes = state.get("attributes") or {}
+        config_id = str(attributes.get("id") or state.get("config_id") or "").strip()
+        if config_id == automation_id:
+            return True
+    return False
+
+
+def _cn_int(token):
+    token = str(token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    if token == "十":
+        return 10
+    if "十" in token:
+        head, _, tail = token.partition("十")
+        tens = _CN_DIGITS.get(head, 1) if head else 1
+        ones = _CN_DIGITS.get(tail, 0) if tail else 0
+        return tens * 10 + ones
+    total = 0
+    for ch in token:
+        if ch not in _CN_DIGITS:
+            return None
+        total = total * 10 + _CN_DIGITS[ch]
+    return total
+
+
+def _parse_cn_clock(text: str):
+    '''Return (HH:MM, span) for the first clock expression, else (None, None).'''
+    match = re.search(r"(\d{1,2})\s*[:：]\s*(\d{2})", text)
+    if match:
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return "%02d:%02d" % (hour, minute), match.span()
+    pattern = (r"([零〇一二两三四五六七八九十\d]{1,3})\s*[点时]\s*"
+               r"(半|一刻|三刻|[零〇一二两三四五六七八九十\d]{1,3}\s*分?)?")
+    match = re.search(pattern, text)
+    if not match:
+        return None, None
+    hour = _cn_int(match.group(1))
+    if hour is None or not 0 <= hour <= 24:
+        return None, None
+    tail = (match.group(2) or "").strip()
+    minute = 0
+    if tail == "半":
+        minute = 30
+    elif tail == "一刻":
+        minute = 15
+    elif tail == "三刻":
+        minute = 45
+    elif tail:
+        parsed = _cn_int(tail.replace("分", ""))
+        if parsed is not None and 0 <= parsed <= 59:
+            minute = parsed
+    return "%02d:%02d" % (hour % 24, minute), match.span()
+
+
+def _apply_period(text: str, at_time: str) -> str:
+    '''晚上七点 -> 19:00; 下午三点 -> 15:00; 早上七点 stays 07:00.'''
+    hour_text, minute_text = at_time.split(":")
+    hour = int(hour_text)
+    if hour == 12 and any(w in text for w in ("晚上", "夜里", "夜间", "今晚", "凌晨", "午夜")):
+        hour = 0
+    elif any(w in text for w in ("下午", "晚上", "傍晚", "夜里", "夜间", "今晚")) and hour < 12:
+        hour += 12
+    elif "中午" in text and hour < 12:
+        hour += 12
+    return "%02d:%s" % (hour % 24, minute_text)
+
+
+def _parse_relative_offset(text: str):
+    '''Return (timedelta, phrase) for 「十分钟后」/「半小时后」/「两个半小时后」.'''
+    from datetime import timedelta as _td
+    text = str(text or "")
+    suffix = r"(?:之后|以后|过后|后)"
+    match = re.search(
+        r"([零〇一二两三四五六七八九十\d]{1,3})\s*个?\s*半\s*个?\s*小时" + suffix, text)
+    if match:
+        hours = _cn_int(match.group(1))
+        if hours is not None and 0 <= hours <= 23:
+            return _td(hours=hours, minutes=30), match.group(0)
+    match = re.search(r"半\s*个?\s*小时" + suffix, text)
+    if match:
+        return _td(minutes=30), match.group(0)
+    match = re.search(
+        r"([零〇一二两三四五六七八九十\d]{1,3})\s*个?\s*小时" + suffix, text)
+    if match:
+        hours = _cn_int(match.group(1))
+        if hours is not None and 0 <= hours <= 23:
+            return _td(hours=hours), match.group(0)
+    match = re.search(r"半\s*个?\s*分钟" + suffix, text)
+    if match:
+        return _td(seconds=30), match.group(0)
+    match = re.search(
+        r"([零〇一二两三四五六七八九十\d]{1,3})\s*个?\s*分钟" + suffix, text)
+    if match:
+        minutes = _cn_int(match.group(1))
+        if minutes is not None and 0 <= minutes <= 1440:
+            return _td(minutes=minutes), match.group(0)
+    match = re.search(
+        r"([零〇一二两三四五六七八九十\d]{1,3})\s*秒钟?" + suffix, text)
+    if match:
+        seconds = _cn_int(match.group(1))
+        if seconds is not None and 0 <= seconds <= 3600:
+            return _td(seconds=seconds), match.group(0)
+    return None, ""
+
+
+def _parse_once_date(text: str, now=None):
+    '''「明天八点」「后天七点」「今晚九点」 → YYYY-MM-DD (None when not one-shot).'''
+    from datetime import datetime as _dt, timedelta as _td
+    text = str(text or "")
+    now = now or _schedule_now()
+    if "后天" in text:
+        return (now + _td(days=2)).strftime("%Y-%m-%d")
+    if "明天" in text or "明晚" in text or "明日" in text:
+        return (now + _td(days=1)).strftime("%Y-%m-%d")
+    if any(word in text for word in ("今天", "今晚", "今日")):
+        return now.strftime("%Y-%m-%d")
+    return None
+
+
+def _normalize_schedule_date(value):
+    '''Return YYYY-MM-DD or "" when the value is not a real calendar date.'''
+    from datetime import datetime as _dt
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", raw):
+        return ""
+    try:
+        parsed = _dt.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _schedule_now():
+    from datetime import datetime as _dt
+    return _dt.now(_schedule_clock["zone"]).replace(tzinfo=None)
+
+
+def _schedule_once_at(date_text: str, at_time: str):
+    '''Absolute datetime of a one-shot task expressed in HA's local calendar.'''
+    from datetime import datetime as _dt
+    return _dt.strptime(_normalize_schedule_date(date_text) + " " + at_time,
+                        "%Y-%m-%d %H:%M:%S")
+
+
+def _parse_schedule_days_cn(text: str):
+    '''Return ("daily"|"weekdays"|"weekends"|"1,3,5"|None, once).'''
+    once = any(w in text for w in ("明天", "后天", "今晚", "今天"))
+    if "工作日" in text:
+        return "weekdays", once
+    if "周末" in text:
+        return "weekends", once
+    match = re.search(r"每(?:周|星期)\s*([一二三四五六日天、,，和及\s]+)", text)
+    if match:
+        days = []
+        for ch in match.group(1):
+            if ch in _CN_WEEKDAY and _CN_WEEKDAY[ch] not in days:
+                days.append(_CN_WEEKDAY[ch])
+        return (",".join(sorted(days)), once) if days else (None, once)
+    if any(w in text for w in ("每天", "每日", "天天")):
+        return "daily", once
+    return ("daily", once) if once else (None, once)
+
+
+def _looks_like_schedule(text: str) -> bool:
+    text = str(text or "")
+    return any(w in text for w in _SCHEDULE_HINTS) or bool(
+        re.search(r"(?:秒钟?|分钟|小时)\s*(?:之后|以后|过后|后)", text))
+
+
+def _pick_schedule_device(text: str, devices, aliases):
+    '''Longest device name/alias that appears in the sentence wins.'''
+    best = None
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        entity_id = str(device.get("entity_id") or "")
+        if not entity_id:
+            continue
+        names = [str(device.get("name") or "")]
+        for alias, target in (aliases or {}).items():
+            if target == entity_id:
+                names.append(str(alias))
+        for name in names:
+            name = name.strip()
+            if len(name) >= 2 and name in text:
+                if best is None or len(name) > len(best[0]):
+                    best = (name, device)
+    return best[1] if best else None
+
+
+def _schedule_service_for(domain: str, text: str) -> str:
+    if any(w in text for w in ("关掉", "关闭", "关上", "停止", "停掉", "关一下")):
+        return "close_cover" if domain == "cover" else "turn_off"
+    if any(w in text for w in ("切换", "翻转")):
+        return "toggle"
+    return "open_cover" if domain == "cover" else "turn_on"
+
+
+def _parse_schedule_command(text: str, devices, aliases):
+    '''Turn 「每天早上七点半打开热水器」/「十分钟后关灯」 into a schedule action.'''
+    text = str(text or "").strip()
+    if not text or not _looks_like_schedule(text):
+        return None
+    now = _schedule_now()
+    once_date = None
+    offset, _phrase = _parse_relative_offset(text)
+    if offset is not None:
+        # 相对时间（「十分钟后」「半小时后」）只能是一次性的绝对时间点。
+        when = now + offset
+        at_time = when.strftime("%H:%M:%S")
+        once = True
+        days = "once"
+        once_date = when.strftime("%Y-%m-%d")
+    else:
+        at_time, _span = _parse_cn_clock(text)
+        if not at_time:
+            return None
+        at_time = _apply_period(text, at_time)
+        days, once = _parse_schedule_days_cn(text)
+        if days is None:
+            return None
+        if once:
+            once_date = _parse_once_date(text, now)
+            if not once_date:
+                return None
+            if at_time.startswith("00:") and any(w in text for w in ("晚上", "今晚", "夜里", "夜间")):
+                from datetime import datetime as _dt, timedelta as _td
+                once_date = (_dt.strptime(once_date, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+            days = "once"
+    device = _pick_schedule_device(text, devices, aliases)
+    if not device:
+        return None
+    domain = str(device.get("domain") or str(device.get("entity_id") or "").split(".")[0])
+    service = _schedule_service_for(domain, text)
+    entity_id = str(device.get("entity_id") or "")
+    name = str(device.get("name") or entity_id)
+    verb = "打开"
+    if "off" in service or service == "close_cover":
+        verb = "关闭"
+    elif service == "toggle":
+        verb = "切换"
+    action = {
+        "type": "schedule",
+        "schedule_time": at_time,
+        "schedule_days": days,
+        "once": bool(once),
+        "domain": domain,
+        "service": service,
+        "entity_id": entity_id,
+        "reply": verb + name,
+    }
+    if once_date:
+        action["once_date"] = once_date
+    return action
+
+
+async def _ha_device_catalog(ha, session) -> list:
+    '''Cache the HA entity list for voice schedule parsing (60s).'''
+    now = time.monotonic()
+    if _ha_catalog["devices"] and now - _ha_catalog["at"] < 60:
+        return _ha_catalog["devices"]
+    try:
+        async with session.get(
+            ha.base + "/api/states", headers=ha.headers,
+            timeout=aiohttp.ClientTimeout(total=8), allow_redirects=False
+        ) as response:
+            if response.status != 200:
+                return _ha_catalog["devices"]
+            states = await response.json()
+    except Exception as e:
+        log.warning("读取 HA 设备列表失败，语音定时任务暂不可用: %s", type(e).__name__)
+        return _ha_catalog["devices"]
+    devices = []
+    for state in states if isinstance(states, list) else []:
+        if not isinstance(state, dict):
+            continue
+        entity_id = str(state.get("entity_id") or "")
+        if not entity_id or entity_id.split(".")[0] in (
+                "automation", "scene", "sensor", "binary_sensor", "zone", "person"):
+            continue
+        attributes = state.get("attributes") or {}
+        devices.append({
+            "entity_id": entity_id,
+            "domain": entity_id.split(".")[0],
+            "name": str(attributes.get("friendly_name") or entity_id),
+            "state": state.get("state", ""),
+        })
+    _ha_catalog["devices"] = devices
+    _ha_catalog["at"] = now
+    return devices
+
+
+async def _create_ha_automation(
+    ha, domain: str, service: str, data: dict,
+    schedule_time: str, schedule_days=None,
+    session=None, once: bool = False, once_date=None,
+    source=None, replace: bool = False, automation_id: str | None = None,
+):
+    '''Create (or replace) one time-triggered automation, idempotently.
+
+    Differences from the upstream version: the config id is derived from the
+    request (so saying the same thing twice cannot create two tasks), one-shot
+    requests get an absolute date trigger instead of a daily one, and after
+    reloading we read the automation back from HA before reporting success.
+
+    ``replace``/``automation_id`` are used by the edit endpoint: the same HA
+    config id is overwritten in place instead of being reported as "exists".
+    '''
+    at_time = _normalize_schedule_time(schedule_time)
+    if not at_time:
+        log.warning("定时任务时间格式无效: %r", schedule_time)
+        return "", False
+    _schedule_registry_read()  # check before writing anything to HA
+    data = dict(data or {})
+    once = bool(once or data.get("once") or data.get("__once"))
+    once_date = once_date or data.get("once_date") or data.get("__once_date")
+    source = str(source or data.get("__source") or "voice")
+    once_at = ""
+    if once:
+        once_date = _normalize_schedule_date(once_date)
+        if not once_date:
+            log.warning("一次性定时任务缺少日期，无法创建: %r", schedule_time)
+            return "", False
+        try:
+            when = _schedule_once_at(once_date, at_time)
+        except ValueError:
+            log.warning("一次性定时任务时间无效: %s %s", once_date, at_time)
+            return "", False
+        if when <= _schedule_now():
+            log.warning("一次性定时任务的时间已经过去: %s %s", once_date, at_time)
+            return "", False
+        once_at = _schedule_format_moment(when)
+    try:
+        entity_id = _schedule_targets(data.get("entity_id"))
+    except ValueError as e:
+        log.warning("定时任务目标无效: %s", e)
+        return "", False
+    weekdays = [] if once else _normalize_schedule_weekdays(schedule_days)
+    extra = {k: v for k, v in data.items() if k not in _SCHEDULE_INTERNAL_KEYS}
+    if not automation_id:
+        automation_id = _automation_stable_id(at_time, weekdays, entity_id,
+                                              domain, service,
+                                              once_date if once else None, data=extra)
+
+    action_item = {"service": "%s.%s" % (domain, service)}
+    if entity_id:
+        action_item["target"] = {"entity_id": entity_id}
+    if extra:
+        action_item["data"] = extra
+    label = "%s %s" % (at_time[:5] if at_time.endswith(":00") else at_time, entity_id or domain)
+    if once:
+        label = "%s %s" % (once_date, label)
+    config = {
+        "alias": "小爱桥接-" + label,
+        "description": "由小爱语音桥接器自动创建" + ("（一次性）" if once else ""),
+        # HA's time trigger accepts a clock time (HH:MM[:SS]), not a date-time
+        # string. The date half of a one-shot is enforced by the template
+        # condition below, so it fires on that date and never again.
+        "trigger": [{"platform": "time", "at": at_time}],
+        "action": [action_item],
+        "mode": "single",
+    }
+    if once:
+        # HA's time trigger has no date-time form, so a one-shot is a clock
+        # trigger plus a date guard: it only passes on the selected day and is
+        # dead afterwards (the list then purges it).
+        config["condition"] = [{
+            "condition": "template",
+            "value_template": ("{{ now().strftime('%Y-%m-%d') == '"
+                               + once_date + "' }}"),
+        }]
+    elif weekdays:
+        config["condition"] = [{"condition": "time", "weekday": weekdays}]
+
+    if not replace:
+        existing = await _automation_exists(ha, automation_id, session)
+        if existing is True:
+            log.info("定时任务已存在，跳过重复创建: %s", automation_id)
+            _automation_outcome(automation_id, "exists", True)
+            return automation_id, True
+
+    ok = await ha.create_automation(automation_id, config, session)
+    if ok:
+        # Record accepted storage before reload: a reload failure is precisely
+        # when HA states cannot supply this row (or the edited metadata).
+        _schedule_registry_add(automation_id, at_time, weekdays, entity_id,
+                               domain, service, source, once,
+                               once_at=once_at, data=extra)
+        ok = await ha.reload_automations(session)
+    if not ok:
+        _automation_outcome(automation_id, "failed", False)
+        return automation_id, False
+
+    verified = await _automation_exists(ha, automation_id, session)
+    if verified is True:
+        _automation_outcome(automation_id, "verified", True)
+        return automation_id, True
+    if verified is False:
+        _automation_outcome(automation_id, "missing", False)
+        log.error("定时任务已提交但 HA 里查不到: %s（请检查 configuration.yaml 的 automation 配置）",
+                  automation_id)
+        return automation_id, False
+    _automation_outcome(automation_id, "unverified", False)
+    log.warning("定时任务已创建，但无法回读确认: %s", automation_id)
+    return automation_id, False
+
+
+# ──────────────── 定时任务本地登记表：页面不再只依赖 HA 实体状态 ────────────────
+# HA 的 /api/states 只反映「已经加载的 automation 实体」。配置写进去了但 reload 没
+# 生效时，列表会显示 0 条，用户就以为没建成。这里在 /data 记一份登记表，列表把
+# 两边合并，并明确标出「HA 里没有」的状态。
+
+def _schedule_registry_path():
+    override = globals().get("_SCHEDULE_REGISTRY_OVERRIDE")
+    if override:
+        return Path(override)
+    return AUTH_PATH.parent / "schedules.json"
+
+
+def _schedule_registry_read() -> list:
+    try:
+        data = json.loads(_schedule_registry_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log.error("定时任务登记表读取失败，保留原文件: %s", type(e).__name__)
+        raise ScheduleRegistryError("定时任务登记表无法读取，已停止修改并保留原文件，请检查或恢复备份") from e
+    if (not isinstance(data, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip()
+            for item in data)):
+        raise ScheduleRegistryError("定时任务登记表格式损坏，已停止修改并保留原文件，请检查或恢复备份")
+    if len({item["id"] for item in data}) != len(data):
+        raise ScheduleRegistryError("定时任务登记表存在重复 ID，已停止修改并保留原文件")
+    return data
+
+
+def _schedule_registry_write(items: list) -> None:
+    import tempfile
+    import os
+    _schedule_registry_read()  # guard even a direct replacement of the registry
+    path = _schedule_registry_path()
+    temporary = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".schedules-", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(items, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+    except Exception as e:
+        log.warning("定时任务登记表写入失败: %s", type(e).__name__)
+        raise ScheduleRegistryError("定时任务登记表写入失败，原文件已保留；HA 操作可能已完成，请核对后重试") from e
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _schedule_registry_add(automation_id: str, at_time: str, weekdays,
+                           entity_id: str, domain: str, service: str,
+                           source: str, once: bool = False,
+                           once_at: str = "", data=None) -> None:
+    current = _schedule_registry_read()
+    items = [item for item in current
+             if str(item.get("id")) != automation_id]
+    previous = next((item for item in current
+                     if str(item.get("id")) == automation_id), {})
+    stamp = _schedule_now().strftime("%Y-%m-%d %H:%M:%S")
+    items.append({
+        "id": automation_id,
+        "time": at_time,
+        "weekdays": list(weekdays or []),
+        "entity_id": entity_id,
+        "domain": domain,
+        "service": service,
+        "source": source,
+        "once": bool(once),
+        "once_at": str(once_at or ""),
+        "data": dict(data or {}),
+        "created_at": previous.get("created_at") or stamp,
+        "updated_at": stamp,
+    })
+    _schedule_registry_write(items)
+
+
+def _schedule_registry_remove(automation_id: str) -> None:
+    _schedule_registry_write([item for item in _schedule_registry_read()
+                              if str(item.get("id")) != automation_id])
+
+
+def _schedule_local_naive(value):
+    '''Parse an HA ISO timestamp into a local naive datetime, or None.'''
+    from datetime import datetime as _dt
+    try:
+        parsed = _dt.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_schedule_clock["zone"]).replace(tzinfo=None)
+    return parsed
+
+
+def _schedule_parse_moment(value):
+    '''Read both legacy minute-only dates and new second-precision dates.'''
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return _dt.strptime(str(value or ""), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _schedule_format_moment(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S" if value.second else "%Y-%m-%d %H:%M")
+
+
+def _schedule_once_state(meta, last_triggered, now=None):
+    '''``done``/``expired`` for a one-shot task whose moment has passed, else None.'''
+    if not meta or not meta.get("once"):
+        return None
+    from datetime import datetime as _dt, timedelta as _td
+    now = now or _schedule_now()
+    when = _schedule_parse_moment(meta.get("once_at"))
+    if when is None:
+        return None
+    if now < when:
+        return None
+    fired = _schedule_local_naive(last_triggered)
+    if fired is not None and fired >= when:
+        return "done"
+    # A near-boundary timestamp is insufficient evidence either way. Never
+    # restore the old two-minute grace, which could count an earlier manual run.
+    if fired is not None and when - _td(seconds=2) <= fired < when:
+        return "unconfirmed"
+    return "expired"
+
+
+def _schedule_next_run(at_time: str, weekdays, once: bool, now=None,
+                       once_at: str = ""):
+    '''Next datetime this task should fire, or None when it cannot be known.'''
+    from datetime import datetime as _dt, timedelta as _td
+    now = now or _schedule_now()
+    if once:
+        when = _schedule_parse_moment(once_at)
+        if when is None:
+            return None
+        return _schedule_format_moment(when) if when > now else None
+    normal = _normalize_schedule_time(at_time)
+    if not normal:
+        return None
+    hour, minute, second = map(int, normal.split(":"))
+    week_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    allowed = [week_map[d] for d in (weekdays or []) if d in week_map]
+    for offset in range(0, 8):
+        candidate = (now + _td(days=offset)).replace(
+            hour=hour, minute=minute, second=second, microsecond=0)
+        if candidate <= now:
+            continue
+        if not allowed or candidate.weekday() in allowed:
+            return _schedule_format_moment(candidate)
+    return None
+
+
+def _schedule_listing(states, clock_known=True) -> list:
+    '''Merge what HA loaded with what we know we wrote.'''
+    from datetime import datetime as _dt
+    entries = _automation_entries(states)
+    registry = {str(item.get("id")): item for item in _schedule_registry_read()}
+    now = _schedule_now()
+    seen = set()
+    result = []
+    for entry in entries:
+        config_id = entry.get("config_id", "")
+        seen.add(config_id)
+        meta = registry.get(config_id) or {}
+        once_state = _schedule_once_state(meta, entry.get("last_triggered"), now) if clock_known else None
+        status = "active" if entry.get("state") == "on" else "disabled"
+        if once_state:
+            status = once_state
+        result.append({
+            "config_id": config_id,
+            "entity_id": entry.get("entity_id", ""),
+            "alias": entry.get("alias", ""),
+            "state": entry.get("state", ""),
+            "last_triggered": entry.get("last_triggered"),
+            "time": meta.get("time", ""),
+            "weekdays": meta.get("weekdays") or [],
+            "entity": meta.get("entity_id", ""),
+            "domain": meta.get("domain", ""),
+            "service": meta.get("service", ""),
+            "data": meta.get("data") or {},
+            "source": meta.get("source", ""),
+            "once": bool(meta.get("once")),
+            "once_at": meta.get("once_at", ""),
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "next_run": (_schedule_next_run(
+                meta.get("time", ""), meta.get("weekdays"), bool(meta.get("once")),
+                now=now, once_at=meta.get("once_at", "")) if clock_known and meta.get("time") else None),
+            "status": status,
+            "expired": bool(once_state),
+        })
+    for config_id, meta in registry.items():
+        if config_id in seen:
+            continue
+        once_state = _schedule_once_state(meta, None, now) if clock_known else None
+        status = "not_loaded"
+        if once_state:
+            status = once_state
+        result.append({
+            "config_id": config_id,
+            "entity_id": "",
+            "alias": "小爱桥接-%s %s（HA 未加载）" % (
+                meta.get("time", "")[:5], meta.get("entity_id", "")),
+            "state": "",
+            "last_triggered": None,
+            "time": meta.get("time", ""),
+            "weekdays": meta.get("weekdays") or [],
+            "entity": meta.get("entity_id", ""),
+            "domain": meta.get("domain", ""),
+            "service": meta.get("service", ""),
+            "data": meta.get("data") or {},
+            "source": meta.get("source", ""),
+            "once": bool(meta.get("once")),
+            "once_at": meta.get("once_at", ""),
+            "created_at": meta.get("created_at", ""),
+            "updated_at": meta.get("updated_at", ""),
+            "next_run": (_schedule_next_run(
+                meta.get("time", ""), meta.get("weekdays"), bool(meta.get("once")),
+                now=now, once_at=meta.get("once_at", "")) if clock_known and meta.get("time") else None),
+            "status": status,
+            "expired": bool(once_state),
+        })
+    return result
+
+
+def _schedule_form_date(value, at_time: str):
+    '''Validate the date field of a one-shot form task.'''
+    date_text = _normalize_schedule_date(value)
+    if not date_text:
+        return "", "一次性任务需要选择日期（YYYY-MM-DD）"
+    try:
+        when = _schedule_once_at(date_text, at_time)
+    except ValueError:
+        return "", "日期或时间格式无效"
+    if when <= _schedule_now():
+        return "", "选择的时间已经过去，请换一个将来的日期或时间"
+    return date_text, ""
+
+
+async def _schedule_purge_expired(ha, session, entries):
+    '''Drop one-shot tasks that already fired; keep ones that never fired.
+
+    A task that never fired keeps its row so the user can see that HA did not
+    run it (deleting it silently would hide a real failure).
+    '''
+    kept = []
+    purged = 0
+    for entry in entries or []:
+        if not isinstance(entry, dict) or not entry.get("expired"):
+            kept.append(entry)
+            continue
+        if entry.get("status") != "done":
+            kept.append(entry)
+            continue
+        config_id = str(entry.get("config_id") or "")
+        try:
+            deleted = await ha.delete_automation(config_id, session)
+        except Exception as e:
+            log.warning("清理一次性任务异常: %s (%s)", config_id, type(e).__name__)
+            deleted = False
+        if not deleted:
+            log.warning("一次性任务已执行，但自动清理失败: %s", config_id)
+            kept.append(entry)
+            continue
+        purged += 1  # HA changed even if the subsequent local write fails
+        try:
+            _schedule_registry_remove(config_id)
+        except ScheduleRegistryError:
+            log.warning("HA 一次性任务配置 %s 已删除，但本地登记清理失败", config_id)
+            kept.append(dict(entry, registry_pending=True))
+            continue
+        log.info("一次性任务已执行，自动清理: %s", config_id)
+    if purged:
+        try:
+            await ha.reload_automations(session)
+        except Exception:
+            pass
+    return kept
+
+
+async def _schedule_automation_entity(ha, automation_id, session):
+    '''Entity id of one automation (config id != entity id). "" when absent.'''
+    try:
+        states = await ha.list_automation_states(session)
+    except Exception as e:
+        log.warning("读取自动化实体失败: %s", type(e).__name__)
+        return None
+    if not isinstance(states, list):
+        return None
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        attributes = state.get("attributes") or {}
+        config_id = str(attributes.get("id") or state.get("config_id") or "").strip()
+        if config_id == automation_id:
+            return str(state.get("entity_id") or "")
+    return ""
+
+
+@app.post("/api/automations/cleanup")
+async def cleanup_automations():
+    '''Explicit, serialised cleanup; reading the task list never mutates HA.'''
+    global _schedule_cleanup_lock
+    if _schedule_cleanup_lock is None:
+        _schedule_cleanup_lock = asyncio.Lock()
+    async with _schedule_cleanup_lock:
+        cfg = load_config().get("homeassistant") or {}
+        if not cfg.get("url") or not cfg.get("token"):
+            raise HTTPException(400, "HA 未配置")
+        ha = HAClient(cfg["url"], cfg["token"])
+        async with aiohttp.ClientSession() as session:
+            if not await _sync_schedule_clock(ha, session):
+                raise HTTPException(503, "无法读取 HA 时区，未清理任何任务")
+            states = await ha.list_automation_states(session)
+            if states is None:
+                raise HTTPException(502, "无法读取 HA 自动化状态，未清理任何任务")
+            entries = _schedule_listing(states)
+            kept = await _schedule_purge_expired(ha, session, entries)
+        pending = sum(bool(item.get("registry_pending")) for item in kept)
+        message = ("HA 任务配置已删除，但 %s 条本地登记未能清理；请修复存储后删除残留登记" % pending
+                   if pending else "已清理完成")
+        return {"ok": True, "removed": len(entries) - len(kept),
+                "registry_pending": pending, "msg": message}
+
+
+_SCHEDULE_AREAS_TEMPLATE = (
+    "{% set ns = namespace(out=[]) %}"
+    "{% for area in areas() %}"
+    "{% set ns.out = ns.out + [{'id': area, 'name': area_name(area), "
+    "'entities': area_entities(area)}] %}"
+    "{% endfor %}"
+    "{{ ns.out | tojson }}"
+)
+
+
+def _schedule_parse_areas(payload) -> list:
+    '''Normalise /api/template output into [{id,name,entities}], skipping junk.'''
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return []
+    if not isinstance(payload, list):
+        return []
+    areas = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        area_id = str(item.get("id") or "").strip()
+        if not area_id:
+            continue
+        entities = item.get("entities")
+        areas.append({
+            "id": area_id,
+            "name": str(item.get("name") or area_id),
+            "entities": [str(entity) for entity in entities
+                         if isinstance(entity, str)] if isinstance(entities, list) else [],
+        })
+    return areas
+
+
+@app.get("/api/ha/areas")
+async def ha_areas():
+    '''Rooms/areas known to HA, so the schedules page can filter devices.'''
+    cfg = load_config()
+    ha_cfg = cfg.get("homeassistant", {}) or {}
+    if not ha_cfg.get("url") or not ha_cfg.get("token"):
+        raise HTTPException(400, "Home Assistant 未配置")
+    ha = HAClient(ha_cfg["url"], ha_cfg["token"])
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(ha.base + "/api/template",
+                              json={"template": _SCHEDULE_AREAS_TEMPLATE},
+                              headers=ha.headers,
+                              timeout=aiohttp.ClientTimeout(total=10),
+                              allow_redirects=False) as r:
+                status = getattr(r, "status", 0)
+                if status in (401, 403, 404):
+                    # Limited HA without the template API: filtering is optional.
+                    return {"ok": True, "supported": False, "areas": [],
+                            "msg": "HA 不支持模板 API，无法按房间筛选"}
+                if status != 200:
+                    raise HTTPException(502, "HA 模板接口返回 %s" % status)
+                payload = await r.text()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, "读取 HA 房间列表失败: %s" % type(e).__name__)
+    areas = _schedule_parse_areas(payload)
+    return {"ok": True, "supported": bool(areas), "areas": areas}
+
+
+@app.put("/api/automations/{automation_id}")
+async def update_automation(automation_id: str, req: ScheduleAutomationRequest):
+    '''Edit one scheduled task in place (same HA config id, same list row).'''
+    cfg = load_config()
+    ha_cfg = cfg.get("homeassistant", {}) or {}
+    if not ha_cfg.get("url") or not ha_cfg.get("token"):
+        raise HTTPException(400, "HA 未配置")
+    automation_id = str(automation_id or "").strip()
+    if not automation_id.startswith(_AUTOMATION_PREFIX):
+        raise HTTPException(403, "只能修改由小爱桥接创建的任务")
+    schedule_time = _normalize_schedule_time(getattr(req, "time", ""))
+    if not schedule_time:
+        raise HTTPException(400, "时间格式无效，请用 HH:MM（24 小时制）")
+    once = bool(getattr(req, "once", False))
+    once_date = ""
+    days = None
+    if once:
+        async with aiohttp.ClientSession() as clock_session:
+            if not await _sync_schedule_clock(HAClient(ha_cfg["url"], ha_cfg["token"]), clock_session):
+                raise HTTPException(503, "无法读取 HA 时区，暂时不能创建一次性任务")
+        once_date, date_error = _schedule_form_date(getattr(req, "date", None), schedule_time)
+        if date_error:
+            raise HTTPException(400, date_error)
+    else:
+        days, days_error = _schedule_form_days(getattr(req, "days", None))
+        if days_error:
+            raise HTTPException(400, days_error)
+    extra_data, data_error = _schedule_form_data(getattr(req, "data", None))
+    if data_error:
+        raise HTTPException(400, data_error)
+    domain = str(getattr(req, "domain", "") or "").strip().lower()
+    service = str(getattr(req, "service", "") or "").strip().lower()
+    action, error = _schedule_form_action(domain, service, getattr(req, "entity_id", ""))
+    if error:
+        raise HTTPException(400, error)
+    action.update(extra_data)
+    ha = HAClient(ha_cfg["url"], ha_cfg["token"])
+    async with aiohttp.ClientSession() as s:
+        target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
+        if target_error:
+            raise HTTPException(400, target_error)
+        automation_id, ok = await _create_ha_automation(
+            ha, domain, service, action, schedule_time, days, s,
+            once=once, once_date=once_date or None, source="form",
+            replace=True, automation_id=automation_id,
+        )
+        config_state = "created"
+        if not ok:
+            config_state = await _automation_config_state(ha, automation_id, s)
+    if not ok:
+        if config_state == "missing":
+            raise HTTPException(500, "保存失败，请检查 HA 连接与实体 ID")
+        if config_state == "unknown":
+            raise HTTPException(
+                504, "保存结果暂时无法确认：HA 没有返回明确结果。"
+                     "请先在 HA 的「自动化」里核对，再决定是否重试。")
+        log.warning("定时任务 %s 已改写，但重新加载自动化失败", automation_id)
+        return {"ok": True, "automation_id": automation_id, "reloaded": False,
+                "msg": "修改已保存，但尚未确认 HA 已加载，请稍后刷新核对"}
+    log.info("已修改定时任务 %s（手动）", automation_id)
+    when_text = (once_date + " ") if once else ""
+    return {"ok": True, "automation_id": automation_id, "reloaded": True,
+            "updated": True, "msg": "已保存修改 " + when_text
+                       + (schedule_time[:5] if schedule_time.endswith(":00") else schedule_time)}
+"""
+
+
+
+
+source = source + '# ════════════════ 登录回退：令牌路径不带密码 + 87001 终态判定 ════════════════\n_last_auth_failure: dict = {}\nAUTH_OTP_REQUIRED_CODES = {87001, 87002, 87003}\n\n\ndef _token_account_credentials(mi_cfg: dict) -> tuple:\n    """Credentials handed to MiAccount on the token/cookie paths: always empty.\n\n    miservice\'s mi_request calls login(sid) whenever the sid is missing from the\n    token, and login() falls back to serviceLoginAuth2 with self.username and\n    md5(self.password) when the passToken exchange fails. For a QR-login user that\n    password is stale or empty, so the fallback returns 87001 (验证码输入错误) and\n    miservice then sets self.token = None, destroying the passToken we just got.\n    Password login has its own explicit path (_otp_password_login).\n    """\n    return "", ""\n\n\ndef _miservice_auth_failure(exc) -> dict:\n    """Classify a miservice Exception that carries a Xiaomi response dict.\n\n    Returns {} when the error says nothing about authentication. A terminal\n    verdict means retrying is pointless and the operator has to log in again.\n    """\n    args = getattr(exc, "args", None) or ()\n    payload = args[0] if args and isinstance(args[0], dict) else None\n    if not isinstance(payload, dict):\n        return {}\n    code = payload.get("code")\n    desc = str(payload.get("desc") or payload.get("description") or "").strip()\n    if code in AUTH_OTP_REQUIRED_CODES:\n        return {\n            "kind": "otp", "code": code, "terminal": True, "desc": desc,\n            "message": "小米要求验证码/二次验证（%s），自动登录无法完成；"\n                       "请在面板「小米账号」页重新扫码或完成一次人工验证" % (code,),\n        }\n    if code in RELOGIN_FATAL_CODES:\n        return {\n            "kind": "rejected", "code": code, "terminal": True, "desc": desc,\n            "message": "小米拒绝了保存的凭据（%s），需要重新登录" % (code,),\n        }\n    return {}\n\n\ndef _note_auth_failure(exc) -> dict:\n    """Record and log a terminal auth verdict from a miservice exception."""\n    verdict = _miservice_auth_failure(exc)\n    if verdict:\n        _last_auth_failure.clear()\n        _last_auth_failure.update(verdict)\n        log.error("%s", verdict["message"])\n    return verdict\n\n\ndef _build_token_account(session, mi_cfg: dict):\n    """Build the MiAccount used by the token / cookie paths — without a password.\n\n    miservice\'s mi_request calls login(sid) after a 401, and login() falls back to\n    serviceLoginAuth2 with self.username / md5(self.password) when the passToken\n    exchange fails. A QR-login user has no usable password there, so that fallback\n    returns 87001 and miservice then sets self.token = None, destroying the\n    passToken. Password login has its own explicit path (_otp_password_login).\n    """\n    from miservice import MiAccount\n    return MiAccount(session, "", "", None)\n'
+
+source = source + '\n# ════════════════ 定时任务：暂停/启用 + HA 服务列表代理 ════════════════\n@app.post("/api/automations/{automation_id}/toggle")\nasync def toggle_automation(automation_id: str, payload: dict | None = None):\n    """Pause or resume one scheduled task (HA automation.turn_on / turn_off)."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    enabled = bool((payload or {}).get("enabled", True))\n    automation_id = str(automation_id or "").strip()\n    if not automation_id.startswith(_AUTOMATION_PREFIX):\n        raise HTTPException(403, "只能操作由小爱桥接创建的任务")\n    async with aiohttp.ClientSession() as s:\n        ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n        entity_id = await _schedule_automation_entity(ha, automation_id, s)\n        if entity_id is None:\n            raise HTTPException(502, "读取 HA 自动化列表失败，暂时无法切换")\n        if not entity_id:\n            raise HTTPException(404, "HA 里没有这个任务（可能尚未重新加载）")\n        ok = await ha.call_service(\n            "automation", "turn_on" if enabled else "turn_off",\n            {"entity_id": entity_id}, s)\n    if not ok:\n        raise HTTPException(500, "切换失败：HA 没有接受这次调用")\n    log.info("定时任务 %s 已%s", automation_id, "启用" if enabled else "暂停")\n    return {"ok": True, "enabled": enabled, "msg": "已启用" if enabled else "已暂停"}\n\n\n@app.get("/api/ha/services")\nasync def ha_services():\n    """Proxy HA /api/services so the form offers services HA actually has."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n    try:\n        async with aiohttp.ClientSession() as s:\n            async with s.get(ha.base + "/api/services", headers=ha.headers,\n                             timeout=aiohttp.ClientTimeout(total=10)) as r:\n                if r.status != 200:\n                    raise HTTPException(502, "HA /api/services 返回 %s" % r.status)\n                data = await r.json()\n    except HTTPException:\n        raise\n    except Exception as e:\n        raise HTTPException(502, "读取 HA 服务列表失败: %s" % type(e).__name__)\n    services = {}\n    if isinstance(data, list):\n        for item in data:\n            domain = item.get("domain")\n            entries = item.get("services")\n            if domain and isinstance(entries, dict):\n                services[domain] = sorted(entries.keys())\n    return {"ok": True, "services": services}\n'
+
 # Validate the built Python AST, not the patch source's quoted upstream templates.
+replace_exact(
+    "rule execution uses the same HA schedule clock as voice and form entry points",
+    '''        async with aiohttp.ClientSession() as s:
+            automation_id, created = await _create_ha_automation(''',
+    '''        async with aiohttp.ClientSession() as s:
+            if not await _sync_schedule_clock(ha, s):
+                raise HTTPException(503, "无法读取 HA 时区，未创建定时任务")
+            automation_id, created = await _create_ha_automation(''',
+)
+
 import ast
 _tree = ast.parse(source)
 _unverified = [

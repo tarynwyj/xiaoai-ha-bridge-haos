@@ -153,6 +153,9 @@ BASE_FUNCTIONS = (
 )
 # Only 1.0.10 has these (the access-control / credential-hardening release).
 NEW_ONLY_FUNCTIONS = (
+    "_validate_listening_scope",
+    "_poll_auth_cookies",
+    "_looks_like_schedule",
     "_read_saved_credential",
     "_token_snapshot",
     "_restore_token",
@@ -165,16 +168,53 @@ NEW_ONLY_FUNCTIONS = (
     "_saved_credential_pair_conflicted",
     "_write_last_timestamp_atomic",
     "_load_or_create_access_token",
+    # 1.0.17: token accounts carry no password (kills the 87001 fallback).
+    "_build_token_account",
+    # 1.0.17: proactive session renewal, per-device polling, durable log tail.
+    "_relogin_failure_from",
+    "_relogin_retry_plan",
+    "_credential_fingerprint",
+    "_wait_for_relogin",
+    "_refresh_interval_seconds",
+    "_token_age_seconds",
+    "_poll_targets",
+    "_warn_poll_scope_empty",
+    "_log_file_handler",
+    "_log_lines_from_file",
+    "_plausible_credential",
+    "_adopt_login_identity",
+    "_login_device_id",
+    "_refresh_lock_obj",
+    "_refresh_outcome",
+    "_recent_refresh",
+    "_remember_refresh",
+    "_unsaved_refresh",
+    "_save_refreshed_credentials",
 )
+# Classes that must be real objects, not the object() placeholder: `raise` and
+# `except` require a BaseException subclass.
+WANTED_CLASSES = ("MicoapiLoginRejected", "CredentialIdentityMismatch")
 # Module-level assignments needed by the functions above.  ACCESS_TOKEN is the
 # import-time side effect that creates /data/config/.access_token in 1.0.10.
 NEEDED_ASSIGNMENTS = (
+    "_SCHEDULE_HINTS",
     "AUTH_TOKEN_PATH",
     "MASKED_VALUE",
     "RELOGIN_BACKOFF_START",
     "RELOGIN_BACKOFF_MAX",
     "ACCESS_TOKEN",
     "SESSION_VALUE",
+    "RELOGIN_FATAL_CODES",
+    "RELOGIN_FATAL_BACKOFF",
+    "RELOGIN_FATAL_WAIT_SLICE",
+    "TOKEN_REFRESH_RETRY",
+    "_last_refresh_failure",
+    "_LOG_LINE_RE",
+    "POLL_COOKIE_KEYS",
+    "REFRESH_COALESCE_SECONDS",
+    "_refresh_lock",
+    "_process_login_device_id",
+    "_refresh_cache",
 )
 
 
@@ -448,6 +488,8 @@ class PatchedApp:
             identity = {key: creds.get(key, "") for key in ("userId", "passToken", "deviceId")}
             token = dict(identity)
             token["micoapi"] = [creds.get("ssecurity", ""), creds.get("serviceToken", "")]
+            # Mirrors the real _persist_sms_credentials in 1.0.17.
+            token["issued_at"] = time.time()
             self.auth_path.write_text(json.dumps(identity), encoding="utf-8")
             self.token_path.write_text(json.dumps(token), encoding="utf-8")
             cfg = self.load_config()
@@ -511,6 +553,7 @@ class PatchedApp:
                 to_thread=immediate_thread,
                 CancelledError=real_asyncio.CancelledError,
                 TimeoutError=real_asyncio.TimeoutError,
+                Lock=real_asyncio.Lock,
             ),
             "HAClient": FakeHAClient,
             "_get_latest_ask_from_xiaoai": stack.poll,
@@ -522,6 +565,19 @@ class PatchedApp:
             "ai_parse_command": stack.ai,
             "yarl": SimpleNamespace(URL=lambda text: text),
         }
+        # Exception classes must be real BaseException subclasses: `raise` and
+        # `except` cannot work with the object() placeholder used below for the
+        # pydantic/fastapi models.
+        for node in self.tree.body:
+            if isinstance(node, ast.ClassDef) and node.name in WANTED_CLASSES:
+                exec(
+                    compile(
+                        ast.Module(body=[node], type_ignores=[]),
+                        f"<{self.label} bridge.py>",
+                        "exec",
+                    ),
+                    namespace,
+                )
         # Function annotations are evaluated when the AST node is executed, so
         # pydantic/fastapi model names must resolve to *something*.
         for node in self.tree.body:
@@ -739,6 +795,22 @@ def assert_unchanged(data_dir: Path, snapshot, names, label):
         assert digest == snapshot[name], f"{label}: {name} was modified"
 
 
+def assert_config_only_cookie_cache_changed(config_path: Path, before_bytes: bytes, label):
+    """config.yaml may only lose its byte-identity through the app's own cache.
+
+    1.0.17 renews the session before it expires; every renewal rotates the
+    serviceToken, so `xiaomi.cookie_text` (the app's private fallback copy) is
+    refreshed. Every key the user actually owns must stay byte-for-byte equal.
+    """
+    before = yaml.safe_load(before_bytes.decode("utf-8"))
+    after = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    before.setdefault("xiaomi", {}).pop("cookie_text", None)
+    after.setdefault("xiaomi", {}).pop("cookie_text", None)
+    assert before == after, (
+        f"{label}: config.yaml changed beyond the app-owned xiaomi.cookie_text cache"
+    )
+
+
 # ───────────────────────── scenarios ─────────────────────────
 def scenario_1_legacy_install(legacy: PatchedApp, reporter: Reporter):
     """S1: a fresh 1.0.9 install produces a realistic /data tree."""
@@ -871,16 +943,17 @@ def scenario_2_upgrade(new: PatchedApp, legacy_snapshot, reporter: Reporter):
     reporter.ok("S2d GET /api/config masks secrets and leaves config.yaml byte-identical")
 
     # 1.0.10 start-up against the 1.0.9 data: no reconfiguration required.
+    config_before_loop = new.config_path.read_bytes()
     new.run_loop()
     assert new.bridge_state["error"] is None, f"S2e: {new.bridge_state['error']}"
     assert new.bridge_state["devices"], "S2e: no device discovered"
     assert new.log.has("已使用保存的 micoapi Token 登录"), new.log.messages
     assert not FakeHAClient.calls, "S2e: no new voice record => no HA call"
-    assert_unchanged(
-        data,
-        legacy_snapshot,
-        ("config.yaml", "last_timestamp.json"),
-        "S2e",
+    assert_unchanged(data, legacy_snapshot, ("last_timestamp.json",), "S2e")
+    # 1.0.17 renews the session before it expires, which refreshes the app-owned
+    # xiaomi.cookie_text cache; every user-owned key must stay byte-identical.
+    assert_config_only_cookie_cache_changed(
+        new.config_path, config_before_loop, "S2e"
     )
     assert new.read_json(new.auth_path) == {
         "passToken": "qr-pass",
@@ -922,7 +995,16 @@ def scenario_4_shapes(new: PatchedApp, reporter: Reporter):
     reporter.ok("S4a auth.json still has exactly {passToken, userId, deviceId}")
 
     token = new.read_json(new.token_path)
-    assert set(token) == {"passToken", "userId", "deviceId", "micoapi"}, token
+    # `issued_at` is additive in 1.0.17 (it drives the proactive renewal); 1.0.9
+    # reads the four keys it knows and ignores unknown ones, so the shape stays
+    # forward compatible in both directions.
+    assert set(token) == {
+        "passToken",
+        "userId",
+        "deviceId",
+        "micoapi",
+        "issued_at",
+    }, token
     assert isinstance(token["micoapi"], list) and len(token["micoapi"]) == 2, token
     assert token["micoapi"][1], f"S4b: empty micoapi serviceToken: {token!r}"
     reporter.ok("S4b .mi.token has userId/passToken/deviceId and a 2-element micoapi list")

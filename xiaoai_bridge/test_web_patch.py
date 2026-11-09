@@ -51,6 +51,22 @@ DEFAULT_BRIDGE = Path(__file__).resolve().parents[2] / "build-main" / "bridge.py
 # Names of the JS functions that must be present in the built HTML and that the
 # Node harness exercises.  Missing names are a hard failure (the patch drifted).
 EXTRACT_FUNCTIONS = [
+    "gv",
+    "miScopeNormIds",
+    "miScopeSaved",
+    "miScopeInit",
+    "miScopeReset",
+    "miScopeRows",
+    "setMiScopeMode",
+    "toggleMiScopeIndex",
+    "miScopeSelectAll",
+    "miScopeClearAll",
+    "miScopeCollect",
+    "miScopeDirty",
+    "miScopeStatus",
+    "renderMiScope",
+    "renderDeviceList",
+    "saveXiaomi",
     # 通用
     "escHtml",
     "extraJ",
@@ -1640,6 +1656,158 @@ test('bindRulesDirty shows the marker on input/change and binds once', () => {
   checkEq('changing a select shows the unsaved marker again', indicator.style.display, '');
   bindRulesDirty();
   checkEq('bindRulesDirty is idempotent', (ruleList.listeners.input || []).length, 1);
+});
+
+
+// --- listening scope (小米账号页) -------------------------------------------
+function scopeFixture(mi){
+  cfg = { xiaomi: mi || {} };
+  globalThis.miScopeDevices = [];
+  globalThis.miScopeDraft = null;
+  return cfg;
+}
+function scopeDevices(){
+  return [
+    { deviceID: 'A', name: '客厅', hardware: 'L05C' },
+    { deviceID: 'B', name: '客厅', hardware: 'L06A' },
+    { deviceID: 'C', name: '卧室"<b>', hardware: 'X10A' },
+  ];
+}
+test('scope: a fresh install listens to everything and pins no device', () => {
+  scopeFixture({});
+  const state = miScopeInit();
+  checkEq('default mode is all', state.mode, 'all');
+  checkEq('no device is pinned', state.ids.length, 0);
+  const picked = miScopeCollect();
+  checkEq('collect is ok', picked.ok, true);
+  checkEq('collect keeps the mode', picked.mode, 'all');
+  checkEq('collect sends no ids', picked.ids.length, 0);
+});
+test('scope: an explicit empty selection stays selected and cannot become all', () => {
+  scopeFixture({device_scope:'selected',device_ids:[]});
+  checkEq('empty selected mode is preserved',miScopeSaved().mode,'selected');
+  checkEq('empty selected mode refuses saving',miScopeCollect().ok,false);
+});
+test('scope: a legacy device_did reads back as a one-device selection', () => {
+  scopeFixture({ device_did: 'did-A' });
+  const saved = miScopeSaved();
+  checkEq('legacy mode', saved.mode, 'selected');
+  checkEq('legacy id', saved.ids[0], 'did-A');
+  checkEq('legacy is flagged for the operator', saved.legacy, true);
+  scopeFixture({ device_id: 'dev-B' });
+  checkEq('device_id also reads back', miScopeSaved().ids[0], 'dev-B');
+});
+test('scope: an existing device_ids list reads back verbatim', () => {
+  scopeFixture({ device_ids: ['A', 'C'] });
+  const saved = miScopeSaved();
+  checkEq('mode', saved.mode, 'selected');
+  checkEq('first id', saved.ids[0], 'A');
+  checkEq('second id', saved.ids[1], 'C');
+  checkEq('legacy flag off', !!saved.legacy, false);
+});
+test('scope: a comma separated string is still understood', () => {
+  scopeFixture({ device_ids: 'A, C ,,A' });
+  const saved = miScopeSaved();
+  checkEq('two ids survive', saved.ids.length, 2);
+  checkEq('order kept', saved.ids[0] + saved.ids[1], 'AC');
+});
+test('scope: non string and blank entries are ignored', () => {
+  scopeFixture({ device_ids: ['A', 42, null, '  ', { x: 1 }] });
+  const saved = miScopeSaved();
+  checkEq('only the valid id survives', saved.ids.length, 1);
+  checkEq('the valid id is kept', saved.ids[0], 'A');
+});
+test('scope: selecting two speakers collects exactly those two', () => {
+  scopeFixture({});
+  globalThis.miScopeDevices = scopeDevices();
+  setMiScopeMode('selected');
+  toggleMiScopeIndex(0, true);
+  toggleMiScopeIndex(2, true);
+  const picked = miScopeCollect();
+  checkEq('collect is ok', picked.ok, true);
+  checkEq('mode selected', picked.mode, 'selected');
+  checkEq('two ids', picked.ids.length, 2);
+  checkEq('A picked', picked.ids[0], 'A');
+  checkEq('C picked', picked.ids[1], 'C');
+  checkEq('B was never picked', picked.ids.indexOf('B'), -1);
+});
+test('scope: selected mode with nothing picked must not be savable', () => {
+  scopeFixture({});
+  globalThis.miScopeDevices = scopeDevices();
+  setMiScopeMode('selected');
+  const picked = miScopeCollect();
+  checkEq('collect refuses', picked.ok, false);
+  checkEq('it explains why', picked.msg.indexOf('至少要选一台') >= 0, true);
+  miScopeSelectAll();
+  checkEq('select-all fills every discovered device', miScopeCollect().ids.length, 3);
+  miScopeClearAll();
+  checkEq('clear-all blocks saving again', miScopeCollect().ok, false);
+});
+test('scope: a configured but missing speaker keeps its slot', () => {
+  scopeFixture({ device_ids: ['A', 'gone-1'] });
+  globalThis.miScopeDevices = scopeDevices();
+  const rows = miScopeRows();
+  checkEq('three discovered plus one missing', rows.length, 4);
+  const missing = rows.filter(r => r.missing);
+  checkEq('exactly one is missing', missing.length, 1);
+  checkEq('the missing id is kept', missing[0].id, 'gone-1');
+  checkEq('re-rendering keeps the draft', (function () {
+    renderMiScope();
+    renderMiScope();
+    return miScopeCollect().ids.length;
+  })(), 2);
+});
+test('scope: switching to all drops the allow list but keeps the draft mode', () => {
+  scopeFixture({ device_ids: ['A', 'C'] });
+  globalThis.miScopeDevices = scopeDevices();
+  setMiScopeMode('all');
+  const picked = miScopeCollect();
+  checkEq('mode all', picked.mode, 'all');
+  checkEq('no ids are sent', picked.ids.length, 0);
+  checkEq('dirty because the saved config still pins two', miScopeDirty(), true);
+});
+test('scope: re-rendering after a login does not change the selection', () => {
+  scopeFixture({ device_ids: ['C'] });
+  globalThis.miScopeDevices = scopeDevices();
+  const before = miScopeCollect().ids.join(',');
+  renderMiScope(scopeDevices());
+  renderMiScope([]);
+  renderMiScope(scopeDevices());
+  checkEq('the selection survived every re-render', miScopeCollect().ids.join(','), before);
+});
+
+
+test('scope: a failed save keeps the draft and never claims success', async () => {
+  scopeFixture({ device_ids: ['A'] });
+  globalThis.miScopeDevices = scopeDevices();
+  for (const id of ['mi-username', 'mi-password', 'mi-hardware', 'mi-did',
+                    'xiaomi-alert', 'mi-scope-status']){
+    const el = document.createElement('div');
+    el.id = id;
+    document.body.appendChild(el);
+  }
+  const tts = document.createElement('input');
+  tts.id = 'mi-tts';
+  tts.type = 'checkbox';
+  tts.checked = true;
+  document.body.appendChild(tts);
+  setMiScopeMode('selected');
+  toggleMiScopeIndex(2, true);
+  const draftBefore = miScopeCollect().ids.join(',');
+
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return { json: async () => ({ ok: false, msg: '保存失败' }) };
+  };
+  const okd = await saveXiaomi();
+  checkEq('the save reports failure', okd, false);
+  checkEq('exactly one request was made', calls, 1);
+  checkEq('the draft survived the failure', miScopeCollect().ids.join(','), draftBefore);
+  checkEq('the form still shows unsaved changes', miScopeDirty(), true);
+
+  checkEq('the section is still dirty after the failure', miScopeDirty(), true);
+
 });
 
 // --- runner -----------------------------------------------------------------

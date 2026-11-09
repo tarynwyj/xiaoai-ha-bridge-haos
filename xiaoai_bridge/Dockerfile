@@ -4,7 +4,7 @@ ARG UPSTREAM_REF=e4c82d4b4e872ff5d02d1baec089a6b4ad36734a
 ARG APP_VERSION=dev
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git init /app \
@@ -26,6 +26,8 @@ RUN python -m py_compile /tmp/patch_web.py \
     && python /tmp/patch_web.py \
     && grep -Fq 'type="checkbox" class="r-e"' /app/web/index.html \
     && grep -Fq 'function saveOneRule(' /app/web/index.html \
+    && grep -Fq 'id="mi-scope-card"' /app/web/index.html \
+    && grep -Fq 'miScopeCollect' /app/web/index.html \
     && grep -Fq '保存全部' /app/web/index.html \
     && ! grep -Fq 'multiple size="6"' /app/web/index.html \
     && grep -Fq 'function ruleSummaryHtml(rule)' /app/web/index.html \
@@ -38,6 +40,7 @@ RUN python -m py_compile /tmp/patch_web.py \
     && grep -Fq 'async function startPasswordLogin()' /app/web/index.html \
     && grep -Fq 'async function verifyCookieLogin()' /app/web/index.html \
     && ! grep -Fq '免短信' /app/web/index.html \
+    && grep -Fq 'api/logs?n=500' /app/web/index.html \
     && rm /tmp/patch_web.py
 
 COPY patch_auth.py /tmp/patch_auth.py
@@ -47,6 +50,27 @@ RUN python -m py_compile /tmp/patch_auth.py \
     && grep -Fq 'async def _refresh_micoapi_token' /app/bridge.py \
     && grep -Fq 'micoapi serviceToken 已保存' /app/bridge.py \
     && grep -Fq 'async def _relogin_and_refresh' /app/bridge.py \
+    && grep -Fq 'class MicoapiLoginRejected' /app/bridge.py \
+    && grep -Fq 'class CredentialIdentityMismatch' /app/bridge.py \
+    && grep -Fq 'def _warn_poll_scope_empty' /app/bridge.py \
+    && grep -Fq 'def _adopt_login_identity' /app/bridge.py \
+    && grep -Fq 'def _login_device_id' /app/bridge.py \
+    && grep -Fq 'def _refresh_outcome' /app/bridge.py \
+    && grep -Fq 'def _save_refreshed_credentials' /app/bridge.py \
+    && grep -Fq 'def _unsaved_refresh' /app/bridge.py \
+    && grep -Fq 'bridge_state["renewal"]' /app/bridge.py \
+    && grep -Fq 'def _relogin_retry_plan' /app/bridge.py \
+    && grep -Fq 'def _refresh_interval_seconds' /app/bridge.py \
+    && grep -Fq 'def _token_age_seconds' /app/bridge.py \
+    && grep -Fq 'def _log_file_handler' /app/bridge.py \
+    && grep -Fq 'def _poll_targets' /app/bridge.py \
+    && grep -Fq 'bridge_state["poll_cursor"]' /app/bridge.py \
+    && ! grep -Fq 'device_id = devices[0].get("deviceID", "")' /app/bridge.py \
+    && grep -Fq 'def _log_lines_from_file' /app/bridge.py \
+    && grep -Fq 'next_refresh_at = time.time()' /app/bridge.py \
+    && grep -Fq 'token_data["issued_at"]' /app/bridge.py \
+    && grep -Fq '_wait_for_relogin(wait_seconds, fatal)' /app/bridge.py \
+    && ! grep -Fq 'await asyncio.sleep(relogin_backoff)' /app/bridge.py \
     && grep -Fq 'async def _enforce_access_control' /app/bridge.py \
     && grep -Fq 'async def reveal_direct_token' /app/bridge.py \
     && grep -Fq 'async def xiaomi_otp_start' /app/bridge.py \

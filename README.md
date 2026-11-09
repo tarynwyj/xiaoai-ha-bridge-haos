@@ -1,210 +1,192 @@
 # XiaoAI HA Bridge
 
-**让小爱同学控制 Home Assistant 里的智能家居设备。**
+**让小爱音箱成为 Home Assistant 的语音入口。**
 
-对着小爱音箱说「打开客厅灯」，家里的灯就亮了。支持自定义语音指令、多设备联动、
-设备别名和定时任务，全部在 Home Assistant 侧边栏里配置，不用写 YAML。
+对音箱说「打开客厅灯」，灯就亮；说「把空调调到 26 度」，温度就跟着变。规则、定时任务、
+音箱设置都在 Home Assistant 侧边栏的面板里点，不用写 YAML。
 
 [![CI](https://github.com/tarynwyj/xiaoai-ha-bridge-haos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tarynwyj/xiaoai-ha-bridge-haos/actions/workflows/ci.yml)
 
-> 当前版本 **1.0.19**，变更记录见 [CHANGELOG](xiaoai_bridge/CHANGELOG.md)。
+> 版本与更新记录见 [CHANGELOG](xiaoai_bridge/CHANGELOG.md) · 完整文档在 [docs/](docs/README.md) ·
+> 这个加载项是 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge) 的
+> Home Assistant OS 适配版。
 
 ---
 
-## 功能亮点
+## 能做什么
 
-- 🎤 **语音控制**：小爱同学的语音指令直接触发 Home Assistant 服务，支持灯、开关、空调、
-  场景、脚本、媒体播放器、自动化等设备类型。
-- 🔗 **意图规则自由配置**：一条规则 = 一句话 + 一个动作 + 若干目标实体；支持正则匹配、
-  数字提取（「把空调调到 26 度」）和自定义语音回复。
-- 🧩 **多设备联动**：一条规则可以同时控制多个实体（例如「关灯」一次关掉客厅、餐厅、走廊）。
-- 🕐 **定时任务**：说「晚上 11 点关灯」，会在 Home Assistant 中创建对应的定时自动化。
-- 📱 **Home Assistant 侧边栏管理**：面板通过 HAOS Ingress 打开，沿用 Home Assistant 登录，
-  不需要记额外密码。
-- 🔐 **本地保存、按需外发**：配置与登录态保存在 `/data`，界面与配置接口会脱敏；运行时会
-  按需向小米服务端、你的 Home Assistant、以及你主动启用的 AI 服务发起必要请求
-  （详见[安全与数据流向](#安全与数据流向)）。
-- ♻️ **登录态自动恢复**：Token 过期后自动用保存的凭据换取新 Token，失败按指数退避重试，
-  不会擦除仍然有效的凭据。
+| 场景 | 说明 |
+|---|---|
+| 一句话控制设备 | 说「打开客厅灯」，桥接器把这句话换成 Home Assistant 的服务调用 |
+| 一条规则控制多台 | 「全部关灯」一次关掉客厅、餐厅、走廊，规则里勾几个实体都行 |
+| 带数字的指令 | 语句写 `把空调调到{num}度`，说多少度就设多少度 |
+| 小爱回一句话 | 规则里填「回复」，执行完小爱念出来，也可以关掉 |
+| 定时执行 | 说「明天八点打开热水器」「每周一三五晚上九点关灯」，或在面板里建任务 |
+| 多台音箱都能用 | 默认监听账号下所有小爱设备，对哪台说话都算数 |
+| 给设备起中文名 | 在设备管理里给实体起别名，规则里一眼能认出来 |
 
-## 界面预览
+支持的设备类型：灯光、开关、空调、场景、媒体播放器、脚本、自动化、虚拟开关。
+不同设备类型能用的操作不一样，面板会按类型给出对应选项。
+
+## 需要什么
+
+| 条件 | 说明 |
+|---|---|
+| Home Assistant OS | 本项是**加载项**，需要 Supervisor（HAOS，或带 Supervisor 的 Supervised 安装） |
+| amd64 架构 | 目前只提供 amd64 镜像 |
+| 小米账号和至少一台小爱音箱 | 音箱 / 触屏音箱 / 智能屏都是语音入口 |
+| Home Assistant 长期访问令牌 | 面板里填一次，用来调用 HA 服务 |
+
+不需要改 `configuration.yaml`，不需要装 HACS，也不需要把面板开放到公网。
+米家的灯、插座、空调不在这里管理——它们由 Home Assistant 里对应的集成负责，
+桥接器只负责「听音箱说的话」。
+
+## 安装
+
+1. Home Assistant → 设置 → 加载项 → 右上角 ⋮ → **仓库** → 粘贴
+   `https://github.com/tarynwyj/xiaoai-ha-bridge-haos` → 添加。
+2. 在加载项商店里找到 **XiaoAI HA Bridge** → 安装 → 启动。
+3. 打开左侧边栏的 **小爱语音桥接**，用米家 App 扫码登录小米账号。
+4. 在 Home Assistant 页填地址（例如 `http://homeassistant.local:8123`）和长期访问令牌，
+   点「测试」。
+5. 到意图规则页新增一条规则，保存后回仪表盘点「启动」。
+
+然后对小爱说规则里的那句话，仪表盘的「指令执行」会加一。
+详细步骤、直连端口备用法见 [安装与首次配置](docs/install.md)。
+
+## 三条最常用的操作
+
+**加一条语音规则**：意图规则页 → 新增 → 填触发语句、选设备类型和操作、勾选目标设备 →
+点这一条的「保存」。规则页顶部可以先输入一句话试试会命中哪条、执行什么。
+
+**建一个定时任务**：定时任务页 → 新建 → 选设备和操作、选时间与重复方式（每天 / 工作日 /
+周末 / 自定义星期 / 仅一次指定日期）。也可以直接说「明天八点打开热水器」「十分钟后关灯」。
+任务会写进 Home Assistant 的自动化，桥接器没在跑也会按时执行。
+
+**限定听哪几台音箱**：小米账号页 →「接收语音的小爱音箱」→ 选「仅监听所选音箱」→ 勾选。
+默认是全部。改完要重启桥接器生效。
+
+更多写法见 [使用指南](docs/usage.md)。
+
+## 界面
 
 | 页面 | 用途 |
 |---|---|
-| 仪表盘 | 启动/停止桥接器、运行状态、指令执行数、最近一条语音 |
-| 实时日志 | 运行日志（最近 80 条，可自动滚动） |
-| 小米账号 | 三个入口：扫码登录（推荐）/ 账号密码 + 验证码（1.0.12 重写，待实机验证）/ 高级：手动 Cookie 登录；含清除登录凭据 |
+| 仪表盘 | 启动 / 停止桥接器、运行状态、指令执行数、最近一条语音 |
+| 实时日志 | 最近的运行日志，排障先看这里 |
+| 小米账号 | 登录小米、监听范围、设备参数、清除登录凭据 |
 | Home Assistant | HA 地址与长期访问令牌 |
-| 意图规则 | 语音 → 动作 → 设备映射，支持搜索、导入导出、在线测试 |
-| 设备管理 | 设备别名与设备列表 |
-| 定时任务 | 由语音创建的自动化列表 |
-| 高级设置 | 轮询间隔、AI 托管、显示直连令牌 |
+| 意图规则 | 语音 → 动作 → 设备，支持测试和导入导出 |
+| 设备管理 | HA 实体列表与中文别名 |
+| 定时任务 | 创建、编辑、暂停、清理定时任务 |
+| 高级设置 | 轮询间隔、AI托管、直连令牌 |
 
-以下为实际界面截图，已裁剪并遮挡账号数字、设备标识及部分私人名称；运行状态和数量仅反映截图时刻。
-
-**仪表盘**：查看桥接器状态、运行时长与 HA 连接。
+截图已裁剪并遮挡账号数字、设备标识和部分私人名称。
 
 ![仪表盘：运行状态、指令计数与 Home Assistant 连接](docs/images/panel-dashboard.png)
 
 <details>
-<summary>意图规则：语音匹配、多设备选择与分条保存</summary>
+<summary>意图规则：测试区、多设备选择与分条保存</summary>
 
-![意图规则编辑器：测试区、多实体选择与保存按钮，设备标识已脱敏](docs/images/panel-rules.png)
-
-</details>
-
-<details>
-<summary>设备管理：设备列表与别名设置</summary>
-
-![设备管理：设备列表和别名输入框，私人名称及实体 ID 已脱敏](docs/images/panel-devices.png)
+![意图规则编辑器](docs/images/panel-rules.png)
 
 </details>
 
 <details>
-<summary>定时任务：新建入口与空列表状态</summary>
+<summary>设备管理：设备列表与别名</summary>
 
-截图时尚未创建定时任务，展示的是空列表及“新建定时任务”入口。
-
-![定时任务：新建按钮与空列表提示](docs/images/panel-schedules.png)
+![设备管理](docs/images/panel-devices.png)
 
 </details>
 
-## 快速安装
+<details>
+<summary>定时任务：新建入口与空列表</summary>
 
-1. **添加仓库**：Home Assistant → 设置 → 加载项 → 右上角 ⋮ → 仓库 →
-   粘贴 `https://github.com/tarynwyj/xiaoai-ha-bridge-haos` → 添加。
-2. **安装**：在加载项商店里找到 **XiaoAI HA Bridge** → 安装 → 启动。
-3. **绑定小米账号**：打开左侧边栏的 **小爱语音桥接** 面板 → 小米账号 → 用米家 App 扫码登录。
-4. **连接 Home Assistant**：Home Assistant 页填地址（如 `http://homeassistant.local:8123`）
-   和长期访问令牌，点「测试」。
-5. **配置规则**：意图规则页 → 新增 → 填「规则名称」（可选）与「触发语句」、勾选设备、
-   点该条规则的「保存」→ 回仪表盘点「启动」。
-6. **试一句**：对小爱说「打开客厅灯」，看仪表盘是否出现执行记录。
+![定时任务](docs/images/panel-schedules.png)
 
-> 需要 Home Assistant OS（Supervisor 加载项）、amd64 架构、米家账号和至少一台小爱音箱。
-> 详细步骤与常见问题见 [配置文档](xiaoai_bridge/DOCS.md)。
-
-## 使用示例
-
-在「意图规则」里加一条：
-
-| 字段 | 填写 |
-|---|---|
-| 规则名称（可选） | `客厅灯组开灯` |
-| 触发语句 | `打开客厅灯` |
-| 设备类型 | 灯光 |
-| 操作 | 开 |
-| 实体 ID | `light.ke_ting_deng`（复选框，可多选） |
-| 回复 | `好的` |
-
-保存后对小爱说「打开客厅灯」，灯会开，小爱回「好的」。
-
-几个进阶写法：
-
-- **带数字的参数**：语句写 `把空调调到{num}度`，动作的「温度」填 `{0}`，
-  说「把空调调到 26 度」就会调用 `climate.set_temperature`，temperature=26。
-- **多实体**：在实体复选框里勾选多台设备即可，一条规则同时控制多个设备；列表支持搜索、
-  全选、清空，收起再展开不会丢失勾选。
-- **分条保存**：每条规则右侧有「保存」，只提交这一条；顶部「保存全部」才统一提交所有修改，
-  未保存的规则标题会显示「未保存」。
-- **定时**：在「其他(JSON)」里填
-  `{"type":"schedule","schedule_time":"23:00:00","schedule_days":[1,2,3,4,5,6,7]}`，
-  说对应语句时会在 Home Assistant 里创建一条 `xiaoai_bridge_*` 自动化。
-- **先试后说**：规则页顶部的测试区可以输入一句话，直接看匹配到哪条规则、会执行什么。
+</details>
 
 ## 常见问题
 
-- **侧边栏看不到面板？** 确认加载项已启动，并在 设置 → 加载项 → XiaoAI HA Bridge 中
-  打开「显示在侧边栏」；需要 Home Assistant 管理员账号。
-- **说话没反应？** 先看仪表盘有没有「最近」语音记录：没有 → 小米登录态失效；
-  有记录但没执行 → 规则未匹配或实体 ID 不对（用规则页测试区验证）；细节看实时日志。
-- **直连端口打不开？** 1.0.10 起 `http://<主机IP>:47521` 需要直连令牌，在面板「高级设置」页查看。
-- **一定要扫码吗？** 不一定。1.0.12 起小米账号页有三个入口：**扫码登录（推荐）**、
-  **账号密码登录**（小米要求二次验证时，验证码直接在该卡片里提交）、**高级选项：手动 Cookie 登录**
-  （默认折叠）。账号密码与 Cookie 流程已通过模拟回归测试，**真实小米账号兼容性仍待验证**，
-  卡住时请优先用扫码登录。
-- **账号密码 / 验证码怎么用？** 填账号密码 → 点「登录」；若小米要求二次验证，卡片里会出现
-  验证码面板 → 点「获取验证码」（60 秒冷却）→ 输入验证码 → 点「提交验证码」。
-  验证码错误会显示剩余次数，连续错误或超时（5 分钟）请点「重新开始」再登录一次。
-  拿不到有效凭据时不会写入任何文件，扫码登录不受影响。
-- **Cookie 登录怎么用？** 展开「高级选项：手动 Cookie 登录」→ 粘贴包含 `userId` 与 `passToken`
-  的浏览器 Cookie → 点「验证 Cookie」。旧版「粘贴浏览器跳转地址」保留在同一张卡片的
-  「兼容」子块里，但它与浏览器会话绑定，**通常无法复用并会返回 401**，不建议作为常规方式。
-- 更多问题见 [完整配置文档与 FAQ](xiaoai_bridge/DOCS.md)。
+**侧边栏看不到面板？** 确认加载项在运行；设置 → 加载项 → XiaoAI HA Bridge → 打开
+「显示在侧边栏」。面板只对 Home Assistant 管理员显示。
+
+**说了话没反应？** 先看仪表盘的「最近」有没有新语音。没有，是小米登录态或桥接器的问题；
+有记录但设备没动，多半是规则没匹配上或实体 ID 不对，用规则页测试区验证。
+
+**一定要扫码吗？** 不是。也可以用账号密码 + 验证码，或手动填 Cookie。扫码最稳，其余方式
+容易卡在小米的验证上，具体见 [登录小米账号](docs/login.md)。
+
+**提示 `code=70016` 怎么办？** 这张 Cookie 票已经失效。在浏览器里退出小米账号、重新登录，
+复制新的 `userId` 和 `passToken` 再试；还不行就用面板里的「浏览器代签」。
+
+**直连端口要令牌？** `http://<主机IP>:47521` 需要直连令牌，在面板「高级设置 → 显示直连令牌」查看。
+日常建议直接用侧边栏。
+
+**升级会不会丢配置？** 不会，配置和登录凭据都在 `/data`。升级前建议做一次 HA 备份，
+回退步骤见 [升级与回退](docs/upgrade.md)。
+
+还有别的症状，看 [故障排查](docs/troubleshooting.md)。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [xiaoai_bridge/DOCS.md](xiaoai_bridge/DOCS.md) | 完整配置、FAQ、升级与备份恢复 |
-| [xiaoai_bridge/CHANGELOG.md](xiaoai_bridge/CHANGELOG.md) | 各版本新增功能与修复 |
-| [DEVELOPMENT.md](DEVELOPMENT.md) | 补丁机制、构建、测试、CI 与发布流程 |
+| [docs/README.md](docs/README.md) | 文档目录，按你的目标选一篇 |
+| [安装与首次配置](docs/install.md) | 装加载项、登录小米、连接 HA、第一条规则 |
+| [使用指南](docs/usage.md) | 规则写法、定时任务、多台音箱、AI 托管 |
+| [登录小米账号](docs/login.md) | 四种登录方式、70016、自动续期、清除凭据 |
+| [故障排查](docs/troubleshooting.md) | 按症状查：面板、语音、定时任务、登录 |
+| [数据与隐私](docs/data-and-privacy.md) | 数据存在哪、发往哪里、备份注意 |
+| [升级与回退](docs/upgrade.md) | 升级、回退、版本对应关系 |
+| [xiaoai_bridge/DOCS.md](xiaoai_bridge/DOCS.md) | 加载项页面里的「文档」页（HA 内查看） |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | 补丁构建、测试、CI、发布（开发者） |
 
-## 安全与数据流向
+## 数据与隐私
 
-本加载项**不把数据上传到作者或第三方服务器**，但运行中必然会与以下服务通信：
+配置、登录凭据、日志都在 `/data` 下，不会上传给作者或第三方。运行时必须与小米服务端
+通信（登录、拉取对话记录），也会和你填写的 Home Assistant 通信。开启「AI托管」时，
+语音文本会额外发给你配置的 AI 接口，默认关闭。
 
-| 数据 | 存在哪里 / 发往哪里 | 说明 |
-|---|---|---|
-| 配置（规则、别名、HA 地址、轮询间隔） | 留在 `/data/config/config.yaml` | 不对外发送 |
-| 小米登录态（`passToken`、`serviceToken` 等） | 留在 `/data/config/`；**会**发往小米服务端 | 用于登录、刷新 Token、拉取设备与对话记录；这是使用小爱音箱的必要条件 |
-| Home Assistant 长期访问令牌 | 留在 `/data/config/`；**会**发往你填写的 HA 地址 | 用于调用 HA 服务与读取实体 |
-| 语音文本 | 发往小米（对话记录由小米提供）与本机；若你**主动启用**「AI 托管」，还会发给你配置的第三方 AI 接口 | 默认关闭，仅在开启后生效 |
-| 直连令牌 | 留在 `/data/config/.access_token` | 只用于直连端口鉴权 |
+`/data` 会随 Home Assistant 备份一起备份，**备份文件里含凭据**，请自己保管。
+面板走 HAOS Ingress，只对管理员可见；直连端口是明文 HTTP，只在可信局域网用。
+细节和完整数据流向见 [数据与隐私](docs/data-and-privacy.md)。
 
-使用本加载项时，请遵守小米账号及相关服务条款。
+## 支持范围与已知限制
 
-安全要求：
+- 只发布 **amd64** 镜像，需要 Home Assistant OS（或带 Supervisor 的安装）；
+- 语音识别和对话记录由小米提供，小米服务不可用时桥接器无法工作；
+- 扫码登录是主要方式。账号密码 + 验证码流程只通过模拟回归测试，真实账号尚未验证；
+  邮箱验证码（小米返回 `flag=8`）只识别、不发送，会提示改用扫码；
+- 手动 Cookie 登录已实测可用（浏览器重新登录后取新票），被拒时先换票再考虑「浏览器代签」；
+  「浏览器代签」目前只通过模拟回归测试，真实账号行为需要自测；
+- 直连端口为明文 HTTP，跨网段或公网请用侧边栏面板。
 
-- 面板走 HAOS Ingress，只有 Home Assistant 管理员能打开；直连端口 47521 需要访问令牌，
-  且是明文 HTTP，**只建议在可信局域网内使用**，跨网段或公网请走侧边栏面板；
-- 界面对 `cookie_text`、密码、HA Token、AI Key 一律脱敏，`/api/config` 也不会返回它们；
-- 日志不打印直连令牌与小米令牌，只提示令牌文件位置；
-- 凭据保存在 `/data`，会随 Home Assistant 备份一起备份 —— **备份文件里包含这些凭据，
-  请自行妥善保管，不要公开分享**；怀疑泄露时清除登录凭据并重建直连令牌。
-- 请勿把本加载项暴露到公网，也不要公开贴出包含 Cookie / 令牌的日志。
+## 许可与鸣谢
 
-## 与上游项目的关系
+本仓库原创代码与文档采用[自定义非商业许可](LICENSE)：非商业使用免费，商业使用需事先
+取得书面授权。上游核心桥接逻辑来自
+[chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge)，
+构建所用固定提交的 README 声明为 MIT；授权范围与第三方说明见
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-本项目是 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge) 的
-Home Assistant OS 适配与增强版：构建时拉取固定 commit 的上游代码，再由本仓库的补丁脚本
-加上鉴权、界面与稳定性修复。核心桥接逻辑的功劳属于上游作者。
-
-## 鸣谢
-
-- [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge) —— 上游桥接器；
-- [MiService](https://github.com/Yonsm/MiService) —— 小米账号与设备接口；
-- **[@caideone](https://github.com/caideone)** —— 定位并修复了小爱对话轮询丢失认证 Cookie 的
-  问题（PR #4），这正是「显示已连接但语音指令数为 0」的根因；
-- 以及所有提 issue、帮忙在真机上验证的用户。
-
-## License
-
-本仓库中由维护者拥有版权并有权许可的原创代码与文档采用
-[自定义非商业使用许可协议](LICENSE)：**非商业使用免费；商业使用、销售、付费打包或
-收费部署服务须事先取得书面授权，授权费或销售分成另行签约。**
-这是一份含商业限制的源码可见许可，不属于 OSI 定义的开源许可证。
-
-本项目基于 [chenshuhe/xiaoai-ha-bridge](https://github.com/chenshuhe/xiaoai-ha-bridge)，
-其构建所用固定提交的 README 声明采用 MIT License；上游代码仍遵循原许可。
-授权范围、上游来源与固定提交见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；
-第三方代码遵循各自许可证，先前有效许可已授予的权利不因本次调整而追溯撤销。
+感谢上游作者与所有反馈问题的用户，其中 **[@caideone](https://github.com/caideone)**
+定位并修复了小爱对话轮询丢失认证 Cookie 的问题（PR #4）。
 
 ---
 
 <details>
 <summary>English summary</summary>
 
-**XiaoAI HA Bridge** — control Home Assistant devices with natural language through a
-Xiaomi XiaoAI smart speaker. It runs as a Home Assistant OS add-on, opens from the sidebar
-(HAOS Ingress), and maps spoken phrases to Home Assistant service calls with a visual rule
-editor (multi-entity actions, aliases, scheduled automations, TTS replies).
+**XiaoAI HA Bridge** — control Home Assistant from a Xiaomi XiaoAI speaker. It runs as a
+Home Assistant OS add-on, opens from the sidebar (HAOS Ingress), and maps spoken phrases to
+Home Assistant service calls with a visual rule editor: multi-entity actions, aliases,
+scheduled automations and TTS replies.
 
 Install: add `https://github.com/tarynwyj/xiaoai-ha-bridge-haos` as an add-on repository,
-install **XiaoAI HA Bridge**, open the sidebar panel, log in to Xiaomi by QR code, fill in
-your Home Assistant URL + long-lived token, then add intent rules and start the bridge.
+install **XiaoAI HA Bridge**, open the sidebar panel, log in to Xiaomi, fill in your Home
+Assistant URL and long-lived token, add intent rules, then start the bridge.
 
-Developer docs (patching, tests, CI, release): [DEVELOPMENT.md](DEVELOPMENT.md).
-User docs (Chinese): [xiaoai_bridge/DOCS.md](xiaoai_bridge/DOCS.md).
+User docs (Chinese): [docs/](docs/README.md) · Developer docs: [DEVELOPMENT.md](DEVELOPMENT.md).
 
 </details>

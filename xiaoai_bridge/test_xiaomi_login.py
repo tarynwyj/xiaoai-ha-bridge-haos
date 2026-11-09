@@ -31,6 +31,7 @@ Usage: python test_xiaomi_login.py [/app/bridge.py] [--html /app/web/index.html]
 
 import ast
 import asyncio
+import base64
 import hashlib
 import inspect
 import json
@@ -75,9 +76,10 @@ def ok(headline):
 
 # ───────────────────────────── fake aiohttp / miservice ─────────────────────────────
 class FakeResponse:
-    def __init__(self, status=200, body=b"", headers=None):
+    def __init__(self, status=200, body=b"", headers=None, cookies=None):
         self.status = status
         self.headers = dict(headers or {})
+        self.cookies = dict(cookies or {})
         if isinstance(body, (bytes, bytearray)):
             self._body = bytes(body)
         elif isinstance(body, str):
@@ -369,6 +371,19 @@ FUNCTIONS = (
     "xiaomi_otp_verify",
     "xiaomi_otp_restart",
     "xiaomi_cookie_login",
+    "xiaomi_cookie_ticket",
+    "_adopt_login_identity",
+    "_plausible_credential",
+    "_cookie_pass_token_problem",
+    "_cookie_exchange_detail",
+    "_cookie_exchange_message",
+    "_cookie_login_minimal_attempt",
+    "_iter_json_objects",
+    "_parse_cookie_ticket",
+    "_ticket_client_sign",
+    "_ticket_sts_url",
+    "_response_cookie_values",
+    "_exchange_ticket_service_token",
     # 1.0.11 section E helpers reused by F
     "_probe_devices_with_token",
     "_persist_sms_credentials",
@@ -383,7 +398,8 @@ FUNCTIONS = (
     "_normalize_verify_url",
 )
 
-CLASSES = ("OtpFlowError", "SmsVerifyError")
+CLASSES = ("OtpFlowError", "SmsVerifyError", "CookieTicketError",
+           "CredentialIdentityMismatch")
 
 
 class Harness:
@@ -449,6 +465,7 @@ class Harness:
             "OtpStartRequest": object,
             "OtpVerifyRequest": object,
             "CookieLoginRequest": object,
+            "CookieTicketRequest": object,
             "MiAccount": FakeMiAccount,
             "MiNAService": FakeMiNAService,
             "get_random": lambda n=16: "RANDOMDEVICEID",
@@ -531,12 +548,16 @@ def cookie_login(h, text):
     return run(h.ns["xiaomi_cookie_login"](SimpleNamespace(cookie_text=text)))
 
 
-def response(status=200, payload=None, raw=None, headers=None):
+def cookie_ticket(h, text):
+    return run(h.ns["xiaomi_cookie_ticket"](SimpleNamespace(text=text)))
+
+
+def response(status=200, payload=None, raw=None, headers=None, cookies=None):
     if raw is not None:
-        return FakeResponse(status, raw, headers=headers)
+        return FakeResponse(status, raw, headers=headers, cookies=cookies)
     if payload is None:
-        return FakeResponse(status, b"", headers=headers)
-    return FakeResponse(status, payload, headers=headers)
+        return FakeResponse(status, b"", headers=headers, cookies=cookies)
+    return FakeResponse(status, payload, headers=headers, cookies=cookies)
 
 
 def redirect(location, status=302):
@@ -2223,11 +2244,36 @@ def scenario_cookie_login_errors():
         check("请求未完成" in raised.get("msg", "") and "可能已过期" not in raised.get("msg", ""),
               "transport failures must not be diagnosed as expired cookies")
         CURRENT["cookie_login"] = "fail"
+        base_calls = len(CURRENT["verified_login_calls"])
         rejected = cookie_login(h, "userId=u; passToken=p; deviceId=same-browser")
         check(rejected.get("code") == 70016, "cookie rejection exposes Xiaomi's business code")
         check("70016" in rejected.get("msg", "") and "尚未保存" in rejected.get("msg", ""),
               "cookie rejection explains the rejection and preserves saved credentials")
         check("同一登录会话" in rejected.get("msg", ""), "cookie rejection explains matching browser identity")
+        # P0: the rejection carries Xiaomi's own words and a machine-readable detail block
+        check((rejected.get("detail") or {}).get("description") == "scripted exchange rejection",
+              f"the Xiaomi description must reach the UI, got {rejected}")
+        check("小米说明" in rejected.get("msg", ""),
+              f"the rejection message must quote Xiaomi, got {rejected.get('msg')!r}")
+        check("浏览器代签" in rejected.get("msg", ""),
+              "the rejection must point at the browser-signed path")
+        # P2: exactly one extra probe, with the minimal cookie set and the MiHome app UA
+        probe_calls = CURRENT["verified_login_calls"][base_calls:]
+        check(len(probe_calls) == 2,
+              f"70016 gets the standard shape plus exactly one probe, got {len(probe_calls)}")
+        if len(probe_calls) == 2:
+            shape = probe_calls[1]["kwargs"].get("cookies") or {}
+            check(set(shape) == {"userId", "deviceId", "passToken"},
+                  f"the probe must use the minimal cookie set, got {shape}")
+            headers = probe_calls[1]["kwargs"].get("headers") or {}
+            check("APP/com.xiaomi.mihome" in str(headers.get("User-Agent", "")),
+                  f"the probe must use the MiHome app UA, got {headers}")
+        # a pasted serviceToken must not trigger the probe (the fallback is enough)
+        CURRENT["cookie_login"] = "fail"
+        base_calls = len(CURRENT["verified_login_calls"])
+        cookie_login(h, "userId=u; passToken=p; serviceToken=svc-only")
+        check(len(CURRENT["verified_login_calls"]) - base_calls == 1,
+              "a pasted serviceToken must skip the extra probe")
         CURRENT["cookie_login"] = "ok"
         ok("cookie errors: unparsable/empty/missing/expired/exchange-failure are all explicit, no writes")
     finally:
@@ -2373,6 +2419,7 @@ def scenario_compatibility():
                   '@app.post("/api/test/xiaomi/otp/verify")',
                   '@app.post("/api/test/xiaomi/otp/restart")',
                   '@app.post("/api/test/xiaomi/cookie-login")',
+                  '@app.post("/api/test/xiaomi/cookie-ticket")',
                   '@app.get("/api/config")'):
         check(route in source, f"{route} must be registered")
     check("_enforce_access_control" in source, "the HTTP auth middleware must still be installed")
@@ -2418,17 +2465,27 @@ def scenario_frontend_structure():
 
     # every button is wired to the right handler
     for handler in ("qrLogin()", "startPasswordLogin()", "sendOtp()", "verifyOtp()",
-                    "restartOtp()", "verifyCookieLogin()", "clearXiaomiLogin()",
-                    "completeSmsVerify()"):
+                    "restartOtp()", "verifyCookieLogin()", "verifyCookieTicket()",
+                    "clearXiaomiLogin()", "completeSmsVerify()"):
         check(f'onclick="{handler}"' in html, f"no button is wired to {handler}")
     for element_id in ("mi-username", "mi-password", "mi-otp-code", "mi-otp-send",
                        "mi-otp-verify", "mi-otp-restart", "mi-otp-status", "mi-otp-method",
                        "mi-cookie-text", "mi-cookie-userid", "mi-cookie-passtoken",
                        "mi-cookie-submit", "mi-cookie-status",
+                       "mi-ticket-text", "mi-ticket-submit", "mi-ticket-status",
+                       "mi-ticket-detail",
                        "qr-img", "qr-msg", "qr-status", "mi-sts-url", "mi-sts-submit"):
         check(f'id="{element_id}"' in html, f"missing element #{element_id}")
     check('id="qr-area"' in html and 'id="qr-area" style="display:none' in html,
           "the QR image area must exist and stay hidden until a QR is fetched")
+
+    # the browser-signed ticket block lives inside the advanced card, above the
+    # legacy STS compatibility path
+    ticket = html.find('id="mi-ticket-card"')
+    check(ticket > advanced > 0, "the browser-signed ticket block must be inside the advanced card")
+    check(ticket < html.find('id="mi-sts-card"', ticket),
+          "the recommended ticket block must come before the legacy STS path")
+    check("浏览器代签" in html, "the browser-signed block must be labelled")
 
     # the legacy STS block is only inside the advanced card and labelled honestly
     legacy = html.find('id="mi-sts-card"')
@@ -2756,6 +2813,55 @@ def scenario_frontend_behaviour():
               "the inline cookie status preserves the actual server reason and code")
         check("可能已过期" not in payload["cookieStatus"], "the cookie form never invents an expiry diagnosis")
         ok("frontend cookie: browser identity and server rejection details are retained")
+
+    # (f) browser-signed ticket: one POST to the ticket endpoint, text forwarded,
+    #     textarea cleared and devices refreshed; failure shows msg plus detail
+    elements = json.loads(json.dumps(base_elements))
+    elements["mi-ticket-text"] = {"value": "&&&START&&&{\"code\":0}"}
+    elements["mi-ticket-submit"] = {"disabled": False}
+    elements["mi-ticket-status"] = {"textContent": ""}
+    elements["mi-ticket-detail"] = {"style": {"display": "none"}, "textContent": ""}
+    ticket_snapshot = ("ticketStatus:elements['mi-ticket-status'].textContent,"
+                       "ticketText:elements['mi-ticket-text'].value,"
+                       "ticketDetail:elements['mi-ticket-detail'].textContent,"
+                       "ticketDetailStyle:elements['mi-ticket-detail'].style.display,"
+                       "alert:elements['xiaomi-alert'].innerHTML")
+    payload = _run_node(script_source,
+                        {"ok": True, "devices": [{"deviceID": "d1"}],
+                         "msg": "浏览器代签成功，发现 1 台设备"},
+                        elements, "verifyCookieTicket()", ticket_snapshot)
+    if payload:
+        fetches = [call for call in payload["calls"] if call[0] == "fetch"]
+        check(len(fetches) == 1
+              and fetches[0][1] == "/api/test/xiaomi/cookie-ticket"
+              and fetches[0][2] == "POST",
+              f"ticket login must POST the new endpoint once, got {fetches}")
+        body = json.loads((fetches[0][3] if fetches else "{}") or "{}")
+        check(str(body.get("text", "")).startswith("&&&START&&&"),
+              f"ticket login must send the pasted text, got {body}")
+        check(payload["ticketText"] == "", "a successful ticket login clears the textarea")
+        check(any(call[0] == "devices" for call in payload["calls"]),
+              "a successful ticket login refreshes the device list")
+        check(payload["ticketDetailStyle"] == "none",
+              "a successful ticket login hides the detail box")
+        ok("frontend ticket: one POST, pasted text forwarded, textarea cleared, devices refreshed")
+    elements = json.loads(json.dumps(base_elements))
+    elements["mi-ticket-text"] = {"value": "&&&START&&&{\"code\":70016}"}
+    elements["mi-ticket-submit"] = {"disabled": False}
+    elements["mi-ticket-status"] = {"textContent": ""}
+    elements["mi-ticket-detail"] = {"style": {"display": "none"}, "textContent": ""}
+    payload = _run_node(script_source,
+                        {"ok": False, "action": "rejected",
+                         "msg": "浏览器返回的登录响应不是成功状态（code=70016）",
+                         "detail": {"code": 70016, "description": "登录验证失败"}},
+                        elements, "verifyCookieTicket()", ticket_snapshot)
+    if payload:
+        check("70016" in payload["ticketStatus"], "a rejected ticket must name the code inline")
+        check("70016" in payload["ticketDetail"],
+              f"the machine-readable detail must be shown, got {payload['ticketDetail']}")
+        check(payload["ticketDetailStyle"] == "block",
+              "a rejected ticket must reveal the detail box")
+        ok("frontend ticket: a rejected ticket names the code and reveals the detail block")
     return "frontend behaviour verified"
 
 
@@ -3089,6 +3195,124 @@ def scenario_provider_error_is_sanitised():
         h.cleanup()
 
 
+# ─────────────── 20. browser-signed ticket: the add-on never exchanges the passToken ───────────────
+TICKET_JSON = {
+    "code": 0,
+    "userId": "ticket-user",
+    "passToken": "V1:ticket-pass",
+    "ssecurity": "ticket-ssecurity",
+    "nonce": 1234567890123456789,
+    "location": "https://api2.mina.mi.com/sts?sign=ticket&t=1",
+}
+
+
+def ticket_text(payload=None, prefix="&&&START&&&"):
+    return prefix + json.dumps(payload if payload is not None else TICKET_JSON)
+
+
+def scenario_cookie_ticket():
+    from urllib.parse import quote as _quote
+    h = Harness()
+    try:
+        # (a) success: the STS call carries _userIdNeedEncrypt + clientSign, and the
+        #     19-digit nonce is signed exactly (never through a float).
+        CURRENT["response_script"] = [
+            response(200, raw=b"", cookies={"serviceToken": "ticket-svc"})]
+        data = cookie_ticket(h, ticket_text())
+        check(data.get("ok") is True, f"a browser-signed ticket must log in, got {data}")
+        check(CURRENT["verified_login_calls"] == [],
+              "the ticket path must never call serviceLogin from the add-on")
+        requests = [call for session in CURRENT["sessions"] for call in session.calls]
+        sts = [call for call in requests
+               if str(call[1]).startswith("https://api2.mina.mi.com/sts")]
+        check(len(sts) == 1, f"exactly one STS request expected, got {sts}")
+        if sts:
+            url = str(sts[0][1])
+            check("_userIdNeedEncrypt=true" in url,
+                  f"the STS URL must ask for user-id encryption: {url}")
+            expected = base64.b64encode(hashlib.sha1(
+                ("nonce=" + str(TICKET_JSON["nonce"]) + "&ticket-ssecurity").encode()
+            ).digest()).decode()
+            check(("clientSign=" + _quote(expected, safe="")) in url,
+                  f"clientSign must sign the exact 19-digit nonce, got {url}")
+            check(sts[0][2].get("allow_redirects") is False,
+                  "the STS request must not follow redirects")
+            check("ssl" not in sts[0][2] or sts[0][2]["ssl"] is not False,
+                  "the STS request must keep TLS verification on")
+        token = json.loads(h.token_path.read_text(encoding="utf-8"))
+        check(token.get("micoapi") == ["ticket-ssecurity", "ticket-svc"],
+              f"the ticket credentials must be persisted, got {token}")
+        check("serviceToken=ticket-svc" in h.cfg["xiaomi"]["cookie_text"],
+              f"cookie_text must carry the ticket token, got {h.cfg['xiaomi']['cookie_text']!r}")
+
+        # (b) the JSON wrapped in a pasted page is still recognised
+        h2 = Harness()
+        try:
+            CURRENT["response_script"] = [
+                response(200, raw=b"", cookies={"serviceToken": "svc2"})]
+            page = "<html><body><pre>" + json.dumps(TICKET_JSON) + "</pre></body></html>"
+            got = cookie_ticket(h2, page)
+            check(got.get("ok") is True, f"a wrapped JSON body must still parse, got {got}")
+        finally:
+            h2.cleanup()
+
+        # (c) empty / wrong field / unparsable / rejected / incomplete are explicit
+        h3 = Harness()
+        try:
+            before = h3.snapshot_data()
+            cases = [
+                ("", "empty"),
+                ("https://account.xiaomi.com/pass/serviceLogin?sid=micoapi", "wrong_field"),
+                ("not json at all", "bad_json"),
+                (ticket_text({**TICKET_JSON, "code": 70016,
+                              "description": "登录验证失败"}), "rejected"),
+                (ticket_text({k: v for k, v in TICKET_JSON.items() if k != "ssecurity"}),
+                 "incomplete"),
+            ]
+            for text, action in cases:
+                got = cookie_ticket(h3, text)
+                check(got.get("ok") is False and got.get("action") == action,
+                      f"{action}: expected that action, got {got}")
+            rejected = cookie_ticket(h3, ticket_text({**TICKET_JSON, "code": 70016,
+                                                      "description": "登录验证失败"}))
+            check((rejected.get("detail") or {}).get("code") == 70016,
+                  f"a rejected ticket must expose Xiaomi's code, got {rejected}")
+            check("70016" in rejected.get("msg", ""),
+                  f"a rejected ticket must name the code, got {rejected.get('msg')!r}")
+            check(h3.snapshot_data() == before, "a failed ticket must not write any file")
+        finally:
+            h3.cleanup()
+
+        # (d) the STS endpoint answering 401 is an explicit failure, not a traceback
+        h4 = Harness()
+        try:
+            CURRENT["response_script"] = [response(401, raw=b"")]
+            got = cookie_ticket(h4, ticket_text())
+            check(got.get("ok") is False and got.get("action") == "sts_http",
+                  f"an STS 401 must be explicit, got {got}")
+            check("401" in got.get("msg", ""),
+                  f"the HTTP status must be named: {got.get('msg')!r}")
+        finally:
+            h4.cleanup()
+
+        # (e) a ticket for another account is refused instead of silently switching
+        h5 = Harness()
+        try:
+            h5.ns["_load_saved_xiaomi_identity"] = lambda: {
+                "userId": "saved-user", "passToken": "saved-pass", "deviceId": "saved-dev"}
+            before = h5.snapshot_data()
+            got = cookie_ticket(h5, ticket_text())
+            check(got.get("ok") is False and got.get("action") == "identity_mismatch",
+                  f"another account's ticket must be refused, got {got}")
+            check(h5.snapshot_data() == before, "a refused ticket must not write any file")
+        finally:
+            h5.cleanup()
+        ok("ticket: browser-signed login skips the exchange, keeps nonce precision, "
+           "refuses another account and every failure leaves /data untouched")
+    finally:
+        h.cleanup()
+
+
 def main():
     probe = Harness()
     probe.cleanup()
@@ -3130,6 +3354,7 @@ def main():
         scenario_cookie_login,
         scenario_cookie_login_errors,
         scenario_cookie_login_clears_otp,
+        scenario_cookie_ticket,
         scenario_legacy_message,
         scenario_secrets_not_logged,
         scenario_otp_cookie_path_scope,

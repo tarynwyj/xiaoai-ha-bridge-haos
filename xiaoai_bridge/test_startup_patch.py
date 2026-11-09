@@ -38,6 +38,8 @@ assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in sou
 
 MASKED = "\u2022" * 8
 WANTED_FUNCS = [
+    "_schedule_parse_moment",
+    "_schedule_format_moment",
     "_create_ha_automation",
     "_automation_stable_id",
     "_automation_exists",
@@ -508,6 +510,9 @@ class Harness:
             "JSONResponse": object,
             "HTMLResponse": object,
         }
+        registry_error = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                              and node.name == "ScheduleRegistryError")
+        exec(compile(ast.Module(body=[registry_error], type_ignores=[]), str(source_path), "exec"), namespace)
         # Module level constants the extracted functions read at call time
         # (e.g. POLL_COOKIE_KEYS). Explicit values above win.
         for node in tree.body:
@@ -837,6 +842,36 @@ def scenario_unsaved_renewal_retries_persistence(root: Path):
     assert harness.read_token()["passToken"] == "pass-token-rotated", harness.read_token()
     assert harness.bridge_state.get("renewal") is None, harness.bridge_state
     return "a failed renewal write is retried after five minutes while polling uses the new token"
+
+
+def scenario_clock_failure_is_announced(root: Path):
+    for enabled in (True, False):
+        harness = Harness(root / str(enabled))
+        harness.cfg["xiaomi"]["tts_reply"] = enabled
+        harness.cfg["intent_rules"] = [{"pattern": "打开客厅灯", "action": {
+            "domain": "light", "service": "turn_on", "entity_id": "light.ceiling"}}]
+        harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                             "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                             "issued_at": int(time.time())})
+        harness.poll_script = [([{"time": 1_700_000_000_000,
+                                  "query": "明天八点打开客厅灯"}], False)]
+        async def unavailable(*args):
+            return False
+        async def stop(delay):
+            harness.bridge_state["running"] = False
+        harness.namespace["_sync_schedule_clock"] = unavailable
+        harness.namespace["asyncio"].sleep = stop
+        FakeMiNAService.said.clear()
+        FakeHAClient.calls.clear()
+        harness.run()
+        assert not FakeHAClient.calls, FakeHAClient.calls
+        assert "时区" in harness.bridge_state["error"], harness.bridge_state
+        if enabled:
+            assert len(FakeMiNAService.said) == 1 and "时区" in FakeMiNAService.said[0], FakeMiNAService.said
+            assert "稍后" in FakeMiNAService.said[0], FakeMiNAService.said
+        else:
+            assert not FakeMiNAService.said, FakeMiNAService.said
+    return "unknown HA timezone is announced and shown in panel without executing, unless TTS is disabled"
 
 
 def scenario_runtime_refresh_failure(root: Path):
@@ -1387,6 +1422,7 @@ def main():
         scenario_qr_only_start,
         scenario_runtime_refresh_recovers,
         scenario_scheduled_rule_never_executes_now,
+        scenario_clock_failure_is_announced,
         scenario_schedule_ai_fallback_keeps_time,
         scenario_renewal_updates_device_scope,
         scenario_unsaved_renewal_retries_persistence,

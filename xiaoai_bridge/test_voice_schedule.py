@@ -25,6 +25,8 @@ WANTED_FUNCS = (
     "_normalize_schedule_date",
     "_schedule_now",
     "_schedule_once_at",
+    "_schedule_parse_moment",
+    "_schedule_format_moment",
     "_schedule_local_naive",
     "_schedule_once_state",
     "_parse_schedule_days_cn",
@@ -151,6 +153,9 @@ def build_namespace(bridge: Path):
                  "log": Log(), "json": json,
                  "Path": __import__("pathlib").Path,
                  "_SCHEDULE_REGISTRY_OVERRIDE": REGISTRY_PATH}
+    registry_error = next(node for node in tree.body
+                          if isinstance(node, ast.ClassDef) and node.name == "ScheduleRegistryError")
+    exec(compile(ast.Module(body=[registry_error], type_ignores=[]), str(bridge), "exec"), namespace)
     for node in tree.body:
         if isinstance(node, ast.Assign):
             names = [t.id for t in node.targets if isinstance(t, ast.Name)]
@@ -217,8 +222,8 @@ def scenario_parsing(reporter, ns):
                        action.get("once_date") in ((before + _td2(minutes=10)).strftime("%Y-%m-%d"),
                                                    (after + _td2(minutes=10)).strftime("%Y-%m-%d")),
                        action.get("once_date"))
-        expected_low = (before + _td2(minutes=10)).strftime("%H:%M")
-        expected_high = (after + _td2(minutes=10)).strftime("%H:%M")
+        expected_low = (before + _td2(minutes=10)).strftime("%H:%M:%S")
+        expected_high = (after + _td2(minutes=10)).strftime("%H:%M:%S")
         reporter.check("十分钟后 lands ten minutes ahead",
                        action["schedule_time"] in (expected_low, expected_high),
                        (action["schedule_time"], expected_low, expected_high))
@@ -334,11 +339,94 @@ def scenario_atomic_registry(reporter, ns):
     path = ns["_schedule_registry_path"]()
     before = [{"id": "xiaoai_bridge_keep", "once": True, "once_at": "2030-11-10 08:00"}]
     ns["_schedule_registry_write"](before)
-    with patch.object(os, "replace", side_effect=OSError("injected replace failure")):
-        ns["_schedule_registry_write"]([{"id": "xiaoai_bridge_new"}])
+    reported = False
+    try:
+        with patch.object(os, "replace", side_effect=OSError("injected replace failure")):
+            ns["_schedule_registry_write"]([{"id": "xiaoai_bridge_new"}])
+    except ns["ScheduleRegistryError"]:
+        reported = True
+    reporter.check("failed replacement is reported to the caller", reported)
     reporter.eq("failed replacement preserves the complete old registry", ns["_schedule_registry_read"](), before)
     reporter.check("failed replacement leaves no temporary registry file", not list(path.parent.glob(".schedules-*")))
     ns["_schedule_registry_write"]([])
+
+
+def scenario_seconds_precision(reporter, ns):
+    from datetime import datetime, timedelta
+    original = ns["_schedule_now"]
+    cases = ((datetime(2030, 11, 10, 10, 0, 10), 30),
+             (datetime(2030, 11, 10, 10, 0, 40), 30),
+             (datetime(2030, 11, 10, 23, 59, 40), 30),
+             (datetime(2030, 11, 10, 10, 0, 1), 1))
+    async def run(now, delay):
+        ns["_schedule_now"] = lambda: now
+        action = parse(ns, str(delay) + "秒钟后打开热水器")
+        expected = now + timedelta(seconds=delay)
+        ha = FakeHA()
+        aid, ok = await ns["_create_ha_automation"](
+            ha, action["domain"], action["service"],
+            {"entity_id": action["entity_id"], "once": True, "once_date": action["once_date"]},
+            action["schedule_time"], action["schedule_days"])
+        reporter.check("second-based task is accepted at " + str(now), ok)
+        reporter.eq("the FINAL HA trigger retains seconds", ha.created[0]["config"]["trigger"][0]["at"],
+                    expected.strftime("%H:%M:%S"))
+        row = next(x for x in ns["_schedule_registry_read"]() if x["id"] == aid)
+        reporter.eq("registry date/clock retains the exact target", ns["_schedule_parse_moment"](row["once_at"]), expected)
+        next_run = ns["_schedule_next_run"](row["time"], [], True, now, once_at=row["once_at"])
+        reporter.eq("next run retains the exact second", ns["_schedule_parse_moment"](next_run), expected)
+        reporter.eq("a trigger before the target is not counted as execution",
+                    ns["_schedule_once_state"](row, (expected - timedelta(seconds=1)).isoformat(), expected), "expired")
+    try:
+        for now, delay in cases:
+            asyncio.run(run(now, delay))
+        ns["_schedule_now"] = lambda: datetime(2030, 11, 10, 10, 0, 10)
+        for phrase in ("三十秒后", "三十秒钟以后", "半分钟后"):
+            reporter.eq("equivalent seconds expression: " + phrase,
+                        parse(ns, phrase + "打开热水器")["schedule_time"], "10:00:40")
+    finally:
+        ns["_schedule_now"] = original
+
+
+def scenario_unreadable_registry(reporter, ns):
+    from unittest.mock import patch
+    path = ns["_schedule_registry_path"]()
+    original = path.read_bytes()
+    path.write_bytes(b'[{"id":"old-task"},')
+    ha = FakeHA()
+    try:
+        try:
+            asyncio.run(ns["_create_ha_automation"](ha, "light", "turn_on",
+                         {"entity_id": "light.keting"}, "08:00", "daily"))
+            reporter.check("corrupt registry blocks creation", False)
+        except ns["ScheduleRegistryError"]:
+            reporter.eq("corrupt registry is never replaced by a one-row table",
+                        path.read_bytes(), b'[{"id":"old-task"},')
+        reporter.eq("preflight blocks HA mutations too", ha.created, [])
+    finally:
+        path.write_bytes(original)
+    try:
+        with patch.object(Path, "read_text", side_effect=PermissionError("injected read failure")):
+            ns["_schedule_registry_add"]("xiaoai_bridge_new", "08:00", [],
+                                         "light.keting", "light", "turn_on", "voice")
+        reporter.check("a read permission error blocks replacing the registry", False)
+    except ns["ScheduleRegistryError"]:
+        reporter.eq("read permission error preserves original bytes", path.read_bytes(), original)
+
+
+def scenario_unknown_readback(reporter, ns):
+    ha = FakeHA()
+    original = ha.list_automation_states
+    async def unavailable_after_create(session):
+        if ha.created:
+            raise TimeoutError("HA unavailable during readback")
+        return await original(session)
+    ha.list_automation_states = unavailable_after_create
+    aid, ok = asyncio.run(ns["_create_ha_automation"](
+        ha, "switch", "turn_on", {"entity_id": "switch.reshui"}, "11:22", "daily"))
+    reporter.check("unknown readback is not reported as verified success", not ok)
+    reporter.eq("unknown readback keeps its explicit outcome",
+                ns["_automation_outcomes"][aid]["status"], "unverified")
+    reporter.eq("unknown readback retains the accepted HA write", len(ha.created), 1)
 
 
 def scenario_reload_registry(reporter, ns):
@@ -613,6 +701,9 @@ def main():
                            ("final multi-target HA payload", scenario_multi_target_contract),
                            ("HA clock and midnight", scenario_clock_boundaries),
                            ("atomic registry replacement", scenario_atomic_registry),
+                           ("second precision end to end", scenario_seconds_precision),
+                           ("unreadable registry protection", scenario_unreadable_registry),
+                           ("unknown readback outcome", scenario_unknown_readback),
                            ("registry survives reload failure", scenario_reload_registry),
                            ("verified creation", scenario_creation),
                            ("weekday conditions", scenario_weekdays)):

@@ -65,7 +65,7 @@ def main() -> int:
     toggles: list[dict] = []
     updated: list[dict] = []
     cleanups: list[str] = []
-    state = {"fail_create": False, "automations": []}
+    state = {"fail_create": False, "fail_list": False, "automations": []}
 
     def open_page(page):
         def api(route):
@@ -108,6 +108,10 @@ def main() -> int:
                                                    "reloaded": True,
                                                    "automation_id": "xiaoai_bridge_0730_light"}))
                     return
+                if state["fail_list"]:
+                    route.fulfill(status=502, content_type="application/json",
+                                  body=json.dumps({"detail": "无法读取 HA 自动化状态，任务状态未知"}))
+                    return
                 route.fulfill(status=200, content_type="application/json",
                               body=json.dumps({"ok": True,
                                                "count": len(state["automations"]),
@@ -135,6 +139,8 @@ def main() -> int:
                 if msg.type != "error":
                     return
                 if state["fail_create"] and "500 (Internal Server Error)" in msg.text:
+                    return
+                if state["fail_list"] and "502 (Bad Gateway)" in msg.text:
                     return
                 errors.append(f"console: {msg.text}")
 
@@ -365,6 +371,28 @@ def main() -> int:
             page.locator('button[onclick="cleanupSchedules()"]').click()
             page.wait_for_timeout(400)
             result.eq("explicit cleanup sends POST exactly once", cleanups, ['POST'])
+            page.evaluate("""() => {
+                scheduleItems=[{config_id:'xiaoai_bridge_seconds',entity:'light.kitchen',
+                  domain:'light',service:'turn_on',time:'10:01:10',weekdays:[],data:{}}];
+                editSchedule('xiaoai_bridge_seconds');
+            }""")
+            page.wait_for_timeout(400)
+            result.eq("editing retains seconds in the time input", page.input_value('#sch-time'), '10:01:10')
+            updated.clear()
+            page.click('#sch-create')
+            page.wait_for_timeout(400)
+            result.eq("saving retains seconds in the API payload",
+                      (updated[0] if updated else {}).get('time'), '10:01:10')
+            state['fail_list']=True
+            page.evaluate('loadSchedules()')
+            page.wait_for_timeout(400)
+            result.check("HA outage is shown as unknown, not not-loaded",
+                         '状态未知' in page.inner_text('#schedules-alert'))
+            result.eq("HA outage clears misleading cached task rows",
+                      page.inner_text('#schedule-count'), '状态未知')
+            result.check("HA outage leaves an explicit retry message",
+                         '暂时未知' in page.inner_text('#schedule-list'))
+            state['fail_list']=False
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()
     finally:

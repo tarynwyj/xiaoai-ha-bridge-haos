@@ -415,6 +415,11 @@ class FakeHAHandler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self._send_json(200, {"time_zone": getattr(self.store, "time_zone", "UTC")})
         if path == "/api/states":
+            status = getattr(self.store, "states_status", 200)
+            if status != 200:
+                return self._send_json(status, {"message": "temporary HA state query failure"})
+            if getattr(self.store, "malformed_states", False):
+                return self._send_json(200, {"unexpected": "payload"})
             return self._send_json(200, self.store.snapshot_states())
         if path.startswith("/api/states/"):
             entity_id = unquote(path[len("/api/states/"):])
@@ -1163,6 +1168,50 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
     eq("clock: unknown HA timezone refuses one-shots instead of guessing", unknown_clock.status_code, 503)
     store.time_zone = "UTC"
     restarted._schedule_clock.update(zone=None, at=0)
+
+    # HA outages are unknown, never an authoritative empty automation list.
+    before_outage = dict(store.configs)
+    for status in (401, 503):
+        store.states_status = status
+        unavailable_list = client2.get("/api/automations")
+        eq("outage: listing maps HA HTTP %s to unknown/502" % status,
+           unavailable_list.status_code, 502)
+        unavailable_toggle = client2.post("/api/automations/" + periodic_id + "/toggle",
+                                          headers=UI_HEADER, json_body={"enabled": False})
+        eq("outage: toggling maps HA HTTP %s to 502, never 404" % status,
+           unavailable_toggle.status_code, 502)
+        unavailable_cleanup = client2.post("/api/automations/cleanup", headers=UI_HEADER, json_body={})
+        eq("outage: cleanup stops on unknown state", unavailable_cleanup.status_code, 502)
+        eq("outage: no automation configuration is changed", store.configs, before_outage)
+    store.states_status = 200
+    store.malformed_states = True
+    eq("outage: malformed HA states are unknown too", client2.get("/api/automations").status_code, 502)
+    store.malformed_states = False
+    eq("outage: listing recovers when HA answers again", client2.get("/api/automations").status_code, 200)
+
+    # A corrupt registry must block EVERY mutation and preserve the original bytes.
+    path = registry_path(root)
+    original_registry = path.read_bytes()
+    bad_payloads = (b'[{"id":"old-task"},', b'{"not":"a list"}', b'[null]',
+                    b'[{"id":"duplicate"},{"id":"duplicate"}]')
+    for bad in bad_payloads:
+        path.write_bytes(bad)
+        before_mutations = dict(store.configs)
+        eq("registry: corrupt input makes listing unavailable", client2.get("/api/automations").status_code, 503)
+        attempted = client2.post("/api/automations", headers=UI_HEADER, json_body={
+            "time": "12:34", "domain": "light", "service": "turn_on", "entity_id": "light.kitchen"})
+        eq("registry: creation refuses a corrupt registry", attempted.status_code, 503)
+        edit = client2.put("/api/automations/" + periodic_id, headers=UI_HEADER, json_body={
+            "time": "12:35", "domain": "light", "service": "turn_off", "entity_id": "light.kitchen"})
+        eq("registry: editing refuses a corrupt registry", edit.status_code, 503)
+        deletion = client2.delete("/api/automations/" + periodic_id, headers=UI_HEADER)
+        eq("registry: deletion refuses a corrupt registry", deletion.status_code, 503)
+        cleanup = client2.post("/api/automations/cleanup", headers=UI_HEADER, json_body={})
+        eq("registry: cleanup refuses a corrupt registry", cleanup.status_code, 503)
+        eq("registry: no HA write/delete occurred", store.configs, before_mutations)
+        eq("registry: corrupt bytes are preserved exactly", path.read_bytes(), bad)
+    path.write_bytes(original_registry)
+    eq("registry: restoring the original registry recovers listing", client2.get("/api/automations").status_code, 200)
 
     # ── I: nothing reached HA's config store without the configured token ──
     denied_path = "/api/config/automation/config/" + denied_id

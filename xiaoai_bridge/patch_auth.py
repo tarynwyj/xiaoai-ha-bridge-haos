@@ -4834,7 +4834,30 @@ replace_exact(
                     for s in states
                     if s.get("entity_id", "").startswith("automation.xiaoai_bridge_")
                 ]''',
-    '                return states',
+    '                return states if isinstance(states, list) else None',
+)
+
+replace_exact(
+    "HA state lookup distinguishes request failure from an empty HA",
+    '''                if r.status != 200:
+                    return []
+                states = await r.json()''',
+    '''                if r.status != 200:
+                    log.warning("读取 HA 自动化状态失败 (HTTP %s)", r.status)
+                    return None
+                states = await r.json()''',
+)
+replace_exact(
+    "HA state transport errors remain unknown",
+    '''            log.error("获取自动化列表异常: %s", e)
+            return []''',
+    '''            log.error("获取自动化列表异常: %s", e)
+            return None''',
+)
+replace_exact(
+    "HA state lookup has a nullable result contract",
+    '    async def list_automation_states(self, session: aiohttp.ClientSession) -> list[dict]:',
+    '    async def list_automation_states(self, session: aiohttp.ClientSession) -> list[dict] | None:',
 )
 
 # GET /api/automations must map the raw states through _schedule_listing (which
@@ -4846,7 +4869,10 @@ replace_exact(
     return {"ok": True, "automations": automations, "count": len(automations)}''',
     '''    async with aiohttp.ClientSession() as s:
         clock_known = await _sync_schedule_clock(ha, s)
-        automations = _schedule_listing(await ha.list_automation_states(s), clock_known=clock_known)
+        states = await ha.list_automation_states(s)
+        if states is None:
+            raise HTTPException(502, "无法读取 HA 自动化状态，任务是否已加载暂时未知，请稍后重试")
+        automations = _schedule_listing(states, clock_known=clock_known)
     return {"ok": True, "automations": automations, "count": len(automations)}''',
 )
 
@@ -5170,12 +5196,12 @@ async def create_automation(req: ScheduleAutomationRequest):
         # 否则用户会重复提交并制造重复任务。
         log.warning("定时任务 %s 已写入 HA，但重新加载自动化失败", automation_id)
         return {"ok": True, "automation_id": automation_id, "reloaded": False,
-                "msg": "已创建定时任务，但 HA 重新加载失败；稍后可在 HA 里重载或重启"}
+                "msg": "任务配置已保存，但尚未确认 HA 已加载，请稍后刷新核对"}
     log.info("已创建定时任务 %s（手动）", automation_id)
     when_text = (once_date + " ") if once else ""
     return {"ok": True, "automation_id": automation_id, "reloaded": True,
             "msg": ("已创建一次性任务 " if once else "已创建定时任务 ")
-                   + when_text + schedule_time[:5]}
+                   + when_text + (schedule_time[:5] if schedule_time.endswith(":00") else schedule_time)}
 
 
 @app.delete("/api/automations/{automation_id}")''',
@@ -5192,6 +5218,7 @@ replace_exact(
         raise HTTPException(500, "删除失败")
     return {"ok": True}''',
     r'''    async with aiohttp.ClientSession() as s:
+        _schedule_registry_read()  # refuse mutation if the registry cannot be read
         ok = await ha.delete_automation(automation_id, s)
         reloaded = False
         if ok:
@@ -5204,6 +5231,7 @@ replace_exact(
             config_state = await _automation_config_state(ha, automation_id, s)
             if config_state == "missing":
                 ok = True
+                _schedule_registry_remove(automation_id)
                 reloaded = await ha.reload_automations(s)
             elif config_state == "unknown":
                 raise HTTPException(
@@ -5883,8 +5911,17 @@ replace_exact(
     r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
 """,
     r"""                    if _looks_like_schedule(query) and not await _sync_schedule_clock(ha, _bridge_session):
-                        log.warning("无法读取 HA 时区，未执行定时指令: %s", query)
+                        message = "暂时无法读取 Home Assistant 时区，未创建定时任务，请稍后再试"
+                        bridge_state["error"] = message
+                        log.warning("%s: %s", message, query)
+                        if mi_cfg.get("tts_reply", True):
+                            try:
+                                await na.text_to_speech(device_id, message)
+                            except Exception as e:
+                                log.warning("播报定时任务失败原因失败: %s", type(e).__name__)
                         continue
+                    if _looks_like_schedule(query) and bridge_state.get("error") == "暂时无法读取 Home Assistant 时区，未创建定时任务，请稍后再试":
+                        bridge_state["error"] = None
                     action = IntentParser(load_config().get("intent_rules", [])).parse(query)
                     if _looks_like_schedule(query) and not (
                             action and (action.get("type") == "schedule" or action.get("delay_minutes"))):
@@ -5955,6 +5992,34 @@ replace_exact(
             except asyncio.CancelledError:""",
 )
 
+replace_exact(
+    "voice schedule registry failures are reported to the user",
+    '''                            automation_id, ok = await _create_ha_automation(
+                                ha, domain, service, action,
+                                schedule_time, schedule_days, _bridge_session,
+                            )''',
+    '''                            registry_failure = ""
+                            try:
+                                automation_id, ok = await _create_ha_automation(
+                                    ha, domain, service, action,
+                                    schedule_time, schedule_days, _bridge_session,
+                                )
+                            except ScheduleRegistryError as e:
+                                automation_id, ok = "", False
+                                registry_failure = str(e)
+                                bridge_state["error"] = registry_failure''',
+)
+replace_exact(
+    "voice schedule failure text distinguishes unavailable readback and registry errors",
+    '''                                reply = "抱歉，创建定时任务失败了"''',
+    '''                                if registry_failure:
+                                    reply = "定时任务登记表无法读写，未能完成创建，请在面板查看原因"
+                                elif _automation_outcomes.get(automation_id, {}).get("status") == "unverified":
+                                    reply = "定时任务已提交，但暂时无法确认是否生效，请在面板核对"
+                                else:
+                                    reply = "抱歉，创建定时任务失败了"''',
+)
+
 source = source + r"""
 
 # ════════════════ 语音定时任务（中文解析 + 幂等 + 回读校验） ════════════════
@@ -5978,6 +6043,15 @@ _SCHEDULE_INTERNAL_KEYS = {
     "entity_id", "once", "once_date", "__once", "__once_date", "__source",
     "type", "schedule_time", "schedule_days", "reply", "delay_minutes",
 }
+
+
+class ScheduleRegistryError(RuntimeError):
+    '''The local task registry is unavailable; never treat it as an empty file.'''
+
+
+@app.exception_handler(ScheduleRegistryError)
+async def _schedule_registry_error_response(request, exc):
+    return JSONResponse({"ok": False, "detail": str(exc)}, status_code=503)
 
 
 def _automation_outcome(automation_id: str, status: str, ok: bool) -> None:
@@ -6156,7 +6230,7 @@ def _parse_relative_offset(text: str):
             return _td(hours=hours), match.group(0)
     match = re.search(r"半\s*个?\s*分钟" + suffix, text)
     if match:
-        return _td(minutes=30), match.group(0)
+        return _td(seconds=30), match.group(0)
     match = re.search(
         r"([零〇一二两三四五六七八九十\d]{1,3})\s*个?\s*分钟" + suffix, text)
     if match:
@@ -6231,7 +6305,9 @@ def _parse_schedule_days_cn(text: str):
 
 
 def _looks_like_schedule(text: str) -> bool:
-    return any(w in str(text or "") for w in _SCHEDULE_HINTS)
+    text = str(text or "")
+    return any(w in text for w in _SCHEDULE_HINTS) or bool(
+        re.search(r"(?:秒钟?|分钟|小时)\s*(?:之后|以后|过后|后)", text))
 
 
 def _pick_schedule_device(text: str, devices, aliases):
@@ -6274,7 +6350,7 @@ def _parse_schedule_command(text: str, devices, aliases):
     if offset is not None:
         # 相对时间（「十分钟后」「半小时后」）只能是一次性的绝对时间点。
         when = now + offset
-        at_time = when.strftime("%H:%M")
+        at_time = when.strftime("%H:%M:%S")
         once = True
         days = "once"
         once_date = when.strftime("%Y-%m-%d")
@@ -6377,6 +6453,7 @@ async def _create_ha_automation(
     if not at_time:
         log.warning("定时任务时间格式无效: %r", schedule_time)
         return "", False
+    _schedule_registry_read()  # check before writing anything to HA
     data = dict(data or {})
     once = bool(once or data.get("once") or data.get("__once"))
     once_date = once_date or data.get("once_date") or data.get("__once_date")
@@ -6395,7 +6472,7 @@ async def _create_ha_automation(
         if when <= _schedule_now():
             log.warning("一次性定时任务的时间已经过去: %s %s", once_date, at_time)
             return "", False
-        once_at = when.strftime("%Y-%m-%d %H:%M")
+        once_at = _schedule_format_moment(when)
     try:
         entity_id = _schedule_targets(data.get("entity_id"))
     except ValueError as e:
@@ -6413,7 +6490,7 @@ async def _create_ha_automation(
         action_item["target"] = {"entity_id": entity_id}
     if extra:
         action_item["data"] = extra
-    label = "%s %s" % (at_time[:5], entity_id or domain)
+    label = "%s %s" % (at_time[:5] if at_time.endswith(":00") else at_time, entity_id or domain)
     if once:
         label = "%s %s" % (once_date, label)
     config = {
@@ -6466,9 +6543,9 @@ async def _create_ha_automation(
         log.error("定时任务已提交但 HA 里查不到: %s（请检查 configuration.yaml 的 automation 配置）",
                   automation_id)
         return automation_id, False
-    _automation_outcome(automation_id, "unverified", True)
+    _automation_outcome(automation_id, "unverified", False)
     log.warning("定时任务已创建，但无法回读确认: %s", automation_id)
-    return automation_id, True
+    return automation_id, False
 
 
 # ──────────────── 定时任务本地登记表：页面不再只依赖 HA 实体状态 ────────────────
@@ -6489,14 +6566,21 @@ def _schedule_registry_read() -> list:
     except FileNotFoundError:
         return []
     except Exception as e:
-        log.warning("定时任务登记表读取失败，按空处理: %s", type(e).__name__)
-        return []
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+        log.error("定时任务登记表读取失败，保留原文件: %s", type(e).__name__)
+        raise ScheduleRegistryError("定时任务登记表无法读取，已停止修改并保留原文件，请检查或恢复备份") from e
+    if (not isinstance(data, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip()
+            for item in data)):
+        raise ScheduleRegistryError("定时任务登记表格式损坏，已停止修改并保留原文件，请检查或恢复备份")
+    if len({item["id"] for item in data}) != len(data):
+        raise ScheduleRegistryError("定时任务登记表存在重复 ID，已停止修改并保留原文件")
+    return data
 
 
 def _schedule_registry_write(items: list) -> None:
     import tempfile
     import os
+    _schedule_registry_read()  # guard even a direct replacement of the registry
     path = _schedule_registry_path()
     temporary = None
     try:
@@ -6518,6 +6602,7 @@ def _schedule_registry_write(items: list) -> None:
             pass
     except Exception as e:
         log.warning("定时任务登记表写入失败: %s", type(e).__name__)
+        raise ScheduleRegistryError("定时任务登记表写入失败，原文件已保留；HA 配置可能已保存，请核对后重试") from e
     finally:
         if temporary:
             try:
@@ -6530,9 +6615,10 @@ def _schedule_registry_add(automation_id: str, at_time: str, weekdays,
                            entity_id: str, domain: str, service: str,
                            source: str, once: bool = False,
                            once_at: str = "", data=None) -> None:
-    items = [item for item in _schedule_registry_read()
+    current = _schedule_registry_read()
+    items = [item for item in current
              if str(item.get("id")) != automation_id]
-    previous = next((item for item in _schedule_registry_read()
+    previous = next((item for item in current
                      if str(item.get("id")) == automation_id), {})
     stamp = _schedule_now().strftime("%Y-%m-%d %H:%M:%S")
     items.append({
@@ -6569,20 +6655,34 @@ def _schedule_local_naive(value):
     return parsed
 
 
+def _schedule_parse_moment(value):
+    '''Read both legacy minute-only dates and new second-precision dates.'''
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return _dt.strptime(str(value or ""), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _schedule_format_moment(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S" if value.second else "%Y-%m-%d %H:%M")
+
+
 def _schedule_once_state(meta, last_triggered, now=None):
     '''``done``/``expired`` for a one-shot task whose moment has passed, else None.'''
     if not meta or not meta.get("once"):
         return None
     from datetime import datetime as _dt, timedelta as _td
     now = now or _schedule_now()
-    try:
-        when = _dt.strptime(str(meta.get("once_at") or ""), "%Y-%m-%d %H:%M")
-    except ValueError:
+    when = _schedule_parse_moment(meta.get("once_at"))
+    if when is None:
         return None
     if now < when:
         return None
     fired = _schedule_local_naive(last_triggered)
-    if fired is not None and fired >= when - _td(minutes=2):
+    if fired is not None and fired >= when:
         return "done"
     return "expired"
 
@@ -6593,24 +6693,23 @@ def _schedule_next_run(at_time: str, weekdays, once: bool, now=None,
     from datetime import datetime as _dt, timedelta as _td
     now = now or _schedule_now()
     if once:
-        try:
-            when = _dt.strptime(str(once_at or ""), "%Y-%m-%d %H:%M")
-        except ValueError:
+        when = _schedule_parse_moment(once_at)
+        if when is None:
             return None
-        return when.strftime("%Y-%m-%d %H:%M") if when > now else None
-    try:
-        hour, minute = [int(part) for part in str(at_time).split(":")[:2]]
-    except Exception:
+        return _schedule_format_moment(when) if when > now else None
+    normal = _normalize_schedule_time(at_time)
+    if not normal:
         return None
+    hour, minute, second = map(int, normal.split(":"))
     week_map = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
     allowed = [week_map[d] for d in (weekdays or []) if d in week_map]
     for offset in range(0, 8):
         candidate = (now + _td(days=offset)).replace(
-            hour=hour, minute=minute, second=0, microsecond=0)
+            hour=hour, minute=minute, second=second, microsecond=0)
         if candidate <= now:
             continue
         if not allowed or candidate.weekday() in allowed:
-            return candidate.strftime("%Y-%m-%d %H:%M")
+            return _schedule_format_moment(candidate)
     return None
 
 
@@ -6770,7 +6869,10 @@ async def cleanup_automations():
         async with aiohttp.ClientSession() as session:
             if not await _sync_schedule_clock(ha, session):
                 raise HTTPException(503, "无法读取 HA 时区，未清理任何任务")
-            entries = _schedule_listing(await ha.list_automation_states(session))
+            states = await ha.list_automation_states(session)
+            if states is None:
+                raise HTTPException(502, "无法读取 HA 自动化状态，未清理任何任务")
+            entries = _schedule_listing(states)
             kept = await _schedule_purge_expired(ha, session, entries)
         return {"ok": True, "removed": len(entries) - len(kept)}
 
@@ -6900,11 +7002,12 @@ async def update_automation(automation_id: str, req: ScheduleAutomationRequest):
                      "请先在 HA 的「自动化」里核对，再决定是否重试。")
         log.warning("定时任务 %s 已改写，但重新加载自动化失败", automation_id)
         return {"ok": True, "automation_id": automation_id, "reloaded": False,
-                "msg": "修改已保存，但 HA 重新加载失败；稍后可在 HA 里重载或重启"}
+                "msg": "修改已保存，但尚未确认 HA 已加载，请稍后刷新核对"}
     log.info("已修改定时任务 %s（手动）", automation_id)
     when_text = (once_date + " ") if once else ""
     return {"ok": True, "automation_id": automation_id, "reloaded": True,
-            "updated": True, "msg": "已保存修改 " + when_text + schedule_time[:5]}
+            "updated": True, "msg": "已保存修改 " + when_text
+                       + (schedule_time[:5] if schedule_time.endswith(":00") else schedule_time)}
 """
 
 

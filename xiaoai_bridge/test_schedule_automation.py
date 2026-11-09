@@ -21,6 +21,8 @@ import sys
 import types
 
 FUNCTIONS = (
+    "_schedule_parse_moment",
+    "_schedule_format_moment",
     "_schedule_targets",
     "_sync_schedule_clock",
     "_normalize_schedule_time",
@@ -218,6 +220,8 @@ def load(bridge_path: pathlib.Path):
     missing = [name for name in FUNCTIONS if name not in {node.name for node in functions}]
     assert not missing, f"bridge.py is missing {missing}"
     wanted = tables + functions
+    wanted = [node for node in tree.body if isinstance(node, ast.ClassDef)
+              and node.name == "ScheduleRegistryError"] + wanted
     namespace = {
         "re": __import__("re"), "time": __import__("time"),
         "aiohttp": types.SimpleNamespace(
@@ -735,9 +739,13 @@ def main() -> int:
     ROUTES["http://ha.local:8123/api/config/automation/config/"] = (404, None)
     FakeHA.delete_ok = False
     try:
+        ns["_schedule_registry_add"]("xiaoai_bridge_gone", "08:00", [],
+                                     "light.a", "light", "turn_on", "form")
         response = delete("xiaoai_bridge_gone")
         check("a lost delete response with a vanished config counts as deleted",
               response.get("ok") is True and response.get("reloaded") is True, response)
+        check("a confirmed missing config is removed from the registry too",
+              not any(x["id"] == "xiaoai_bridge_gone" for x in ns["_schedule_registry_read"]()))
         ROUTES["http://ha.local:8123/api/config/automation/config/"] = (500, None)
         expect_delete_error("xiaoai_bridge_unknown",
                             "an unconfirmable delete returns 504 with a check message",

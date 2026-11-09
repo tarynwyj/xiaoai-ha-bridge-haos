@@ -3,3 +3,5 @@
 # browser upgrade cannot silently change behaviour under the suite.
 playwright==1.62.0
 Jinja2==3.1.6
+# Windows has no system IANA database; do not silently skip timezone success cases.
+tzdata==2026.2

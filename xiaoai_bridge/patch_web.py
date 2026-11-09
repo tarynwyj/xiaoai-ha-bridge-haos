@@ -1162,7 +1162,7 @@ replace_exact(
         </div>
         <div class="field"><label>执行操作</label><div id="sch-action-wrap" style="display:flex;flex-wrap:wrap;gap:14px"></div></div>
         <div class="form-grid">
-          <div class="field"><label>执行时间（24 小时制）</label><input type="time" id="sch-time" step="60" value="07:30" onchange="schedulePreview()"></div>
+          <div class="field"><label>执行时间（24 小时制）</label><input type="time" id="sch-time" step="1" value="07:30" onchange="schedulePreview()"></div>
           <div class="field"><label>重复方式</label><select id="sch-days" onchange="scheduleDaysChanged()"><option value="daily">每天</option><option value="weekdays">工作日</option><option value="weekends">周末</option><option value="custom">自定义星期</option></select></div>
         </div>
         <div class="field" id="sch-days-custom-wrap" style="display:none"><label>选择星期</label>
@@ -1694,7 +1694,7 @@ function editSchedule(id){
     scheduleDeviceChanged();
     if(item.service)scheduleActionChanged(String(item.service));
     var timeEl=document.getElementById('sch-time');
-    if(timeEl&&item.time)timeEl.value=String(item.time).slice(0,5);
+    if(timeEl&&item.time){var clock=String(item.time);timeEl.value=clock.length===8&&clock.slice(-3)===':00'?clock.slice(0,5):clock;}
     var daysEl=document.getElementById('sch-days');
     var wd=Array.isArray(item.weekdays)?item.weekdays:[];
     var dateEl=document.getElementById('sch-date');
@@ -1798,7 +1798,7 @@ async function loadSchedules(){
   try{
     const r=await fetch('/api/automations');
     const d=await r.json();
-    if(!d.ok){showAlert(a,'err',d.msg);return}
+    if(!r.ok||!d.ok)throw new Error(d.detail||d.msg||'读取任务状态失败');
     scheduleItems=Array.isArray(d.automations)?d.automations:[];
     document.getElementById('schedule-count').textContent=d.count+'个';
     const list=document.getElementById('schedule-list');
@@ -1831,7 +1831,14 @@ async function loadSchedules(){
         +'<button class="rule-del" title="删除" onclick="deleteSchedule(\''+escAttr(id)+'\')">✕</button>'
         +'</div></div></div>';
     }).join('');
-  }catch(e){showAlert(a,'err','加载失败: '+e.message)}
+  }catch(e){
+    scheduleItems=[];
+    const list=document.getElementById('schedule-list');
+    if(list)list.innerHTML='<div class="empty-state">任务状态暂时未知，请稍后刷新重试</div>';
+    const count=document.getElementById('schedule-count');
+    if(count)count.textContent='状态未知';
+    showAlert(a,'err','加载失败: '+e.message);
+  }
 }
 
 init();''',

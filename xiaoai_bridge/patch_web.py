@@ -1213,13 +1213,14 @@ var SCHEDULE_ACTIONS={
 };
 var SCHEDULE_WEEKDAYS=[['1','一'],['2','二'],['3','三'],['4','四'],['5','五'],['6','六'],['7','日']];
 var scheduleDaysDraft=[];
+var scheduleDeviceIds=[];
 var haServiceCache={};
 function scheduleActionsFor(domain){
   var base=SCHEDULE_ACTIONS[domain]||[['turn_on','打开'],['turn_off','关闭']];
   var known=haServiceCache[domain];
   if(Array.isArray(known)&&known.length){
     var only=base.filter(function(p){return known.indexOf(p[0])>=0;});
-    if(only.length)return only;
+    return only;
   }
   return base;
 }
@@ -1241,34 +1242,47 @@ function scheduleDeviceFilter(){
   scheduleRenderDevices(q);
 }
 function scheduleRenderDevices(query){
-  var sel=document.getElementById('sch-device');if(!sel)return;
-  var current=sel.value;
+  var box=document.getElementById('sch-device');if(!box)return;
   var rows=scheduleDeviceList();
+  if(!scheduleAreaValue()){
+    var known=(typeof haDevices!=='undefined'&&Array.isArray(haDevices))?haDevices:[];
+    scheduleSelectedDevices().forEach(function(d){if(!known.some(function(k){return k.entity_id===d.entity_id;}))rows.push({entity_id:d.entity_id,name:d.entity_id+'（当前未发现）'});});
+  }
   if(query){rows=rows.filter(function(d){return (String(d.name||'')+' '+String(d.entity_id||'')).toLowerCase().indexOf(query)>=0;});}
-  var html='<option value="">请选择设备</option>';
-  rows.forEach(function(d){
+  box.innerHTML=rows.map(function(d){
     var id=String(d.entity_id||'');
     var name=String(d.name||id);
     var state=d.state?'（'+(d.state==='on'?'开':'关')+'）':'';
-    html+='<option value="'+escAttr(id)+'">'+escHtml(name+state)+'</option>';
-  });
-  sel.innerHTML=html;
-  if(current&&rows.some(function(d){return d.entity_id===current;}))sel.value=current;
+    return '<label style="display:flex;align-items:center;gap:8px;padding:8px;cursor:pointer"><input type="checkbox" class="sch-device-box" value="'+escAttr(id)+'"'+(scheduleDeviceIds.indexOf(id)>=0?' checked':'')+' onchange="scheduleDeviceChanged(this.value,this.checked)"><span>'+escHtml(name+state)+'</span></label>';
+  }).join('')||'<div style="padding:8px">没有匹配的设备</div>';
   var hint=document.getElementById('sch-device-hint');
-  if(hint)hint.textContent=rows.length?('共 '+rows.length+' 台设备可选。') : '没有匹配的设备：请先在「设备管理」页同步 Home Assistant。';
+  if(hint)hint.textContent='当前显示 '+rows.length+' 台，已选 '+scheduleDeviceIds.length+' 台。切换房间或搜索不会清除已选设备。';
+  var picked=document.getElementById('sch-device-selected');
+  if(picked)picked.textContent=scheduleSelectedDevices().map(function(d){return d.name||d.entity_id;}).join('、')||'尚未选择设备';
+}
+function scheduleSelectedDevices(){
+  var all=(typeof haDevices!=='undefined'&&Array.isArray(haDevices))?haDevices:[];
+  return scheduleDeviceIds.map(function(id){return all.find(function(d){return d.entity_id===id;})||{entity_id:id,name:id,domain:id.split('.')[0]};});
 }
 function scheduleSelectedDevice(){
-  var sel=document.getElementById('sch-device');var id=sel?String(sel.value||''):'';
-  if(!id)return null;
-  var list=scheduleDeviceList();
-  for(var i=0;i<list.length;i++){if(list[i].entity_id===id)return list[i];}
-  return {entity_id:id,name:id,domain:String(id).split('.')[0]};
+  var devices=scheduleSelectedDevices();if(!devices.length)return null;
+  var domain=devices[0].domain||devices[0].entity_id.split('.')[0];
+  var common=scheduleActionsFor(domain).filter(function(action){return devices.every(function(d){return scheduleActionsFor(d.domain||d.entity_id.split('.')[0]).some(function(a){return a[0]===action[0];});});});
+  var same=devices.every(function(d){return (d.domain||d.entity_id.split('.')[0])===domain;});
+  return {entity_id:scheduleDeviceIds.join(','),entity_ids:scheduleDeviceIds.slice(),name:devices.map(function(d){return d.name||d.entity_id;}).join('、'),domain:same?domain:'homeassistant',actions:common};
 }
-function scheduleDeviceChanged(){scheduleRenderActions();schedulePreview();}
+function scheduleDeviceChanged(id,on){
+  if(id){var i=scheduleDeviceIds.indexOf(id);if(on&&i<0)scheduleDeviceIds.push(id);if(!on&&i>=0)scheduleDeviceIds.splice(i,1);}
+  var search=document.getElementById('sch-search');scheduleRenderDevices(search?search.value:'');
+  scheduleRenderActions();schedulePreview();
+}
+function scheduleSelectVisible(){scheduleDeviceList().forEach(function(d){var query=String((document.getElementById('sch-search')||{}).value||'').toLowerCase();if((!query||(String(d.name||'')+' '+d.entity_id).toLowerCase().indexOf(query)>=0)&&scheduleDeviceIds.indexOf(d.entity_id)<0)scheduleDeviceIds.push(d.entity_id);});scheduleDeviceChanged();}
+function scheduleClearDevices(){scheduleDeviceIds=[];scheduleDeviceChanged();}
 function scheduleRenderActions(){
   var wrap=document.getElementById('sch-action-wrap');if(!wrap)return;
   var dev=scheduleSelectedDevice();
-  var actions=scheduleActionsFor(dev?String(dev.domain||''):'');
+  var actions=dev?dev.actions:[];
+  if(!actions.length){wrap.setAttribute('data-service','');wrap.textContent=dev?'所选设备没有共同操作，请分组创建任务':'请先选择设备';return;}
   var picked=wrap.getAttribute('data-service')||'';
   if(!actions.some(function(a){return a[0]===picked;}))picked=actions[0][0];
   wrap.setAttribute('data-service',picked);
@@ -1331,7 +1345,7 @@ function schedulePreview(){
   var days=scheduleDaysValue();
   var service=scheduleCurrentService();
   var label='';
-  var actions=scheduleActionsFor(dev?String(dev.domain||''):'');
+  var actions=dev?dev.actions:[];
   actions.forEach(function(a){if(a[0]===service)label=a[1];});
   if(!dev){box.textContent='先选择设备';return;}
   box.textContent=scheduleDaysText(days)+' '+(time||'--:--')+'，'+(label||service)+'「'+(dev.name||dev.entity_id)+'」';
@@ -1432,7 +1446,7 @@ replace_exact(
     '''<div id="mi-device-list" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#9670;</span>发现设备 <span id="mi-device-count" style="text-transform:none;font-weight:400;font-size:10px"></span></div></div><div id="mi-devices"></div></div>''',
     '''<div id="mi-device-list" class="card" style="display:none"><div class="card-head"><div class="card-title"><span>&#9670;</span>发现设备 <span id="mi-device-count" style="text-transform:none;font-weight:400;font-size:10px"></span></div></div><div id="mi-devices"></div></div>
       <div id="mi-scope-card" class="card" style="display:none">
-        <div class="card-head"><div class="card-title"><span>&#127911;</span>监听范围 <span id="mi-scope-count" style="text-transform:none;font-weight:400;font-size:10px"></span></div></div>
+        <div class="card-head"><div class="card-title"><span>&#127911;</span>接收语音的小爱音箱 <span id="mi-scope-count" style="text-transform:none;font-weight:400;font-size:10px"></span></div></div>
         <div style="font-size:12px;color:var(--txt-muted);line-height:1.7;margin-bottom:8px">只影响“听哪几台音箱说话”，与“设备管理”页里的 Home Assistant 实体无关。修改后需要重启桥接器才会生效。</div>
         <div class="field"><label class="toggle-label"><input type="radio" name="mi-scope-mode" id="mi-scope-mode-all" value="all" onchange="setMiScopeMode('all')"> 监听全部小爱音箱（含以后新加的）</label></div>
         <div class="field"><label class="toggle-label"><input type="radio" name="mi-scope-mode" id="mi-scope-mode-selected" value="selected" onchange="setMiScopeMode('selected')"> 仅监听所选音箱</label></div>
@@ -1463,8 +1477,8 @@ function miScopeSelectAll(){var d=miScopeInit();d.mode='selected';d.legacy=false
 function miScopeClearAll(){var d=miScopeInit();d.mode='selected';d.legacy=false;d.ids=[];renderMiScope();miScopeStatus()}
 function miScopeCollect(){var d=miScopeInit();if(d.mode==='all')return{ok:true,mode:'all',ids:[]};if(!d.ids.length)return{ok:false,mode:'selected',ids:[],msg:'“仅监听所选”至少要选一台音箱'};return{ok:true,mode:'selected',ids:d.ids.slice()}}
 function miScopeDirty(){var s=miScopeSaved();var d=miScopeInit();if(s.mode!==d.mode)return true;if(s.mode==='all')return false;if(s.ids.length!==d.ids.length)return true;for(var i=0;i<s.ids.length;i++){if(d.ids.indexOf(s.ids[i])<0)return true}return false}
-function miScopeStatus(){var box=document.getElementById('mi-scope-status');var cnt=document.getElementById('mi-scope-count');var d=miScopeInit();var rows=miScopeRows();var missing=rows.filter(function(r){return r.missing}).length;if(cnt)cnt.textContent='('+(d.mode==='all'?'全部':d.ids.length+' 台')+')';if(!box)return;var text='';if(d.mode==='all'){text='当前监听：全部小爱音箱。新发现的音箱会自动纳入。'}else if(!d.ids.length){text='当前监听：未选择任何音箱，保存会被拒绝。'}else{text='当前监听：已选 '+d.ids.length+' 台。'}if(missing>0)text+=' 其中 '+missing+' 台当前未发现，已保留配置。';if(d.legacy)text+=' 这是旧版单台配置，保存后会转为“仅监听所选”。';text+=miScopeDirty()?' 有未保存的修改。':' 已保存。';box.textContent=text}
-function renderMiScope(devices){if(devices!==undefined)globalThis.miScopeDevices=devices||[];var card=document.getElementById('mi-scope-card');var list=document.getElementById('mi-scope-list');if(!card||!list)return;card.style.display='';var d=miScopeInit();var all=document.getElementById('mi-scope-mode-all');var sel=document.getElementById('mi-scope-mode-selected');if(all)all.checked=d.mode==='all';if(sel)sel.checked=d.mode==='selected';var rows=miScopeRows();list.innerHTML=rows.map(function(r,i){var checked=(d.mode==='selected'&&d.ids.indexOf(r.id)>=0)?' checked':'';var disabled=(d.mode==='all')?' disabled':'';return'<label class="rule-item" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" class="mi-scope-box" data-index="'+i+'"'+checked+disabled+' onchange="toggleMiScopeIndex('+i+',this.checked)"><span style="color:var(--txt-primary);font-size:14px">'+escHtml(r.name)+'</span><span style="color:var(--txt-muted);font-size:11px">'+escHtml(r.hw)+'</span><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">'+escHtml(r.id.length>12?r.id.substring(0,12)+'...':r.id)+'</span></label>'}).join('');miScopeStatus()}''',
+function miScopeStatus(){var box=document.getElementById('mi-scope-status');var cnt=document.getElementById('mi-scope-count');var d=miScopeInit();var rows=miScopeRows();var missing=rows.filter(function(r){return r.missing}).length;if(cnt)cnt.textContent='('+(d.mode==='all'?'全部':d.ids.length+' 台')+')';if(!box)return;var text='';if(d.mode==='all'){text='当前监听：全部小爱音箱，下面已全部勾选。要逐台选择，请先切换到「仅监听所选音箱」。新发现的音箱会自动纳入。'}else if(!d.ids.length){text='当前监听：未选择任何音箱，保存会被拒绝。'}else{text='当前监听：已选 '+d.ids.length+' 台。'}if(missing>0)text+=' 其中 '+missing+' 台当前未发现，已保留配置。';if(d.legacy)text+=' 这是旧版单台配置，保存后会转为“仅监听所选”。';text+=miScopeDirty()?' 有未保存的修改。':' 已保存。';box.textContent=text}
+function renderMiScope(devices){if(devices!==undefined)globalThis.miScopeDevices=devices||[];var card=document.getElementById('mi-scope-card');var list=document.getElementById('mi-scope-list');if(!card||!list)return;card.style.display='';var d=miScopeInit();var all=document.getElementById('mi-scope-mode-all');var sel=document.getElementById('mi-scope-mode-selected');if(all)all.checked=d.mode==='all';if(sel)sel.checked=d.mode==='selected';var rows=miScopeRows();list.innerHTML=rows.map(function(r,i){var checked=(d.mode==='all'||d.ids.indexOf(r.id)>=0)?' checked':'';var disabled=(d.mode==='all')?' disabled':'';return'<label class="rule-item" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" class="mi-scope-box" data-index="'+i+'"'+checked+disabled+' onchange="toggleMiScopeIndex('+i+',this.checked)"><span style="color:var(--txt-primary);font-size:14px">'+escHtml(r.name)+'</span><span style="color:var(--txt-muted);font-size:11px">'+escHtml(r.hw)+'</span><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">'+escHtml(r.id.length>12?r.id.substring(0,12)+'...':r.id)+'</span></label>'}).join('');miScopeStatus()}''',
 )
 
 replace_exact(
@@ -1614,10 +1628,11 @@ function schedulePreview(){
   var days=scheduleDaysValue();
   var service=scheduleCurrentService();
   var label='';
-  var actions=scheduleActionsFor(dev?String(dev.domain||''):'');
+  var actions=dev?dev.actions:[];
   actions.forEach(function(a){if(a[0]===service)label=a[1];});
   if(!dev){box.textContent='先选择设备';return;}
   var when=time;
+  if(!dev.actions.length){box.textContent='所选设备没有共同操作，请分组创建任务';return;}
   if(days==='once'){
     var dateEl=document.getElementById('sch-date');
     when=((dateEl&&String(dateEl.value||''))||'未选日期')+' '+(time||'--:--');
@@ -1691,13 +1706,9 @@ function editSchedule(id){
     var multi=Array.isArray(item.entity);
     var entity=multi?item.entity.join(','):String(item.entity||'').trim();
     if(!entity)entity=String(item.entity_id||'').replace(/^automation\./,'');
-    var sel=document.getElementById('sch-device');
-    if(sel&&entity){
-      var found=false;
-      for(var i=0;i<sel.options.length;i++){if(sel.options[i].value===entity)found=true;}
-      if(!found)sel.insertAdjacentHTML('beforeend','<option value="'+escAttr(entity)+'">'+escHtml(entity)+'</option>');
-      sel.value=entity;
-    }
+    scheduleDeviceIds=(multi?item.entity:String(entity).split(',')).map(function(x){return String(x).trim();}).filter(Boolean);
+    var area=document.getElementById('sch-area');if(area)area.value='';
+    var search=document.getElementById('sch-search');if(search)search.value='';
     scheduleDeviceChanged();
     if(item.service)scheduleActionChanged(String(item.service));
     var timeEl=document.getElementById('sch-time');
@@ -1729,9 +1740,10 @@ function editSchedule(id){
     if(svcEl&&item.service)svcEl.value=item.service;
     if(entEl)entEl.value=entity;
     if(dataEl)dataEl.value=(item.data&&Object.keys(item.data).length)?JSON.stringify(item.data):'';
-    var simple=(scheduleActionsFor(item.domain)||[]).map(function(a){return a[0];});
+    var selection=scheduleSelectedDevice();
+    var simple=(selection?selection.actions:[]).map(function(a){return a[0];});
     var adv=document.getElementById('sch-advanced');
-    if(adv&&(multi||(item.service&&simple.indexOf(String(item.service))<0)))adv.open=true;
+    if(adv)adv.open=!!(item.service&&simple.indexOf(String(item.service))<0);
     var banner=document.getElementById('sch-edit-banner');
     var nameEl=document.getElementById('sch-edit-name');
     var title=document.getElementById('sch-form-title');
@@ -1757,7 +1769,8 @@ async function createSchedule(){
     if(!dev){showAlert(a,'err','✗ 请先选择设备');return;}
     domain=String(dev.domain||String(dev.entity_id||'').split('.')[0]);
     service=scheduleCurrentService();
-    entity=String(dev.entity_id||'');
+    if(!dev.actions.length){showAlert(a,'err','✗ 所选设备没有共同操作，请分组创建任务');return;}
+    entity=dev.entity_ids.length===1?dev.entity_ids[0]:dev.entity_ids;
   }
   const daysRaw=scheduleDaysValue();
   const once=daysRaw==='once';
@@ -1858,6 +1871,14 @@ async function loadSchedules(){
 }
 
 init();''',
+)
+
+replace_exact(
+    "schedule targets use a persistent checkbox list",
+    '<select id="sch-device" onchange="scheduleDeviceChanged()"><option value="">正在读取设备…</option></select>',
+    '<div style="display:flex;gap:8px;margin-bottom:6px"><button type="button" class="btn" onclick="scheduleSelectVisible()">全选当前结果</button><button type="button" class="btn" onclick="scheduleClearDevices()">清空已选</button></div>'
+    '<div id="sch-device" style="max-height:200px;overflow:auto;border:1px solid var(--border-default);border-radius:6px">正在读取设备…</div>'
+    '<div id="sch-device-selected" style="font-size:12px;color:var(--txt-secondary);margin-top:6px"></div>',
 )
 
 path.write_text(html, encoding="utf-8")

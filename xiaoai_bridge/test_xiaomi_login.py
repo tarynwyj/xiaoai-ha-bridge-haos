@@ -2137,8 +2137,8 @@ def scenario_cookie_login():
             data = cookie_login(h3, "userId=u; passToken=p; serviceToken=svc-fallback")
             check(data.get("ok") is True,
                   f"a failed exchange must fall back to the pasted token, got {data}")
-            check(len(CURRENT["verified_login_calls"]) == 1,
-                  "the fallback must still try the exchange first")
+            check(len(CURRENT["verified_login_calls"]) == 2,
+                  "the pasted-token fallback follows only the SDK and one browser attempt")
             token = json.loads(h3.token_path.read_text(encoding="utf-8"))
             check(token.get("micoapi") == ["", "svc-fallback"],
                   f"the pasted token may only be the fallback, got {token.get('micoapi')}")
@@ -2172,6 +2172,54 @@ def scenario_cookie_login():
         ok("cookie: passToken exchange wins, a pasted serviceToken is only a fallback")
     finally:
         h.cleanup()
+
+
+def scenario_cookie_browser_compatibility():
+    h = Harness()
+    try:
+        CURRENT["login_script"] = [{"code": 70016}, {
+            "code": 0, "userId": "browser-user", "passToken": "rotated-pass",
+            "nonce": "n", "ssecurity": "s", "location": "https://api2.mina.mi.com/sts?sign=test"}]
+        data = cookie_login(h, "userId=browser-user; passToken=browser-pass; deviceId=wb_browser")
+        check(data.get("ok") is True, "a browser compatibility exchange can finish after SDK rejection")
+        calls = CURRENT["verified_login_calls"]
+        check(len(calls) == 2, "browser compatibility performs exactly one extra exchange")
+        first, second = [call["kwargs"] for call in calls]
+        check(first["cookies"].get("sdkVersion") == "3.9" and "sdkVersion" not in second["cookies"],
+              "browser exchange removes the SDK marker")
+        check(second["cookies"] == {"deviceId": "wb_browser", "userId": "browser-user", "passToken": "browser-pass"},
+              "browser exchange keeps the supplied account and browser device identity")
+        check(second["headers"]["User-Agent"].startswith("Mozilla/5.0"), "browser exchange uses a browser user agent")
+        check(second.get("allow_redirects") is False and "ssl" not in second and second.get("data") is None,
+              "compatibility keeps TLS verification, refuses redirects and never sends a password")
+        check(json.loads(h.token_path.read_text(encoding="utf-8"))["passToken"] == "rotated-pass",
+              "a successful manual exchange persists the rotated passToken")
+        check("browser-pass" not in h.log.joined() and "rotated-pass" not in h.log.joined(),
+              "compatibility diagnostics never log token values")
+    finally:
+        h.cleanup()
+    for code in (70016, 87001, 20003):
+        h = Harness()
+        try:
+            CURRENT["login_script"] = [{"code": code}, {"code": code}]
+            before = h.snapshot_data()
+            data = cookie_login(h, "userId=u; passToken=p; deviceId=wb_browser")
+            check(data.get("ok") is False and data.get("code") == code, "a failed exchange retains its final business code")
+            check(len(CURRENT["verified_login_calls"]) == (2 if code == 70016 else 1),
+                  "only explicit 70016 permits one compatibility retry")
+            check(h.snapshot_data() == before, "failed browser compatibility preserves all saved files")
+        finally:
+            h.cleanup()
+    h = Harness()
+    try:
+        CURRENT["login_script"] = [{"code": 0, "userId": "other-user", "passToken": "other-pass"}]
+        before = h.snapshot_data()
+        data = cookie_login(h, "userId=u; passToken=p")
+        check(data.get("action") == "identity_mismatch" and h.snapshot_data() == before,
+              "manual cookie exchange refuses cross-account credentials without writing")
+    finally:
+        h.cleanup()
+    ok("cookie browser compatibility: bounded retry, no password, rotated credentials, explicit failures")
 
 
 def scenario_cookie_login_errors():
@@ -3128,6 +3176,7 @@ def main():
         scenario_untrusted_hop_diagnostics,
         scenario_confirm_from_query,
         scenario_cookie_login,
+        scenario_cookie_browser_compatibility,
         scenario_cookie_login_errors,
         scenario_cookie_login_clears_otp,
         scenario_legacy_message,

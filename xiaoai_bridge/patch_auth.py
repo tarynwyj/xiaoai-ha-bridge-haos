@@ -2510,7 +2510,7 @@ def _otp_json(raw) -> dict:
 
 async def _mi_service_login_verified(session, uri: str, data: dict | None = None,
                                      device_id: str = "", token: dict | None = None,
-                                     user_agent: str = "") -> dict:
+                                     user_agent: str = "", browser_session: bool = False) -> dict:
     '''Replica of MiAccount._serviceLogin (miservice_fork 2.9.3) with TLS verified.
 
     The pinned dependency turns certificate verification OFF inside
@@ -2538,6 +2538,11 @@ async def _mi_service_login_verified(session, uri: str, data: dict | None = None
         cookies["passToken"] = str(state.get("passToken") or "")
     url = OTP_ACCOUNT_BASE + "/pass/" + uri
     headers = {"User-Agent": user_agent or OTP_USER_AGENT}
+    if browser_session:
+        # Manual browser cookies can be rejected when labelled as Passport SDK
+        # credentials. Keep the original deviceId, but omit the SDK marker.
+        cookies.pop("sdkVersion", None)
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with session.request(
@@ -3845,7 +3850,25 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
             )
             code = _otp_int(resp.get("code"), -1)
             exchange_code = code
+            if code == 70016:
+                # One bounded compatibility attempt, only for an explicit
+                # rejection. Never retry network errors, challenges or success.
+                log.info("Cookie 登录：SDK 格式被拒绝，尝试浏览器会话格式（仅一次）")
+                resp = await _mi_service_login_verified(
+                    session, "serviceLogin?sid=micoapi&_json=true",
+                    device_id=device_id, token=token, browser_session=True,
+                )
+                code = _otp_int(resp.get("code"), -1)
+                exchange_code = code
             if code == 0:
+                returned_user = str(resp.get("userId") or user_id)
+                if returned_user != user_id:
+                    return {"ok": False, "action": "identity_mismatch",
+                            "msg": "换票返回的账号与输入 userId 不一致，本次凭据未保存"}
+                rotated_pass = str(resp.get("passToken") or "").strip()
+                if rotated_pass:
+                    pass_token = rotated_pass
+                    token["passToken"] = rotated_pass
                 location = str(resp.get("location") or "")
                 nonce = str(resp.get("nonce") or "")
                 ssecurity_resp = str(resp.get("ssecurity") or "")

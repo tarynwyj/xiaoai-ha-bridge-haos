@@ -139,6 +139,11 @@ def main() -> int:
 
         page.route("**/api/**", api)
 
+    def choose_devices(page, *ids):
+        page.locator('button[onclick="scheduleClearDevices()"]').click()
+        for entity in ids:
+            page.locator('#sch-device input[value="' + entity + '"]').check()
+
     def preview(page):
         return page.eval_on_selector("#sch-preview", "el => el.textContent")
 
@@ -163,11 +168,11 @@ def main() -> int:
             page.click('.sidebar-item[data-page="schedules"]')
             page.click('button[onclick="scheduleFormToggle()"]')
             page.wait_for_function(
-                "() => document.querySelectorAll('#sch-device option').length > 1")
+                "() => document.querySelectorAll('#sch-device input').length > 1")
 
             # ── the picker only offers controllable devices ──
             options = page.eval_on_selector_all(
-                "#sch-device option", "els => els.map(e => e.textContent.trim())")
+                '#sch-device label', 'els => els.map(e => e.textContent.trim())')
             result.check("the sensor is not offered",
                          not any("温度" in o for o in options), options)
             result.check("the light is offered", any("客厅主灯" in o for o in options), options)
@@ -181,22 +186,50 @@ def main() -> int:
             page.select_option("#sch-area", "kitchen")
             page.wait_for_timeout(150)
             kitchen = page.eval_on_selector_all(
-                "#sch-device option", "els => els.map(e => e.value)")
+                "#sch-device input", "els => els.map(e => e.value)")
             result.check("the kitchen filter keeps only kitchen devices",
                          "light.keting" in kitchen and "switch.reshui" in kitchen
                          and "cover.window" not in kitchen, kitchen)
             page.select_option("#sch-area", "bedroom")
             page.wait_for_timeout(150)
             bedroom = page.eval_on_selector_all(
-                "#sch-device option", "els => els.map(e => e.value)")
+                "#sch-device input", "els => els.map(e => e.value)")
             result.check("the bedroom filter keeps only bedroom devices",
                          "cover.window" in bedroom and "light.keting" not in bedroom,
                          bedroom)
             page.select_option("#sch-area", "")
             page.wait_for_timeout(120)
 
+            # Selection survives filters, and incompatible targets cannot post.
+            choose_devices(page, "switch.reshui")
+            page.select_option("#sch-area", "bedroom")
+            page.locator('#sch-device input[value="cover.window"]').check()
+            result.eq("cross-room selection keeps both targets", page.evaluate('scheduleDeviceIds'),
+                      ['switch.reshui', 'cover.window'])
+            posted.clear()
+            page.click('#sch-create')
+            result.eq("incompatible device actions never post a task", len(posted), 0)
+            result.check("incompatible actions explain how to split the task", '共同操作' in page.inner_text('#schedules-alert'))
+            page.select_option("#sch-area", "")
+            choose_devices(page, "light.keting", "switch.reshui")
+            page.fill('#sch-search', '窗帘')
+            result.eq("search never drops hidden selected devices", page.evaluate('scheduleDeviceIds'),
+                      ['light.keting', 'switch.reshui'])
+            page.fill('#sch-search', '')
+            result.eq("selected checkboxes return after clearing search", page.locator('#sch-device input:checked').count(), 2)
+            page.evaluate("haServiceCache.light=['turn_on'];scheduleRenderActions()")
+            result.eq("mixed actions respect HA's available service catalogue",
+                      page.locator('input[name=sch-action]').evaluate_all('els => els.map(e => e.value)'), ['turn_on'])
+            page.evaluate("haServiceCache={};scheduleRenderActions()")
+            page.click('button[onclick="scheduleClearDevices()"]')
+            page.select_option('#sch-area', 'kitchen')
+            page.click('button[onclick="scheduleSelectVisible()"]')
+            result.eq("select visible respects the room filter", page.evaluate('scheduleDeviceIds'),
+                      ['light.keting', 'switch.reshui'])
+            page.select_option('#sch-area', '')
+
             # ── pick 热水器 + 打开 + 每天 07:30 ──
-            page.select_option("#sch-device", "switch.reshui")
+            choose_devices(page, "switch.reshui")
             page.wait_for_timeout(80)
             actions = page.eval_on_selector_all(
                 "input[name=sch-action]", "els => els.map(e => e.value)")
@@ -228,10 +261,26 @@ def main() -> int:
                                                                 "el => el.innerText")
                          .replace("turn_on", "", 0) or True)
 
+            # ── multiple compatible devices create one array-target task ──
+            page.click('button[onclick="scheduleFormToggle()"]')
+            choose_devices(page, 'light.keting', 'switch.reshui')
+            page.fill('#sch-time', '07:45')
+            page.dispatch_event('#sch-time', 'change')
+            page.select_option('#sch-days', 'daily')
+            result.check("multi-device preview names both devices",
+                         '客厅主灯' in preview(page) and '热水器' in preview(page))
+            posted.clear()
+            page.click('#sch-create')
+            page.wait_for_timeout(300)
+            result.eq("multi-device creation sends one task", len(posted), 1)
+            result.eq("multi-device creation preserves a target array", (posted[0] if posted else {}).get('entity_id'),
+                      ['light.keting', 'switch.reshui'])
+            result.eq("mixed compatible domains use the HA generic service", (posted[0] if posted else {}).get('domain'), 'homeassistant')
+
             # ── custom weekdays ──
             page.click('button[onclick="scheduleFormToggle()"]')
             page.wait_for_timeout(100)
-            page.select_option("#sch-device", "light.keting")
+            choose_devices(page, "light.keting")
             page.wait_for_timeout(80)
             page.select_option("#sch-days", "custom")
             page.wait_for_timeout(80)
@@ -250,7 +299,7 @@ def main() -> int:
             # ── one-shot task: date field + once flag ──
             page.click('button[onclick="scheduleFormToggle()"]')
             page.wait_for_timeout(150)
-            page.select_option("#sch-device", "switch.reshui")
+            choose_devices(page, "switch.reshui")
             page.wait_for_timeout(100)
             page.select_option("#sch-days", "once")
             page.wait_for_timeout(100)
@@ -275,7 +324,7 @@ def main() -> int:
             # ── no device: refuse locally, never post ──
             page.click('button[onclick="scheduleFormToggle()"]')
             page.wait_for_timeout(100)
-            page.select_option("#sch-device", "")
+            choose_devices(page)
             posted.clear()
             page.click("#sch-create")
             page.wait_for_timeout(200)
@@ -286,7 +335,7 @@ def main() -> int:
                          page.eval_on_selector("#schedules-alert", "el => el.textContent"))
 
             # ── a failing HA keeps the form open ──
-            page.select_option("#sch-device", "switch.reshui")
+            choose_devices(page, "switch.reshui")
             page.wait_for_timeout(80)
             state["fail_create"] = True
             posted.clear()
@@ -352,7 +401,7 @@ def main() -> int:
                          page.inner_text("#sch-edit-banner"))
             result.eq("the time is prefilled", page.input_value("#sch-time"), "07:30")
             result.eq("the device is prefilled",
-                      page.input_value("#sch-device"), "switch.reshui")
+                      page.locator('#sch-device input:checked').get_attribute('value'), 'switch.reshui')
             page.fill("#sch-time", "08:45")
             page.dispatch_event("#sch-time", "change")
             posted.clear()
@@ -373,15 +422,16 @@ def main() -> int:
                 editSchedule('xiaoai_bridge_multi');
             }""")
             page.wait_for_timeout(400)
-            result.check("editing multiple targets opens advanced mode",
-                         page.eval_on_selector('#sch-advanced', 'el => el.open'))
+            result.check("editing multiple targets stays in the checkbox form",
+                         not page.eval_on_selector('#sch-advanced', 'el => el.open'))
             result.eq("editing keeps both targets in the entity field",
                       page.input_value('#sch-entity'), 'light.kitchen,light.study_desk')
+            result.eq("editing shows both retained targets as checked", page.locator('#sch-device input:checked').count(), 2)
             updated.clear()
             page.click('#sch-create')
             page.wait_for_timeout(400)
             result.eq("saving a multi-target edit keeps both target ids",
-                      (updated[0] if updated else {}).get('entity_id'), 'light.kitchen,light.study_desk')
+                      (updated[0] if updated else {}).get('entity_id'), ['light.kitchen', 'light.study_desk'])
             result.eq("reading the list never calls cleanup", cleanups, [])
             page.locator('button[onclick="cleanupSchedules()"]').click()
             page.wait_for_timeout(400)

@@ -2510,7 +2510,9 @@ def _otp_json(raw) -> dict:
 
 async def _mi_service_login_verified(session, uri: str, data: dict | None = None,
                                      device_id: str = "", token: dict | None = None,
-                                     user_agent: str = "") -> dict:
+                                     user_agent: str = "",
+                                     cookies_override: dict | None = None,
+                                     capture: dict | None = None) -> dict:
     '''Replica of MiAccount._serviceLogin (miservice_fork 2.9.3) with TLS verified.
 
     The pinned dependency turns certificate verification OFF inside
@@ -2525,17 +2527,24 @@ async def _mi_service_login_verified(session, uri: str, data: dict | None = None
     never sends such an override.
     '''
     state = token if isinstance(token, dict) else {}
-    cookies = {
-        "sdkVersion": "3.9",
-        "deviceId": str(device_id or state.get("deviceId") or ""),
-    }
-    # 不知道 passToken 时绝不要发一个空的：aiohttp 合并显式 cookies 与会话 CookieJar 时
-    # 同名键由显式值覆盖，空串会把验证链刚写进 Jar 的 passToken 抹掉，restore 请求就
-    # 变成匿名请求（真机「验证码已通过，但恢复登录失败」的根因）。参考实现
-    # miservice 3.0.1 的 _serviceLogin 同样只在已知时才发 userId/passToken。
-    if str(state.get("passToken") or "").strip():
-        cookies["userId"] = str(state.get("userId") or "")
-        cookies["passToken"] = str(state.get("passToken") or "")
+    if cookies_override is not None:
+        # 有界形状探测用：参考实现（@mi-gpt/miot）只发 userId/deviceId/passToken
+        # 这三个 cookie，不带 sdkVersion。空值绝不能发，否则会把会话 Jar 里的同名
+        # 值盖成空串（见下面 passToken 的注释）。
+        cookies = {str(key): str(value) for key, value in cookies_override.items()
+                   if str(value)}
+    else:
+        cookies = {
+            "sdkVersion": "3.9",
+            "deviceId": str(device_id or state.get("deviceId") or ""),
+        }
+        # 不知道 passToken 时绝不要发一个空的：aiohttp 合并显式 cookies 与会话 CookieJar 时
+        # 同名键由显式值覆盖，空串会把验证链刚写进 Jar 的 passToken 抹掉，restore 请求就
+        # 变成匿名请求（真机「验证码已通过，但恢复登录失败」的根因）。参考实现
+        # miservice 3.0.1 的 _serviceLogin 同样只在已知时才发 userId/passToken。
+        if str(state.get("passToken") or "").strip():
+            cookies["userId"] = str(state.get("userId") or "")
+            cookies["passToken"] = str(state.get("passToken") or "")
     url = OTP_ACCOUNT_BASE + "/pass/" + uri
     headers = {"User-Agent": user_agent or OTP_USER_AGENT}
     timeout = aiohttp.ClientTimeout(total=15)
@@ -2549,6 +2558,10 @@ async def _mi_service_login_verified(session, uri: str, data: dict | None = None
             timeout=timeout,
             allow_redirects=False,
         ) as resp:
+            if capture is not None:
+                capture["status"] = int(resp.status)
+                capture["contentType"] = str(
+                    (getattr(resp, "headers", None) or {}).get("Content-Type") or "")
             raw = await resp.read()
     except OtpFlowError:
         raise
@@ -3701,6 +3714,10 @@ class CookieLoginRequest(BaseModel):
     cookie_text: str = ""
 
 
+class CookieTicketRequest(BaseModel):
+    text: str = ""
+
+
 @app.post("/api/test/xiaomi/otp/start")
 async def xiaomi_otp_start(req: OtpStartRequest):
     '''Password login; when Xiaomi asks for a second factor, open an OTP session.'''
@@ -3819,6 +3836,7 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
     ssecurity = ""
     exchange_code = None
     exchange_problem = ""
+    exchange_detail = {}
     try:
         from miservice.miaccount import get_random
         if not device_id:
@@ -3835,6 +3853,8 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
         }
         log.info("Cookie 登录：用 userId/passToken 换取 micoapi serviceToken")
         token = account.token
+        capture = {}
+        fallback_note = ""
         try:
             # 契约：先预置 userId/passToken/deviceId，服务端才认这次换取；
             # 请求本身走本地 helper，避免继承依赖里关闭证书校验的行为。
@@ -3842,9 +3862,27 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                 session, "serviceLogin?sid=micoapi&_json=true",
                 device_id=device_id, token=token,
                 user_agent=str(getattr(account, "now_ua", "") or ""),
+                capture=capture,
             )
             code = _otp_int(resp.get("code"), -1)
             exchange_code = code
+            if code == 70016 and not pasted_service_token:
+                # 有界兜底：换一种「客户端形状」再问一次小米，然后停下。
+                # 这不是对同一张票无脑重试：参考实现 @mi-gpt/miot 只发
+                # userId/deviceId/passToken 三个 cookie 且用米家 App UA，
+                # 用它区分「票被拒」和「客户端指纹被拒」。
+                log.info("Cookie 登录：标准形状被拒绝，尝试一次最小 cookie 形状")
+                minimal = await _cookie_login_minimal_attempt(
+                    session, user_id, pass_token, device_id)
+                exchange_detail["minimal_shape"] = minimal.get("detail") or {}
+                if minimal.get("ok"):
+                    resp = minimal.get("resp") or {}
+                    code = 0
+                    exchange_code = 0
+                    log.info("Cookie 登录：最小 cookie 形状换取成功")
+                else:
+                    log.info("Cookie 登录：最小 cookie 形状同样被拒绝 (code=%s)",
+                             minimal.get("code"))
             if code == 0:
                 location = str(resp.get("location") or "")
                 nonce = str(resp.get("nonce") or "")
@@ -3860,12 +3898,50 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                     exchange_problem = "小米返回的登录票据不完整（缺少 STS 参数）"
                     log.info("Cookie 登录：换取响应缺少 STS 参数，未取得 serviceToken")
             else:
-                log.info("Cookie 登录：换取请求被拒绝 (code=%s)", code)
+                exchange_detail.update(
+                    _cookie_exchange_detail(code, resp, capture.get("status")))
+                exchange_problem = _cookie_exchange_message(code, exchange_detail)
+                log.info(
+                    "Cookie 登录：换取请求被拒绝 (code=%s, description=%s, "
+                    "securityStatus=%s, requiresPasswordAuth=%s, needsVerification=%s, "
+                    "httpStatus=%s)",
+                    code,
+                    exchange_detail.get("description", ""),
+                    exchange_detail.get("securityStatus"),
+                    bool(exchange_detail.get("requiresPasswordAuth")),
+                    bool(exchange_detail.get("needsVerification")),
+                    exchange_detail.get("httpStatus"),
+                )
+        except OtpFlowError as e:
+            status = capture.get("status")
+            exchange_detail["error"] = str(e.code)
+            exchange_detail["httpStatus"] = status
+            if e.code == "bad_json":
+                if isinstance(status, int) and 300 <= status < 400:
+                    exchange_problem = (
+                        "小米账号服务返回了重定向（HTTP %s，通常是要求二次验证），"
+                        "插件没有跟随；请改用「浏览器代签」把验证后的票据交给插件" % status)
+                elif isinstance(status, int) and status >= 400:
+                    exchange_problem = "小米账号服务返回 HTTP %s，换票请求被拒绝" % status
+                else:
+                    exchange_problem = (
+                        "小米账号服务返回了非 JSON 响应（HTTP %s），无法换取凭据" % status)
+            else:
+                exchange_problem = "换票请求未完成（网络错误），请检查网络或稍后重试"
+            log.warning("Cookie 登录：换取 serviceToken 失败 (code=%s, status=%s)",
+                        e.code, status)
         except Exception as e:
+            exchange_detail["error"] = type(e).__name__
             exchange_problem = "换票请求未完成（" + type(e).__name__ + "），请检查网络或稍后重试"
             log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
         if not service_token and pasted_service_token:
             log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
+            # 兜底保存的 passToken 从未通过校验：等浏览器 serviceToken 到期，换票还会
+            # 被拒。必须当场说清楚，否则用户几天后只会看到「登录已过期」。
+            log.warning("Cookie 登录：passToken 换票被小米拒绝，本次保存的 passToken "
+                        "未经校验；浏览器 serviceToken 到期后需要重新登录")
+            fallback_note = ("；注意：passToken 换票被小米拒绝，当前只能用浏览器的 "
+                             "serviceToken 临时运行，它到期后需要重新登录")
             service_token = pasted_service_token
             ssecurity = pasted_ssecurity
         if not service_token:
@@ -3873,9 +3949,15 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                 "ok": False,
                 "action": "exchange_failed",
                 "code": exchange_code,
-                "msg": (exchange_problem or ("小米拒绝用该 Cookie 换取音箱登录凭据（code=%s）" % exchange_code))
+                "detail": exchange_detail,
+                "msg": (exchange_problem
+                        or ("小米拒绝用该 Cookie 换取音箱登录凭据（code=%s）" % exchange_code))
                        + "；尚未保存本次凭据。请确认 userId、passToken 来自同一登录会话，"
-                         "并填写该会话的 deviceId（若有）；仍被拒绝可改用扫码登录。不能仅凭此错误判定 Cookie 已过期",
+                         "并填写该会话的 deviceId（若有）；仍被拒绝可改用扫码登录。"
+                         "不能仅凭此错误判定 Cookie 已过期。下一步：在已登录的浏览器打开 "
+                         "https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true "
+                         "——若返回 code 0，点「浏览器代签」把整段返回粘进来；若浏览器也返回 "
+                         "70016，说明这张票或该来源已被小米拒绝，请重新登录浏览器或改用扫码登录",
             }
         creds = {
             "userId": user_id,
@@ -3902,7 +3984,8 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
             "verified": True,
             "devices": devices,
             "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
-                                       else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+                                       else "，但未发现小爱音箱设备（可在设备列表页重试）")
+                   + fallback_note,
         }
     finally:
         if session is not None:
@@ -3910,6 +3993,337 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                 await session.close()
             except Exception:
                 pass
+
+
+# ──────────────── Cookie 登录诊断与「浏览器代签」（1.0.19） ────────────────
+# 70016 是小米在 serviceLogin 换票这一步对「票 + 账号 + 客户端指纹 + 来源」的裁决，
+# 不是本地参数缺失：补 deviceId、换 UA 都改不了结论。能改的只有两件事：
+#   ① 把小米返回的 description/securityStatus/qs 记下来，别再只会说「Cookie 可能过期」；
+#   ② 换一条路径——让已经登录的浏览器去签 serviceLogin，插件只做 clientSign + STS，
+#      换票请求根本不从加载项发出。
+
+COOKIE_TICKET_MAX_TEXT = 64 * 1024
+COOKIE_TICKET_LOGIN_URL = (
+    "https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&_json=true"
+)
+# 参考实现 miservice 3.0.1 的登录 UA：米家 App 的 passport SDK。
+XIAOMI_APP_LOGIN_UA = (
+    "APP/com.xiaomi.mihome APPV/11.3.203 iosPassportSDK/4.2.50 "
+    "DEV/aVBob25l DEVS/aU9T L/zh_CN"
+)
+
+
+class CookieTicketError(Exception):
+    '''Typed failure for the browser-signed login ticket path.'''
+
+    def __init__(self, code: str, message: str, detail: dict | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail or {}
+
+
+def _cookie_pass_token_problem(token: str) -> str:
+    '''Reject pasted values that cannot be a passToken before calling Xiaomi.'''
+    text = str(token or "")
+    if not text.strip():
+        return "passToken 为空"
+    if any(ch.isspace() for ch in text):
+        return "passToken 里含空格或换行，复制时被截断了"
+    if text.lower().startswith(("http://", "https://")):
+        return "passToken 位置粘贴的是网址，不是 token"
+    if "userId=" in text or "passToken=" in text:
+        return "passToken 位置粘贴的是整段 Cookie，请只填 token 本身"
+    if len(text) < 16 or len(text) > 4096:
+        return "passToken 长度异常（%d 字符），请确认复制完整" % len(text)
+    return ""
+
+
+def _cookie_exchange_detail(code, resp, http_status=None) -> dict:
+    '''Non-secret diagnostics for one serviceLogin exchange attempt.'''
+    detail = {"code": code}
+    if isinstance(resp, dict):
+        description = str(resp.get("description") or resp.get("desc") or "").strip()
+        if description:
+            detail["description"] = _mask_secret_text(description)[:120]
+        if resp.get("securityStatus") not in (None, ""):
+            detail["securityStatus"] = resp.get("securityStatus")
+        if resp.get("qs") or resp.get("_sign"):
+            detail["requiresPasswordAuth"] = True
+        if resp.get("notificationUrl"):
+            detail["needsVerification"] = True
+        if resp.get("location"):
+            detail["hasLocation"] = True
+    if http_status is not None:
+        detail["httpStatus"] = http_status
+    return detail
+
+
+def _cookie_exchange_message(code, detail: dict) -> str:
+    '''One honest sentence for a rejected exchange; keeps the legacy prefix.'''
+    description = str((detail or {}).get("description") or "").strip()
+    suffix = ("（小米说明：" + description + "）") if description else ""
+    if code == 70016:
+        return "小米拒绝用该 Cookie 换取音箱登录凭据（code=70016）" + suffix
+    return "小米拒绝用该 Cookie 换取音箱登录凭据（code=%s）%s" % (code, suffix)
+
+
+async def _cookie_login_minimal_attempt(session, user_id: str, pass_token: str,
+                                        device_id: str) -> dict:
+    '''One bounded retry with the minimal cookie set known to accept a passToken.
+
+    @mi-gpt/miot, the other implementation documented to work with a passToken
+    copied from a browser, sends only userId/deviceId/passToken (no sdkVersion)
+    with the MiHome app UA. Trying that shape exactly once tells us whether the
+    rejection is about the client fingerprint. It must never loop.
+    '''
+    capture = {}
+    minimal = {"userId": user_id, "deviceId": device_id, "passToken": pass_token}
+    try:
+        resp = await _mi_service_login_verified(
+            session, "serviceLogin?sid=micoapi&_json=true",
+            device_id=device_id, token=minimal, user_agent=XIAOMI_APP_LOGIN_UA,
+            cookies_override=minimal, capture=capture,
+        )
+    except OtpFlowError as e:
+        return {
+            "attempted": True, "ok": False, "code": str(e.code),
+            "detail": {"error": str(e.code), "httpStatus": capture.get("status")},
+        }
+    code = _otp_int(resp.get("code"), -1)
+    return {
+        "attempted": True,
+        "ok": code == 0,
+        "code": code,
+        "resp": resp,
+        "detail": _cookie_exchange_detail(code, resp, capture.get("status")),
+    }
+
+
+def _iter_json_objects(text: str):
+    '''Yield every balanced {...} slice of text, in order.
+
+    The pasted payload may be a bare JSON body, the "&&&START&&&" prefixed body,
+    or the whole page. String literals and escapes are respected, so a brace in a
+    URL or a message never truncates the object.
+    '''
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        closed = -1
+        for index in range(start, len(text)):
+            ch = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    closed = index
+                    break
+        if closed < 0:
+            return
+        yield text[start:closed + 1]
+        start = text.find("{", closed + 1)
+
+
+def _parse_cookie_ticket(text: str) -> dict:
+    '''Parse the browser serviceLogin response pasted by the user.'''
+    raw = str(text or "").strip()
+    if not raw:
+        raise CookieTicketError("empty", "请粘贴浏览器里 serviceLogin 返回的整段内容")
+    if len(raw) > COOKIE_TICKET_MAX_TEXT:
+        raise CookieTicketError(
+            "too_large", "粘贴内容过大（超过 64 KB），请只复制返回的那一行 JSON")
+    if raw.lower().startswith(("http://", "https://")):
+        raise CookieTicketError(
+            "wrong_field", "这一栏要粘贴返回内容（形如 &&&START&&&{...}），不是网址")
+    body = raw[len(OTP_JSON_PREFIX):].strip() if raw.startswith(OTP_JSON_PREFIX) else raw
+    payload = None
+    try:
+        parsed = json.loads(body)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        payload = parsed
+    if payload is None:
+        for candidate in _iter_json_objects(body):
+            try:
+                parsed = json.loads(candidate)
+            except Exception:
+                continue
+            if isinstance(parsed, dict) and ("code" in parsed or "location" in parsed):
+                payload = parsed
+                break
+    if not isinstance(payload, dict):
+        raise CookieTicketError(
+            "bad_json", "没有从粘贴内容里解析出登录响应（不是预期的 JSON），请确认复制了整段返回")
+    code = _otp_int(payload.get("code"), -1)
+    if code != 0:
+        raise CookieTicketError(
+            "rejected",
+            "浏览器返回的登录响应不是成功状态（code=%s）" % code,
+            detail=_cookie_exchange_detail(code, payload),
+        )
+    missing = [key for key in ("location", "nonce", "ssecurity")
+               if not str(payload.get(key) or "").strip()]
+    if missing:
+        raise CookieTicketError(
+            "incomplete", "登录响应缺少 " + "、".join(missing) + "，请重新复制整段返回")
+    return payload
+
+
+def _ticket_client_sign(nonce, ssecurity: str) -> str:
+    '''clientSign = base64(sha1("nonce=<nonce>&<ssecurity>")).'''
+    import base64
+    import hashlib
+    nsec = "nonce=" + str(nonce) + "&" + str(ssecurity)
+    return base64.b64encode(hashlib.sha1(nsec.encode()).digest()).decode()
+
+
+def _ticket_sts_url(location: str, nonce, ssecurity: str) -> str:
+    '''Validate the one-time ticket and append _userIdNeedEncrypt/clientSign.'''
+    from urllib.parse import quote
+    sts = _validate_sts_url(location)
+    joiner = "&" if "?" in sts else "?"
+    return (sts + joiner + "_userIdNeedEncrypt=true&clientSign="
+            + quote(_ticket_client_sign(nonce, ssecurity), safe=""))
+
+
+def _response_cookie_values(resp) -> dict:
+    '''Cookie values of one response, tolerating dicts and aiohttp morsels.'''
+    try:
+        items = list((getattr(resp, "cookies", None) or {}).items())
+    except Exception:
+        return {}
+    values = {}
+    for key, morsel in items:
+        value = getattr(morsel, "value", morsel)
+        if value:
+            values[str(key)] = str(value)
+    return values
+
+
+async def _exchange_ticket_service_token(sts_url: str) -> str:
+    '''Exchange a signed STS URL for the micoapi serviceToken cookie.'''
+    session = aiohttp.ClientSession()
+    status = 0
+    served = {}
+    try:
+        try:
+            async with session.get(
+                sts_url, timeout=aiohttp.ClientTimeout(total=15), allow_redirects=False
+            ) as resp:
+                status = int(getattr(resp, "status", 0) or 0)
+                served = _response_cookie_values(resp)
+                await resp.read()
+        except Exception as e:
+            log.warning("Cookie 代签：访问小米令牌端点失败 (%s)", type(e).__name__)
+            raise CookieTicketError(
+                "sts_network", "访问小米令牌端点失败（网络错误），请重试") from None
+    finally:
+        try:
+            await session.close()
+        except Exception:
+            pass
+    token = str(served.get("serviceToken") or "").strip()
+    if token:
+        return token
+    if 300 <= status < 400:
+        raise CookieTicketError(
+            "sts_redirect", "小米令牌端点返回重定向（HTTP %s），已拒绝跟随" % status)
+    raise CookieTicketError(
+        "sts_http",
+        "小米令牌端点返回 HTTP %s，没有返回 serviceToken"
+        "（票据可能已过期，或该来源不被接受）" % status,
+    )
+
+
+@app.post("/api/test/xiaomi/cookie-ticket")
+async def xiaomi_cookie_ticket(req: CookieTicketRequest):
+    '''Finish a login with a ticket signed by the user's own browser.
+
+    The browser performs the step Xiaomi judges (serviceLogin); the bridge only
+    computes clientSign and calls the STS endpoint, so no exchange request ever
+    leaves the add-on's own IP/client fingerprint.
+    '''
+    try:
+        payload = _parse_cookie_ticket(str(getattr(req, "text", "") or ""))
+        sts_url = _ticket_sts_url(
+            str(payload.get("location") or ""),
+            payload.get("nonce"),
+            str(payload.get("ssecurity") or ""),
+        )
+    except CookieTicketError as e:
+        log.info("Cookie 代签：票据不可用 (code=%s)", e.code)
+        return {"ok": False, "action": e.code, "msg": e.message, "detail": e.detail}
+    saved = _load_saved_xiaomi_identity() or {}
+    try:
+        adopted = _adopt_login_identity(
+            payload, str(saved.get("userId") or ""), str(saved.get("passToken") or ""))
+    except CredentialIdentityMismatch as e:
+        log.warning("Cookie 代签：账号不一致，已拒绝写入")
+        return {
+            "ok": False,
+            "action": "identity_mismatch",
+            "msg": str(e) + "；如确实要换账号，请先点「清除登录凭据」再登录",
+        }
+    device_id = str(saved.get("deviceId") or "").strip()
+    if not device_id:
+        from miservice.miaccount import get_random
+        device_id = get_random(16).upper()
+    try:
+        service_token = await _exchange_ticket_service_token(sts_url)
+    except CookieTicketError as e:
+        log.warning("Cookie 代签：STS 交换失败 (code=%s)", e.code)
+        return {"ok": False, "action": e.code, "msg": e.message, "detail": e.detail}
+    creds = {
+        "userId": adopted["userId"],
+        "passToken": adopted["passToken"],
+        "deviceId": device_id,
+        "ssecurity": str(payload.get("ssecurity") or "").strip(),
+        "serviceToken": service_token,
+    }
+    missing = _missing_credentials(creds)
+    if missing:
+        return {
+            "ok": False,
+            "action": "incomplete",
+            "msg": "票据里缺少 " + "、".join(missing) + "，请重新复制整段返回",
+        }
+    try:
+        devices = await _probe_devices_with_token("", "", creds)
+    except SmsVerifyError as e:
+        log.warning("Cookie 代签：设备校验失败 (code=%s)", e.code)
+        return {"ok": False, "action": e.code, "msg": e.message}
+    try:
+        _persist_sms_credentials(creds)
+    except Exception as e:
+        log.warning("Cookie 代签：保存凭据失败 (%s)", type(e).__name__)
+        return {"ok": False, "action": "persist_failed",
+                "msg": "票据校验通过，但保存凭据失败，请重试"}
+    await _reset_otp_state()
+    devices = list(devices or [])
+    log.info("Cookie 代签成功，发现 %d 台设备", len(devices))
+    return {
+        "ok": True,
+        "verified": True,
+        "rotated": bool(adopted.get("rotated")),
+        "devices": devices,
+        "msg": "浏览器代签成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
+                                   else "，但未发现小爱音箱设备（可在设备列表页重试）"),
+    }
 # ──────────────── HA 设备列表 ────────────────
 """,
 )
@@ -5527,38 +5941,6 @@ replace_exact(
                                 relogin_backoff = min(relogin_backoff * 2,
                                                       RELOGIN_BACKOFF_MAX)
                         continue
-""",
-)
-
-replace_exact(
-    "a fallback cookie login warns that the passToken was never accepted",
-    """        if not service_token and pasted_service_token:
-            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
-            service_token = pasted_service_token
-            ssecurity = pasted_ssecurity
-""",
-    """        fallback_note = ""
-        if not service_token and pasted_service_token:
-            log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
-            # 兜底保存的 passToken 从未通过校验：等浏览器 serviceToken 到期，换票还会
-            # 被拒。必须当场说清楚，否则用户几天后只会看到「登录已过期」。
-            log.warning("Cookie 登录：passToken 换票被小米拒绝，本次保存的 passToken "
-                        "未经校验；浏览器 serviceToken 到期后需要重新登录")
-            fallback_note = ("；注意：passToken 换票被小米拒绝，当前只能用浏览器的 "
-                             "serviceToken 临时运行，它到期后需要重新登录")
-            service_token = pasted_service_token
-            ssecurity = pasted_ssecurity
-""",
-)
-
-replace_exact(
-    "fallback cookie login reports the warning to the caller",
-    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
-                                       else "，但未发现小爱音箱设备（可在设备列表页重试）"),
-""",
-    """            "msg": "Cookie 登录成功" + ("，发现 " + str(len(devices)) + " 台设备" if devices
-                                       else "，但未发现小爱音箱设备（可在设备列表页重试）")
-                   + fallback_note,
 """,
 )
 

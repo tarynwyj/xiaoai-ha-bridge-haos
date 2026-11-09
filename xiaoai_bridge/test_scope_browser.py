@@ -188,12 +188,14 @@ def main() -> int:
                          page.is_visible("#mi-scope-card"))
             result.check("the all mode is the default",
                          page.is_checked("#mi-scope-mode-all"))
-            result.eq("no checkbox is checked in all mode",
-                      page.eval_on_selector_all(".mi-scope-box", "els => els.filter(e => e.checked).length"), 0)
+            result.eq("all discovered speakers are visibly checked in all mode",
+                      page.eval_on_selector_all(".mi-scope-box", "els => els.filter(e => e.checked).length"), 3)
             result.eq("checkboxes are disabled in all mode",
                       page.eval_on_selector_all(".mi-scope-box", "els => els.filter(e => e.disabled).length"), 3)
             result.check("the status says everything is listened to",
                          "全部" in scope_status(page), scope_status(page))
+            result.check("all mode explains how to enable individual selection",
+                         "仅监听所选音箱" in scope_status(page), scope_status(page))
             result.eq("no device id was pinned into the form",
                       page.input_value("#mi-did"), "")
 

@@ -1130,7 +1130,7 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
     eq("cleanup: concurrent calls send only one HA DELETE", deletes_after - deletes_before, 1)
 
     # The form API must preserve a multi-target array all the way to HA storage.
-    target_ids = ["light.kitchen", "light.study_desk"]
+    target_ids = ["light.kitchen", "light.study_desk", "switch.study_light"]
     multi = client2.post("/api/automations", headers=UI_HEADER, json_body={
         "time": "09:10", "domain": "homeassistant", "service": "turn_on",
         "entity_id": target_ids})

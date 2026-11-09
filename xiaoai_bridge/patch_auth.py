@@ -3817,6 +3817,8 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
     session = None
     service_token = ""
     ssecurity = ""
+    exchange_code = None
+    exchange_problem = ""
     try:
         from miservice.miaccount import get_random
         if not device_id:
@@ -3842,6 +3844,7 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                 user_agent=str(getattr(account, "now_ua", "") or ""),
             )
             code = _otp_int(resp.get("code"), -1)
+            exchange_code = code
             if code == 0:
                 location = str(resp.get("location") or "")
                 nonce = str(resp.get("nonce") or "")
@@ -3854,10 +3857,12 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
                         ssecurity = ssecurity_resp
                         service_token = service
                 else:
+                    exchange_problem = "小米返回的登录票据不完整（缺少 STS 参数）"
                     log.info("Cookie 登录：换取响应缺少 STS 参数，未取得 serviceToken")
             else:
                 log.info("Cookie 登录：换取请求被拒绝 (code=%s)", code)
         except Exception as e:
+            exchange_problem = "换票请求未完成（" + type(e).__name__ + "），请检查网络或稍后重试"
             log.warning("Cookie 登录：换取 serviceToken 失败 (%s)", type(e).__name__)
         if not service_token and pasted_service_token:
             log.info("Cookie 登录：换取未成功，改用粘贴的 serviceToken 兜底")
@@ -3867,8 +3872,10 @@ async def xiaomi_cookie_login(req: CookieLoginRequest):
             return {
                 "ok": False,
                 "action": "exchange_failed",
-                "msg": "用该 Cookie 换取 serviceToken 失败（Cookie 可能已过期或不完整）；"
-                       "如果粘贴内容里带了 serviceToken，请去掉它，只保留 userId 与 passToken 后重试",
+                "code": exchange_code,
+                "msg": (exchange_problem or ("小米拒绝用该 Cookie 换取音箱登录凭据（code=%s）" % exchange_code))
+                       + "；尚未保存本次凭据。请确认 userId、passToken 来自同一登录会话，"
+                         "并填写该会话的 deviceId（若有）；仍被拒绝可改用扫码登录。不能仅凭此错误判定 Cookie 已过期",
             }
         creds = {
             "userId": user_id,
@@ -7050,6 +7057,21 @@ replace_exact(
 )
 
 import ast
+_tree = ast.parse(source)
+# The container executes `python bridge.py`. The upstream blocking server entry
+# must run after every appended helper, override and route has been defined.
+_entrypoints = [
+    node for node in _tree.body
+    if isinstance(node, ast.If)
+    and ast.dump(node.test) == ast.dump(ast.parse('__name__ == "__main__"', mode='eval').body)
+]
+if len(_entrypoints) != 1:
+    raise SystemExit("Expected exactly one top-level __main__ entrypoint")
+_entrypoint = _entrypoints[0]
+_lines = source.splitlines(keepends=True)
+_entry_source = ''.join(_lines[_entrypoint.lineno - 1:_entrypoint.end_lineno])
+source = ''.join(_lines[:_entrypoint.lineno - 1] + _lines[_entrypoint.end_lineno:]).rstrip()
+source += '\n\n\n' + _entry_source.rstrip() + '\n'
 _tree = ast.parse(source)
 _unverified = [
     (getattr(node, 'lineno', '?'), node.func.attr)

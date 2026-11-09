@@ -2220,6 +2220,14 @@ def scenario_cookie_login_errors():
         raised = cookie_login(h, "userId=u; passToken=p")
         check(raised.get("ok") is False and raised.get("action") == "exchange_failed",
               f"an exception in the exchange must be explicit, got {raised}")
+        check("请求未完成" in raised.get("msg", "") and "可能已过期" not in raised.get("msg", ""),
+              "transport failures must not be diagnosed as expired cookies")
+        CURRENT["cookie_login"] = "fail"
+        rejected = cookie_login(h, "userId=u; passToken=p; deviceId=same-browser")
+        check(rejected.get("code") == 70016, "cookie rejection exposes Xiaomi's business code")
+        check("70016" in rejected.get("msg", "") and "尚未保存" in rejected.get("msg", ""),
+              "cookie rejection explains the rejection and preserves saved credentials")
+        check("同一登录会话" in rejected.get("msg", ""), "cookie rejection explains matching browser identity")
         CURRENT["cookie_login"] = "ok"
         ok("cookie errors: unparsable/empty/missing/expired/exchange-failure are all explicit, no writes")
     finally:
@@ -2537,6 +2545,7 @@ def scenario_frontend_behaviour():
         "mi-cookie-text": {"value": ""},
         "mi-cookie-userid": {"value": ""},
         "mi-cookie-passtoken": {"value": ""},
+        "mi-cookie-deviceid": {"value": ""},
         "mi-cookie-submit": {"disabled": False},
         "mi-cookie-status": {"textContent": ""},
     }
@@ -2732,6 +2741,21 @@ def scenario_frontend_behaviour():
               f"a missing field must point at the two inputs, got {payload['cookieStatus']!r}")
         check("passToken" in payload["alert"], "the missing field must be named")
         ok("frontend cookie: a missing userId/passToken field is named without calling Xiaomi")
+    elements = json.loads(json.dumps(base_elements))
+    elements["mi-cookie-userid"]["value"] = "u"
+    elements["mi-cookie-passtoken"]["value"] = "p"
+    elements["mi-cookie-deviceid"]["value"] = "browser-device"
+    rejection = "小米拒绝换票（code=70016）；尚未保存本次凭据，请改用扫码登录"
+    payload = _run_node(script_source, {"ok": False, "action": "exchange_failed", "code": 70016,
+                                      "msg": rejection}, elements, "verifyCookieLogin()", snapshot)
+    if payload:
+        fetches = [call for call in payload["calls"] if call[0] == "fetch"]
+        check(json.loads(fetches[0][3]).get("cookie_text") == "userId=u; passToken=p; deviceId=browser-device",
+              "the cookie form preserves the matching browser deviceId")
+        check(rejection in payload["cookieStatus"] and rejection in payload["alert"],
+              "the inline cookie status preserves the actual server reason and code")
+        check("可能已过期" not in payload["cookieStatus"], "the cookie form never invents an expiry diagnosis")
+        ok("frontend cookie: browser identity and server rejection details are retained")
     return "frontend behaviour verified"
 
 

@@ -116,6 +116,11 @@ def main() -> int:
                                                    "automation_id": "xiaoai_bridge_0730_light"}))
                     return
                 if state["fail_list"]:
+                    if state["fail_list"] in ("plain", "html"):
+                        status = 500 if state["fail_list"] == "plain" else 502
+                        route.fulfill(status=status, content_type="text/plain" if status == 500 else "text/html",
+                                      body="Internal Server Error" if status == 500 else "<html>Bad Gateway</html>")
+                        return
                     route.fulfill(status=502, content_type="application/json",
                                   body=json.dumps({"detail": "无法读取 HA 自动化状态，任务状态未知"}))
                     return
@@ -147,7 +152,7 @@ def main() -> int:
                     return
                 if state["fail_create"] and "500 (Internal Server Error)" in msg.text:
                     return
-                if state["fail_list"] and "502 (Bad Gateway)" in msg.text:
+                if state["fail_list"] and ("502 (Bad Gateway)" in msg.text or "500 (Internal Server Error)" in msg.text):
                     return
                 errors.append(f"console: {msg.text}")
 
@@ -424,6 +429,14 @@ def main() -> int:
                       page.inner_text('#schedule-count'), '状态未知')
             result.check("HA outage leaves an explicit retry message",
                          '暂时未知' in page.inner_text('#schedule-list'))
+            for failure, status in (("plain", 500), ("html", 502)):
+                state['fail_list'] = failure
+                page.evaluate('loadSchedules()')
+                message = page.inner_text('#schedules-alert')
+                result.check("non-JSON error includes HTTP status %s" % status, 'HTTP '+str(status) in message)
+                result.check("non-JSON error names the recovery source", '加载项日志' in message)
+                result.check("non-JSON error never exposes a parser exception",
+                             'Unexpected token' not in message and 'undefined' not in message)
             state['fail_list']=False
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()

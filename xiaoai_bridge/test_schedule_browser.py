@@ -320,23 +320,26 @@ def main() -> int:
             result.check("the row shows the source", "来源: 语音" in joined, joined)
             result.check("the row shows the last trigger", "上次:" in joined, joined)
             result.check("the task HA has not loaded is flagged", "HA 未加载" in joined, joined)
-            pause = page.query_selector_all(
+            # The page periodically replaces list rows. Locators re-resolve
+            # after a refresh; cached ElementHandles can detach before click.
+            pause = page.locator(
                 '#schedule-list button[onclick^="toggleSchedule"]')
-            result.eq("only the loaded task offers pause", len(pause), 1)
+            result.eq("only the loaded task offers pause", pause.count(), 1)
             toggles.clear()
-            if pause:
-                pause[0].click()
+            if pause.count():
+                pause.first.click()
                 page.wait_for_timeout(300)
             result.eq("pausing posts once", len(toggles), 1)
             result.eq("pausing asks HA to disable it",
                       (toggles[0] if toggles else {}).get("enabled"), False)
 
             # ── edit: prefilled form, PUT to the same config id ──
-            edit_buttons = page.query_selector_all(
+            edit_buttons = page.locator(
                 '#schedule-list button[onclick^="editSchedule"]')
-            result.eq("loaded tasks offer edit", len(edit_buttons), 2)
-            if edit_buttons:
-                edit_buttons[0].click()
+            result.eq("loaded tasks offer edit", edit_buttons.count(), 2)
+            if edit_buttons.count():
+                page.evaluate('loadSchedules()')  # force the row replacement race
+                edit_buttons.first.click()
                 page.wait_for_timeout(600)
             result.check("the edit form is open", page.is_visible("#schedule-form"))
             result.check("the edit banner names the task",

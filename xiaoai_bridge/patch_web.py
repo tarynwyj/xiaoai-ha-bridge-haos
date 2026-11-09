@@ -686,6 +686,22 @@ replace_exact(
           <button class="btn btn-primary" id="mi-cookie-submit" onclick="verifyCookieLogin()">&#10003; 验证 Cookie</button>
           <span id="mi-cookie-status" style="font-size:11px;color:var(--txt-muted)"></span>
         </div>
+        <details id="mi-ticket-card" style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-default)">
+          <summary class="card-title" style="font-size:12px;cursor:pointer">&#128273; 浏览器代签（推荐，绕开换票）</summary>
+          <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin:8px 0">
+            换票被小米拒绝（70016）时用这个：让已经登录的浏览器把票签好，插件只做签名交换，换票请求不再由加载项发出。<br>
+            ① 在<b style="color:var(--txt-secondary)">已登录小米</b>的浏览器打开
+            <a href="https://account.xiaomi.com/pass/serviceLogin?sid=micoapi&amp;_json=true" target="_blank" style="color:var(--accent)">serviceLogin?sid=micoapi&amp;_json=true</a><br>
+            ② 把页面上那一整段（形如 <b>&amp;&amp;&amp;START&amp;&amp;&amp;{...}</b>）全选复制<br>
+            ③ 粘到下面 &rarr; 点「代签登录」；只有校验通过才会保存凭据
+          </div>
+          <div class="field"><label>登录响应</label><textarea id="mi-ticket-text" rows="3" placeholder="&amp;&amp;&amp;START&amp;&amp;&amp;{...}"></textarea></div>
+          <div class="input-row" style="margin-top:8px">
+            <button class="btn btn-primary" id="mi-ticket-submit" onclick="verifyCookieTicket()">&#10003; 代签登录</button>
+            <span id="mi-ticket-status" style="font-size:11px;color:var(--txt-muted)"></span>
+          </div>
+          <pre id="mi-ticket-detail" style="display:none;font-size:11px;color:var(--txt-muted);white-space:pre-wrap;word-break:break-all;margin-top:8px"></pre>
+        </details>
         <div id="mi-sts-card" style="margin-top:14px;padding-top:12px;border-top:1px dashed var(--border-default)">
           <div style="font-size:12px;color:var(--txt-muted);line-height:1.8;margin-bottom:8px">
             兼容：粘贴浏览器跳转地址（可能因会话绑定返回 401，不推荐）
@@ -936,6 +952,7 @@ async function verifyCookieLogin(){
     }
     otpText('mi-cookie-status','✗ '+((d&&(d.msg||d.detail))||'Cookie 登录失败，请查看加载项日志'));
     showAlert(alertBox,'err','✗ '+((d&&d.msg)||'Cookie 登录失败'));
+    if(d&&d.action==='exchange_failed'){const card=otpEl('mi-ticket-card');if(card)card.open=true;}
   }catch(e){
     otpText('mi-cookie-status','✗ '+e.message);
     showAlert(alertBox,'err','✗ '+e.message);
@@ -1879,6 +1896,50 @@ replace_exact(
     '<div style="display:flex;gap:8px;margin-bottom:6px"><button type="button" class="btn" onclick="scheduleSelectVisible()">全选当前结果</button><button type="button" class="btn" onclick="scheduleClearDevices()">清空已选</button></div>'
     '<div id="sch-device" style="max-height:200px;overflow:auto;border:1px solid var(--border-default);border-radius:6px">正在读取设备…</div>'
     '<div id="sch-device-selected" style="font-size:12px;color:var(--txt-secondary);margin-top:6px"></div>',
+)
+
+# ════════════════ 浏览器代签：绕开「服务器换票被小米拒绝」（1.0.19） ════════════════
+replace_exact(
+    "xiaomi login: browser-signed ticket handler",
+    "async function qrLogin(){",
+    r"""// ═══════════ 浏览器代签：绕开「服务器换票被小米拒绝」 (1.0.19) ═══════════
+async function verifyCookieTicket(){
+  const alertBox=otpEl('xiaomi-alert');
+  const box=otpEl('mi-ticket-text');
+  const text=String((box&&box.value)||'').trim();
+  const detailBox=otpEl('mi-ticket-detail');
+  const btn=otpEl('mi-ticket-submit');
+  if(detailBox){detailBox.style.display='none';detailBox.textContent='';}
+  if(!text){
+    otpText('mi-ticket-status','✗ 先粘贴浏览器返回的整段内容');
+    showAlert(alertBox,'err','✗ 先粘贴浏览器返回的整段内容');
+    return;
+  }
+  otpText('mi-ticket-status','⟳ 正在校验票据...');
+  if(btn)btn.disabled=true;
+  try{
+    const r=await fetch('/api/test/xiaomi/cookie-ticket',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:text})});
+    const d=await r.json();
+    if(d&&d.ok){
+      if(box)box.value='';
+      otpText('mi-ticket-status','');
+      otpReset();
+      showAlert(alertBox,'ok','✓ '+(d.msg||'代签登录成功'));
+      if(d.devices&&d.devices.length>0)renderDeviceList(d.devices);
+      return;
+    }
+    const why=(d&&d.msg)||'代签失败';
+    otpText('mi-ticket-status','✗ '+why);
+    showAlert(alertBox,'err','✗ '+why);
+    if(detailBox&&d&&d.detail){detailBox.style.display='block';detailBox.textContent=JSON.stringify(d.detail,null,2);}
+  }catch(e){
+    otpText('mi-ticket-status','✗ '+e.message);
+    showAlert(alertBox,'err','✗ '+e.message);
+  }finally{
+    if(btn)btn.disabled=false;
+  }
+}
+async function qrLogin(){""",
 )
 
 path.write_text(html, encoding="utf-8")

@@ -153,6 +153,7 @@ BASE_FUNCTIONS = (
 )
 # Only 1.0.10 has these (the access-control / credential-hardening release).
 NEW_ONLY_FUNCTIONS = (
+    "_validate_listening_scope",
     "_poll_auth_cookies",
     "_looks_like_schedule",
     "_read_saved_credential",

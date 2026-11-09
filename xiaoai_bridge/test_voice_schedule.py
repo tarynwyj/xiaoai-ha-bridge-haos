@@ -33,6 +33,7 @@ WANTED_FUNCS = (
     "_schedule_service_for",
     "_parse_schedule_command",
     "_automation_stable_id",
+    "_schedule_targets",
     "_automation_outcome",
     "_automation_exists",
     "_normalize_schedule_time",
@@ -48,7 +49,7 @@ WANTED_FUNCS = (
     "_schedule_purge_expired",
     "_automation_entries",
 )
-NEEDED_ASSIGNMENTS = ("_AUTOMATION_PREFIX", "_WEEKDAY_MAP", "_automation_outcomes", "_SCHEDULE_HINTS", "_CN_DIGITS", "_CN_WEEKDAY", "_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_INTERNAL_KEYS")
+NEEDED_ASSIGNMENTS = ("_schedule_clock", "_AUTOMATION_PREFIX", "_WEEKDAY_MAP", "_automation_outcomes", "_SCHEDULE_HINTS", "_CN_DIGITS", "_CN_WEEKDAY", "_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_INTERNAL_KEYS")
 
 DEVICES = [
     {"entity_id": "switch.reshui", "name": "热水器", "domain": "switch", "state": "off"},
@@ -281,6 +282,63 @@ def scenario_request_identity(reporter, ns):
         reporter.check("the repeated parameterised request succeeds", ok)
         reporter.eq("two distinct parameter sets produce exactly two writes", len(param_ha.created), 2)
     asyncio.run(run())
+
+
+def scenario_multi_target_contract(reporter, ns):
+    async def run():
+        ha = FakeHA()
+        targets = ["light.ke_ting", "light.wo_shi"]
+        aid, ok = await ns["_create_ha_automation"](
+            ha, "light", "turn_on", {"entity_id": targets, "brightness_pct": 35}, "08:00", "daily")
+        reporter.check("multi-target schedule is created", ok)
+        reporter.eq("the FINAL HA config contains an array, not a Python repr",
+                    ha.created[0]["config"]["action"][0]["target"]["entity_id"], targets)
+        reporter.eq("service data survives target normalisation",
+                    ha.created[0]["config"]["action"][0]["data"], {"brightness_pct": 35})
+        again, _ = await ns["_create_ha_automation"](
+            ha, "light", "turn_on", {"entity_id": list(reversed(targets)), "brightness_pct": 35}, "08:00", "daily")
+        reporter.eq("array order does not create a duplicate task", again, aid)
+        reporter.eq("one HA write for an equivalent set of targets", len(ha.created), 1)
+        _, bad = await ns["_create_ha_automation"](
+            ha, "light", "turn_on", {"entity_id": str(targets)}, "08:00", "daily")
+        reporter.check("a stringified list is refused before any HA write", not bad and len(ha.created) == 1)
+        row = next(x for x in ns["_schedule_registry_read"]() if x["id"] == aid)
+        reporter.eq("the registry retains the target array for editing", row["entity_id"], targets)
+    asyncio.run(run())
+
+
+def scenario_clock_boundaries(reporter, ns):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    original = ns["_schedule_now"]
+    zone = ns["_schedule_clock"]["zone"]
+    try:
+        ns["_schedule_clock"]["zone"] = ZoneInfo("Asia/Shanghai")
+        ns["_schedule_now"] = lambda: datetime(2030, 11, 9, 2, 30)
+        action = parse(ns, "明天八点打开热水器")
+        reporter.eq("tomorrow uses HA's date across a UTC midnight boundary", action["once_date"], "2030-11-10")
+        reporter.eq("HA's UTC last_triggered is compared in HA's timezone",
+                    ns["_schedule_local_naive"]("2030-11-08T18:30:00Z"), datetime(2030, 11, 9, 2, 30))
+        reporter.eq("night twelve is midnight", parse(ns, "每天晚上十二点打开热水器")["schedule_time"], "00:00")
+        reporter.eq("noon twelve stays noon", parse(ns, "每天中午十二点打开热水器")["schedule_time"], "12:00")
+        tonight = parse(ns, "今晚十二点打开热水器")
+        reporter.eq("tonight midnight lands on the following date", tonight["once_date"], "2030-11-10")
+    finally:
+        ns["_schedule_now"] = original
+        ns["_schedule_clock"]["zone"] = zone
+
+
+def scenario_atomic_registry(reporter, ns):
+    import os
+    from unittest.mock import patch
+    path = ns["_schedule_registry_path"]()
+    before = [{"id": "xiaoai_bridge_keep", "once": True, "once_at": "2030-11-10 08:00"}]
+    ns["_schedule_registry_write"](before)
+    with patch.object(os, "replace", side_effect=OSError("injected replace failure")):
+        ns["_schedule_registry_write"]([{"id": "xiaoai_bridge_new"}])
+    reporter.eq("failed replacement preserves the complete old registry", ns["_schedule_registry_read"](), before)
+    reporter.check("failed replacement leaves no temporary registry file", not list(path.parent.glob(".schedules-*")))
+    ns["_schedule_registry_write"]([])
 
 
 def scenario_reload_registry(reporter, ns):
@@ -552,6 +610,9 @@ def main():
                            ("merged listing", scenario_listing),
                            ("stable ids", scenario_stable_ids),
                            ("complete request identity", scenario_request_identity),
+                           ("final multi-target HA payload", scenario_multi_target_contract),
+                           ("HA clock and midnight", scenario_clock_boundaries),
+                           ("atomic registry replacement", scenario_atomic_registry),
                            ("registry survives reload failure", scenario_reload_registry),
                            ("verified creation", scenario_creation),
                            ("weekday conditions", scenario_weekdays)):

@@ -4,7 +4,7 @@ ARG UPSTREAM_REF=e4c82d4b4e872ff5d02d1baec089a6b4ad36734a
 ARG APP_VERSION=dev
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git init /app \

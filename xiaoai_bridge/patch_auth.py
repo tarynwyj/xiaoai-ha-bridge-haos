@@ -4838,15 +4838,15 @@ replace_exact(
 )
 
 # GET /api/automations must map the raw states through _schedule_listing (which
-# merges the local registry) and sweep one-shot tasks that already fired.
+# merges the local registry). Cleanup is an explicit POST, never a GET side effect.
 replace_exact(
-    "automation list endpoint merges the registry and purges fired one-shots",
+    "automation list endpoint merges the registry without deleting tasks",
     '''    async with aiohttp.ClientSession() as s:
         automations = await ha.list_automation_states(s)
     return {"ok": True, "automations": automations, "count": len(automations)}''',
     '''    async with aiohttp.ClientSession() as s:
-        automations = _schedule_listing(await ha.list_automation_states(s))
-        automations = await _schedule_purge_expired(ha, s, automations)
+        clock_known = await _sync_schedule_clock(ha, s)
+        automations = _schedule_listing(await ha.list_automation_states(s), clock_known=clock_known)
     return {"ok": True, "automations": automations, "count": len(automations)}''',
 )
 
@@ -4918,7 +4918,7 @@ class ScheduleAutomationRequest(BaseModel):
     days: str | None = None
     domain: str = "light"
     service: str = "turn_on"
-    entity_id: str = ""
+    entity_id: str | list[str] = ""
     data: dict | None = None
     once: bool = False
     date: str | None = None
@@ -4969,20 +4969,22 @@ def _schedule_form_action(domain, service, entity_id) -> tuple[dict, str]:
     """
     domain_text = str(domain or "").strip().lower()
     service_text = str(service or "").strip().lower()
-    entity_text = str(entity_id or "").strip()
+    try:
+        entity_text = _schedule_targets(entity_id)
+    except ValueError as e:
+        return {}, str(e)
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", domain_text):
         return {}, "域(domain)应为 HA 的英文名，如 light / switch / climate"
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", service_text):
         return {}, "服务(service)应为 HA 的英文服务名，如 turn_on / turn_off"
-    if entity_text and not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", entity_text):
-        return {}, "实体 ID 应形如 light.xiaomi_xxx"
     data = {}
     if entity_text:
         data["entity_id"] = entity_text
-        entity_domain = entity_text.split(".", 1)[0]
-        if domain_text not in _SCHEDULE_CROSS_DOMAIN_ALLOWED and entity_domain != domain_text:
-            return {}, ("服务 " + domain_text + "." + service_text + " 不能作用于 "
-                        + entity_text + "（实体域是 " + entity_domain + "）")
+        for entity in entity_text if isinstance(entity_text, list) else [entity_text]:
+            entity_domain = entity.split(".", 1)[0]
+            if domain_text not in _SCHEDULE_CROSS_DOMAIN_ALLOWED and entity_domain != domain_text:
+                return {}, ("服务 " + domain_text + "." + service_text + " 不能作用于 "
+                            + entity + "（实体域是 " + entity_domain + "）")
     elif domain_text not in _SCHEDULE_TARGET_OPTIONAL_DOMAINS:
         return {}, "这个服务必须填写实体 entity_id（如 light.xiaomi_xxx）"
     return data, ""
@@ -5067,16 +5069,17 @@ async def _schedule_ha_target_error(ha, domain: str, service: str, action: dict,
         if missing:
             return ("服务 " + domain + "." + service + " 还需要参数: "
                     + ", ".join(missing) + "（写在「服务参数」JSON 里）")
-    entity_id = str((action or {}).get("entity_id") or "").strip()
-    if not entity_id:
+    targets = _schedule_targets((action or {}).get("entity_id"))
+    if not targets:
         return ""
-    try:
-        async with session.get(base + "/api/states/" + entity_id, headers=headers,
-                               timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if getattr(r, "status", 0) == 404:
-                return "HA 里找不到实体: " + entity_id
-    except Exception:
-        return ""
+    for entity_id in targets if isinstance(targets, list) else [targets]:
+        try:
+            async with session.get(base + "/api/states/" + entity_id, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if getattr(r, "status", 0) == 404:
+                    return "HA 里找不到实体: " + entity_id
+        except Exception:
+            return ""
     return ""
 
 
@@ -5125,6 +5128,9 @@ async def create_automation(req: ScheduleAutomationRequest):
     once_date = ""
     days = None
     if once:
+        async with aiohttp.ClientSession() as clock_session:
+            if not await _sync_schedule_clock(HAClient(ha_cfg["url"], ha_cfg["token"]), clock_session):
+                raise HTTPException(503, "无法读取 HA 时区，暂时不能创建一次性任务")
         once_date, date_error = _schedule_form_date(getattr(req, "date", None), schedule_time)
         if date_error:
             raise HTTPException(400, date_error)
@@ -5141,9 +5147,6 @@ async def create_automation(req: ScheduleAutomationRequest):
     if error:
         raise HTTPException(400, error)
     action.update(extra_data)
-    if action.get("entity_id") and str(action["entity_id"]).strip() != str(
-            getattr(req, "entity_id", "") or "").strip():
-        raise HTTPException(400, "服务参数不能改写目标实体")
     ha = HAClient(ha_cfg["url"], ha_cfg["token"])
     async with aiohttp.ClientSession() as s:
         target_error = await _schedule_ha_target_error(ha, domain, service, action, s)
@@ -5746,13 +5749,36 @@ replace_exact(
     "poll targets for every xiaoai device",
     """async def bridge_loop():
 """,
-    """def _poll_targets(mi_cfg: dict, devices: list) -> list:
+    """def _validate_listening_scope(mi_cfg: dict) -> str:
+    mode = mi_cfg.get("device_scope")
+    if mode is not None and mode not in ("all", "selected"):
+        return "监听范围必须是 all 或 selected"
+    if mode == "all":
+        mi_cfg.update(device_ids=[], device_id="", device_did="")
+        return ""
+    raw = mi_cfg.get("device_ids", [])
+    if isinstance(raw, str):
+        raw = raw.replace("，", ",").split(",")
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        return "监听音箱 ID 必须是字符串数组"
+    ids = list(dict.fromkeys(item.strip() for item in raw if item.strip()))
+    if mode == "selected" and not ids:
+        return "仅监听所选音箱时至少要选一台"
+    if "device_ids" in mi_cfg:
+        mi_cfg["device_ids"] = ids
+    return ""
+
+
+def _poll_targets(mi_cfg: dict, devices: list) -> list:
     \"\"\"小爱设备里需要监听语音的那几台。
 
     默认全部：账号里有几台小爱设备就听几台（轮流轮询，每台一份 last_timestamp）。
     `xiaomi.device_ids` 给出白名单时只保留这些；`xiaomi.device_id` / `device_did`
     仍然表示「只听这一台」，保持旧配置的含义不变。
     \"\"\"
+    mi_cfg = dict(mi_cfg)
+    if _validate_listening_scope(mi_cfg):
+        return []
     wanted = mi_cfg.get("device_ids")
     if isinstance(wanted, str):
         wanted = [part.strip() for part in wanted.replace("，", ",").split(",")
@@ -5813,6 +5839,17 @@ async def bridge_loop():
 )
 
 replace_exact(
+    "validate listening scope on every config write, including legacy clients",
+    '''    _merge_xiaomi_credentials(cfg, existing, masked)
+    save_config(cfg)''',
+    '''    scope_error = _validate_listening_scope(cfg.get("xiaomi") or {})
+    if scope_error:
+        return JSONResponse({"ok": False, "msg": scope_error}, status_code=400)
+    _merge_xiaomi_credentials(cfg, existing, masked)
+    save_config(cfg)''',
+)
+
+replace_exact(
     "poll every device instead of only the first one",
     """                device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
                 if not device_id and devices:
@@ -5845,7 +5882,10 @@ replace_exact(
     "voice: fall back to the built-in Chinese schedule parser",
     r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
 """,
-    r"""                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
+    r"""                    if _looks_like_schedule(query) and not await _sync_schedule_clock(ha, _bridge_session):
+                        log.warning("无法读取 HA 时区，未执行定时指令: %s", query)
+                        continue
+                    action = IntentParser(load_config().get("intent_rules", [])).parse(query)
                     if _looks_like_schedule(query) and not (
                             action and (action.get("type") == "schedule" or action.get("delay_minutes"))):
                         # Existing instant rules still resolve the action, but must
@@ -5931,6 +5971,8 @@ _SCHEDULE_HINTS = ("每天", "每日", "天天", "每周", "每星期", "工作�
                    "分钟以后", "小时以后", "分钟之后", "小时之后")
 _automation_outcomes: dict = {}
 _ha_catalog = {"at": 0.0, "devices": []}
+_schedule_clock = {"zone": None, "key": None, "at": 0.0}
+_schedule_cleanup_lock = None
 # Keys that describe the request itself, never the HA service call payload.
 _SCHEDULE_INTERNAL_KEYS = {
     "entity_id", "once", "once_date", "__once", "__once_date", "__source",
@@ -5944,11 +5986,54 @@ def _automation_outcome(automation_id: str, status: str, ok: bool) -> None:
         "status": status, "ok": bool(ok)}
 
 
-def _automation_stable_id(at_time: str, weekdays, entity_id: str,
+async def _sync_schedule_clock(ha, session) -> bool:
+    '''Use HA's IANA timezone for natural dates, validation and task status.'''
+    from zoneinfo import ZoneInfo
+    key = (ha.base, ha.headers.get("Authorization"))
+    if _schedule_clock["key"] != key:
+        _schedule_clock.update(zone=None, key=key, at=0.0)
+    if _schedule_clock["zone"] is not None and time.monotonic() - _schedule_clock["at"] < 300:
+        return True
+    try:
+        async with session.get(ha.base + "/api/config", headers=ha.headers,
+                               timeout=aiohttp.ClientTimeout(total=10), allow_redirects=False) as response:
+            if response.status != 200:
+                raise ValueError("HA config unavailable")
+            config = await response.json()
+        zone = ZoneInfo(config["time_zone"])
+        if _schedule_clock["key"] != key:
+            return False  # configuration changed while this HTTP request was in flight
+        _schedule_clock.update(zone=zone, at=time.monotonic())
+        return True
+    except Exception as e:
+        log.warning("读取 HA 时区失败: %s", type(e).__name__)
+        return _schedule_clock["zone"] is not None
+
+
+def _schedule_targets(value):
+    '''Preserve HA target arrays; never stringify a Python list into an entity id.'''
+    if value is None or value == "":
+        return ""
+    array = isinstance(value, list)
+    if not array and not isinstance(value, str):
+        raise ValueError("实体 ID 必须是字符串或字符串数组")
+    values = value if array else value.split(",")
+    targets = []
+    for item in values:
+        if not isinstance(item, str) or not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", item.strip()):
+            raise ValueError("实体 ID 应形如 light.xiaomi_xxx，多个实体请用数组或逗号分隔")
+        if item.strip() not in targets:
+            targets.append(item.strip())
+    return targets if array or len(targets) > 1 else (targets[0] if targets else "")
+
+
+def _automation_stable_id(at_time: str, weekdays, entity_id: str | list[str],
                           domain: str, service: str, once_date=None, data=None) -> str:
     '''Deterministic config id: repeating the same request cannot duplicate it.'''
+    identity = sorted(entity_id) if isinstance(entity_id, list) else entity_id
+    label = ",".join(identity) if isinstance(identity, list) else identity
     parts = [at_time.replace(":", ""), "-".join(weekdays or ["daily"]),
-             entity_id or "none", domain, service]
+             label or "none", domain, service]
     if once_date:
         # Same time/device on a different day is a different one-shot task.
         parts.insert(0, str(once_date).replace("-", ""))
@@ -5956,10 +6041,10 @@ def _automation_stable_id(at_time: str, weekdays, entity_id: str,
     candidate = _AUTOMATION_PREFIX + slug
     # Preserve existing short, parameter-free ids. Long targets and parameterised
     # actions keep a digest of the *whole* request, including fields beyond 60 chars.
-    if len(candidate) <= 60 and not data:
+    if len(candidate) <= 60 and not data and not isinstance(identity, list):
         return candidate
     import hashlib
-    canonical = json.dumps([at_time, weekdays or [], entity_id, domain, service,
+    canonical = json.dumps([at_time, weekdays or [], identity, domain, service,
                             once_date or "", data or {}],
                            sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
@@ -6040,7 +6125,9 @@ def _apply_period(text: str, at_time: str) -> str:
     '''晚上七点 -> 19:00; 下午三点 -> 15:00; 早上七点 stays 07:00.'''
     hour_text, minute_text = at_time.split(":")
     hour = int(hour_text)
-    if any(w in text for w in ("下午", "晚上", "傍晚", "夜里", "夜间", "今晚")) and hour < 12:
+    if hour == 12 and any(w in text for w in ("晚上", "夜里", "夜间", "今晚", "凌晨", "午夜")):
+        hour = 0
+    elif any(w in text for w in ("下午", "晚上", "傍晚", "夜里", "夜间", "今晚")) and hour < 12:
         hour += 12
     elif "中午" in text and hour < 12:
         hour += 12
@@ -6089,7 +6176,7 @@ def _parse_once_date(text: str, now=None):
     '''「明天八点」「后天七点」「今晚九点」 → YYYY-MM-DD (None when not one-shot).'''
     from datetime import datetime as _dt, timedelta as _td
     text = str(text or "")
-    now = now or _dt.now()
+    now = now or _schedule_now()
     if "后天" in text:
         return (now + _td(days=2)).strftime("%Y-%m-%d")
     if "明天" in text or "明晚" in text or "明日" in text:
@@ -6114,11 +6201,11 @@ def _normalize_schedule_date(value):
 
 def _schedule_now():
     from datetime import datetime as _dt
-    return _dt.now()
+    return _dt.now(_schedule_clock["zone"]).replace(tzinfo=None)
 
 
 def _schedule_once_at(date_text: str, at_time: str):
-    '''Absolute datetime of a one-shot task (naive local time, like HA's clock).'''
+    '''Absolute datetime of a one-shot task expressed in HA's local calendar.'''
     from datetime import datetime as _dt
     return _dt.strptime(_normalize_schedule_date(date_text) + " " + at_time,
                         "%Y-%m-%d %H:%M:%S")
@@ -6203,6 +6290,9 @@ def _parse_schedule_command(text: str, devices, aliases):
             once_date = _parse_once_date(text, now)
             if not once_date:
                 return None
+            if at_time.startswith("00:") and any(w in text for w in ("晚上", "今晚", "夜里", "夜间")):
+                from datetime import datetime as _dt, timedelta as _td
+                once_date = (_dt.strptime(once_date, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
             days = "once"
     device = _pick_schedule_device(text, devices, aliases)
     if not device:
@@ -6306,7 +6396,11 @@ async def _create_ha_automation(
             log.warning("一次性定时任务的时间已经过去: %s %s", once_date, at_time)
             return "", False
         once_at = when.strftime("%Y-%m-%d %H:%M")
-    entity_id = str(data.get("entity_id") or "")
+    try:
+        entity_id = _schedule_targets(data.get("entity_id"))
+    except ValueError as e:
+        log.warning("定时任务目标无效: %s", e)
+        return "", False
     weekdays = [] if once else _normalize_schedule_weekdays(schedule_days)
     extra = {k: v for k, v in data.items() if k not in _SCHEDULE_INTERNAL_KEYS}
     if not automation_id:
@@ -6401,12 +6495,35 @@ def _schedule_registry_read() -> list:
 
 
 def _schedule_registry_write(items: list) -> None:
+    import tempfile
+    import os
+    path = _schedule_registry_path()
+    temporary = None
     try:
-        _schedule_registry_path().parent.mkdir(parents=True, exist_ok=True)
-        _schedule_registry_path().write_text(
-            json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".schedules-", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(items, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     except Exception as e:
         log.warning("定时任务登记表写入失败: %s", type(e).__name__)
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def _schedule_registry_add(automation_id: str, at_time: str, weekdays,
@@ -6417,7 +6534,7 @@ def _schedule_registry_add(automation_id: str, at_time: str, weekdays,
              if str(item.get("id")) != automation_id]
     previous = next((item for item in _schedule_registry_read()
                      if str(item.get("id")) == automation_id), {})
-    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    stamp = _schedule_now().strftime("%Y-%m-%d %H:%M:%S")
     items.append({
         "id": automation_id,
         "time": at_time,
@@ -6448,7 +6565,7 @@ def _schedule_local_naive(value):
     except (TypeError, ValueError):
         return None
     if parsed.tzinfo is not None:
-        parsed = parsed.astimezone().replace(tzinfo=None)
+        parsed = parsed.astimezone(_schedule_clock["zone"]).replace(tzinfo=None)
     return parsed
 
 
@@ -6457,7 +6574,7 @@ def _schedule_once_state(meta, last_triggered, now=None):
     if not meta or not meta.get("once"):
         return None
     from datetime import datetime as _dt, timedelta as _td
-    now = now or _dt.now()
+    now = now or _schedule_now()
     try:
         when = _dt.strptime(str(meta.get("once_at") or ""), "%Y-%m-%d %H:%M")
     except ValueError:
@@ -6474,7 +6591,7 @@ def _schedule_next_run(at_time: str, weekdays, once: bool, now=None,
                        once_at: str = ""):
     '''Next datetime this task should fire, or None when it cannot be known.'''
     from datetime import datetime as _dt, timedelta as _td
-    now = now or _dt.now()
+    now = now or _schedule_now()
     if once:
         try:
             when = _dt.strptime(str(once_at or ""), "%Y-%m-%d %H:%M")
@@ -6497,19 +6614,19 @@ def _schedule_next_run(at_time: str, weekdays, once: bool, now=None,
     return None
 
 
-def _schedule_listing(states) -> list:
+def _schedule_listing(states, clock_known=True) -> list:
     '''Merge what HA loaded with what we know we wrote.'''
     from datetime import datetime as _dt
     entries = _automation_entries(states)
     registry = {str(item.get("id")): item for item in _schedule_registry_read()}
-    now = _dt.now()
+    now = _schedule_now()
     seen = set()
     result = []
     for entry in entries:
         config_id = entry.get("config_id", "")
         seen.add(config_id)
         meta = registry.get(config_id) or {}
-        once_state = _schedule_once_state(meta, entry.get("last_triggered"), now)
+        once_state = _schedule_once_state(meta, entry.get("last_triggered"), now) if clock_known else None
         status = "active" if entry.get("state") == "on" else "disabled"
         if once_state:
             status = once_state
@@ -6532,14 +6649,14 @@ def _schedule_listing(states) -> list:
             "updated_at": meta.get("updated_at", ""),
             "next_run": (_schedule_next_run(
                 meta.get("time", ""), meta.get("weekdays"), bool(meta.get("once")),
-                now=now, once_at=meta.get("once_at", "")) if meta.get("time") else None),
+                now=now, once_at=meta.get("once_at", "")) if clock_known and meta.get("time") else None),
             "status": status,
             "expired": bool(once_state),
         })
     for config_id, meta in registry.items():
         if config_id in seen:
             continue
-        once_state = _schedule_once_state(meta, None, now)
+        once_state = _schedule_once_state(meta, None, now) if clock_known else None
         status = "not_loaded"
         if once_state:
             status = once_state
@@ -6563,7 +6680,7 @@ def _schedule_listing(states) -> list:
             "updated_at": meta.get("updated_at", ""),
             "next_run": (_schedule_next_run(
                 meta.get("time", ""), meta.get("weekdays"), bool(meta.get("once")),
-                now=now, once_at=meta.get("once_at", "")) if meta.get("time") else None),
+                now=now, once_at=meta.get("once_at", "")) if clock_known and meta.get("time") else None),
             "status": status,
             "expired": bool(once_state),
         })
@@ -6637,6 +6754,25 @@ async def _schedule_automation_entity(ha, automation_id, session):
         if config_id == automation_id:
             return str(state.get("entity_id") or "")
     return ""
+
+
+@app.post("/api/automations/cleanup")
+async def cleanup_automations():
+    '''Explicit, serialised cleanup; reading the task list never mutates HA.'''
+    global _schedule_cleanup_lock
+    if _schedule_cleanup_lock is None:
+        _schedule_cleanup_lock = asyncio.Lock()
+    async with _schedule_cleanup_lock:
+        cfg = load_config().get("homeassistant") or {}
+        if not cfg.get("url") or not cfg.get("token"):
+            raise HTTPException(400, "HA 未配置")
+        ha = HAClient(cfg["url"], cfg["token"])
+        async with aiohttp.ClientSession() as session:
+            if not await _sync_schedule_clock(ha, session):
+                raise HTTPException(503, "无法读取 HA 时区，未清理任何任务")
+            entries = _schedule_listing(await ha.list_automation_states(session))
+            kept = await _schedule_purge_expired(ha, session, entries)
+        return {"ok": True, "removed": len(entries) - len(kept)}
 
 
 _SCHEDULE_AREAS_TEMPLATE = (
@@ -6723,6 +6859,9 @@ async def update_automation(automation_id: str, req: ScheduleAutomationRequest):
     once_date = ""
     days = None
     if once:
+        async with aiohttp.ClientSession() as clock_session:
+            if not await _sync_schedule_clock(HAClient(ha_cfg["url"], ha_cfg["token"]), clock_session):
+                raise HTTPException(503, "无法读取 HA 时区，暂时不能创建一次性任务")
         once_date, date_error = _schedule_form_date(getattr(req, "date", None), schedule_time)
         if date_error:
             raise HTTPException(400, date_error)
@@ -6776,6 +6915,16 @@ source = source + '# ════════════════ 登录回�
 source = source + '\n# ════════════════ 定时任务：暂停/启用 + HA 服务列表代理 ════════════════\n@app.post("/api/automations/{automation_id}/toggle")\nasync def toggle_automation(automation_id: str, payload: dict | None = None):\n    """Pause or resume one scheduled task (HA automation.turn_on / turn_off)."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    enabled = bool((payload or {}).get("enabled", True))\n    automation_id = str(automation_id or "").strip()\n    if not automation_id.startswith(_AUTOMATION_PREFIX):\n        raise HTTPException(403, "只能操作由小爱桥接创建的任务")\n    async with aiohttp.ClientSession() as s:\n        ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n        entity_id = await _schedule_automation_entity(ha, automation_id, s)\n        if entity_id is None:\n            raise HTTPException(502, "读取 HA 自动化列表失败，暂时无法切换")\n        if not entity_id:\n            raise HTTPException(404, "HA 里没有这个任务（可能尚未重新加载）")\n        ok = await ha.call_service(\n            "automation", "turn_on" if enabled else "turn_off",\n            {"entity_id": entity_id}, s)\n    if not ok:\n        raise HTTPException(500, "切换失败：HA 没有接受这次调用")\n    log.info("定时任务 %s 已%s", automation_id, "启用" if enabled else "暂停")\n    return {"ok": True, "enabled": enabled, "msg": "已启用" if enabled else "已暂停"}\n\n\n@app.get("/api/ha/services")\nasync def ha_services():\n    """Proxy HA /api/services so the form offers services HA actually has."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n    try:\n        async with aiohttp.ClientSession() as s:\n            async with s.get(ha.base + "/api/services", headers=ha.headers,\n                             timeout=aiohttp.ClientTimeout(total=10)) as r:\n                if r.status != 200:\n                    raise HTTPException(502, "HA /api/services 返回 %s" % r.status)\n                data = await r.json()\n    except HTTPException:\n        raise\n    except Exception as e:\n        raise HTTPException(502, "读取 HA 服务列表失败: %s" % type(e).__name__)\n    services = {}\n    if isinstance(data, list):\n        for item in data:\n            domain = item.get("domain")\n            entries = item.get("services")\n            if domain and isinstance(entries, dict):\n                services[domain] = sorted(entries.keys())\n    return {"ok": True, "services": services}\n'
 
 # Validate the built Python AST, not the patch source's quoted upstream templates.
+replace_exact(
+    "rule execution uses the same HA schedule clock as voice and form entry points",
+    '''        async with aiohttp.ClientSession() as s:
+            automation_id, created = await _create_ha_automation(''',
+    '''        async with aiohttp.ClientSession() as s:
+            if not await _sync_schedule_clock(ha, s):
+                raise HTTPException(503, "无法读取 HA 时区，未创建定时任务")
+            automation_id, created = await _create_ha_automation(''',
+)
+
 import ast
 _tree = ast.parse(source)
 _unverified = [

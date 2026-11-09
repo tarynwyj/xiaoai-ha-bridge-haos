@@ -21,6 +21,8 @@ import sys
 import types
 
 FUNCTIONS = (
+    "_schedule_targets",
+    "_sync_schedule_clock",
     "_normalize_schedule_time",
     "_normalize_schedule_weekdays",
     "_normalize_schedule_date",
@@ -56,7 +58,7 @@ FUNCTIONS = (
     "ha_services",
     "ha_areas",
 )
-TABLES = ("_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
+TABLES = ("_schedule_clock", "_SCHEDULE_WEEKDAY_ORDER", "_SCHEDULE_WEEKDAY_ALIASES",
           "_automation_outcomes",
           "_SCHEDULE_DAY_WORDS", "_SCHEDULE_TARGET_OPTIONAL_DOMAINS",
           "_SCHEDULE_CROSS_DOMAIN_ALLOWED", "_SCHEDULE_RESERVED_DATA_KEYS",
@@ -179,6 +181,8 @@ class StubSession:
         return False
 
     def _route(self, url):
+        if str(url).endswith("/api/config"):
+            return FakeResponse(200, {"time_zone": "UTC"})
         for prefix, (status, payload) in ROUTES.items():
             if str(url).startswith(prefix):
                 return FakeResponse(status, payload)

@@ -38,6 +38,20 @@ assert 'IntentParser(load_config().get("intent_rules", [])).parse(query)' in sou
 
 MASKED = "\u2022" * 8
 WANTED_FUNCS = [
+    "_create_ha_automation",
+    "_automation_stable_id",
+    "_automation_exists",
+    "_automation_outcome",
+    "_schedule_targets",
+    "_normalize_schedule_time",
+    "_normalize_schedule_weekdays",
+    "_normalize_schedule_date",
+    "_schedule_once_at",
+    "_schedule_registry_path",
+    "_schedule_registry_read",
+    "_schedule_registry_write",
+    "_schedule_registry_add",
+    "_validate_listening_scope",
     "_set_token",
     "_build_token_account",
     "_load_saved_xiaomi_identity",
@@ -442,7 +456,12 @@ class Harness:
                 "passToken": "pass-token-rotated",
             }
 
+        async def synced_clock(*args):
+            return True  # synthetic HA uses this harness's local clock
+
         namespace = {
+            "_sync_schedule_clock": synced_clock,
+            "_schedule_clock": {"zone": None, "key": None, "at": 0.0},
             "_mi_service_login_verified": verified_service_login,
             "_persist_sms_credentials": persist_synthetic_credentials,
             "_credential_write_allowed": lambda: True,
@@ -690,9 +709,19 @@ def scenario_scheduled_rule_never_executes_now(root: Path):
         harness.poll_script = [([{"time": 1_700_000_000_000,
                                   "query": query, "answer": "好的"}], False)]
         scheduled = []
+        configs = []
+        builder = harness.namespace["_create_ha_automation"]
+        class RecordingHA:
+            async def create_automation(self, aid, config, session):
+                configs.append((aid, config))
+                return True
+            async def reload_automations(self, session):
+                return True
+            async def list_automation_states(self, session):
+                return [{"attributes": {"id": aid}} for aid, _ in configs]
         async def capture(ha, domain, service, data, at, days, session):
             scheduled.append((domain, service, dict(data), at, days))
-            return "xiaoai_bridge_test", True
+            return await builder(RecordingHA(), domain, service, data, at, days, session)
         async def stop(delay):
             harness.bridge_state["running"] = False
         harness.namespace["_create_ha_automation"] = capture
@@ -714,6 +743,8 @@ def scenario_scheduled_rule_never_executes_now(root: Path):
             assert scheduled[0][2]["entity_id"] == targets, scheduled
             assert scheduled[0][2]["brightness_pct"] == 35, scheduled
             assert scheduled[0][2]["once"] is (index < 2), scheduled
+            assert configs[0][1]["action"][0]["target"]["entity_id"] == targets, configs
+            assert configs[0][1]["action"][0]["data"] == {"brightness_pct": 35}, configs
     return "scheduled speech keeps time and rule parameters instead of executing now"
 
 

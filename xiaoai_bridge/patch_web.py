@@ -1152,7 +1152,7 @@ replace_exact(
 replace_exact(
     "schedules page: new-task form",
     r'''      <div class="btn-group"><button class="btn btn-primary" onclick="loadSchedules()">&#128260;刷新</button><span style="color:var(--txt-muted);font-size:12px;margin-left:8px" id="schedule-count"></span></div>''',
-    r'''      <div class="btn-group"><button class="btn btn-primary" onclick="scheduleFormToggle()">&#43; 新建定时任务</button><button class="btn btn-primary" onclick="loadSchedules()">&#128260;刷新</button><span style="color:var(--txt-muted);font-size:12px;margin-left:8px" id="schedule-count"></span></div>
+    r'''      <div class="btn-group"><button class="btn btn-primary" onclick="scheduleFormToggle()">&#43; 新建定时任务</button><button class="btn btn-primary" onclick="loadSchedules()">&#128260;刷新</button><button class="btn" onclick="cleanupSchedules()">清理已完成任务</button><span style="color:var(--txt-muted);font-size:12px;margin-left:8px" id="schedule-count"></span></div>
       <div id="schedule-form" style="display:none;margin:12px 0;padding:14px;background:var(--page-bg);border:1px solid var(--border-default);border-radius:var(--r-md)">
         <div style="font-size:14px;font-weight:600;color:var(--txt-primary);margin-bottom:10px">新建定时任务</div>
         <div class="field"><label>选择设备</label>
@@ -1180,10 +1180,10 @@ replace_exact(
             <div class="field"><label>域 domain</label><input id="sch-domain" value="light" placeholder="light"></div>
             <div class="field"><label>服务 service</label><input id="sch-service" value="turn_on" placeholder="turn_on"></div>
           </div>
-          <div class="field"><label>实体 entity_id（可为空）</label><input id="sch-entity" placeholder="light.xiaomi_xxx"></div>
+          <div class="field"><label>实体 entity_id（多个用逗号分隔）</label><input id="sch-entity" placeholder="light.xiaomi_xxx"></div>
           <div class="field"><label>服务参数（JSON，可留空；如 select.select_option 需要 option）</label><input id="sch-data" placeholder='{"option": "Heat"}'></div>
         </details>
-        <div style="font-size:11px;color:var(--txt-dim);margin-top:6px">创建出来的是 HA 自动化（别名「小爱桥接-HH:MM 实体」），会出现在下方列表；也可以继续用语音「每天七点半打开热水器」。</div>
+        <div style="font-size:11px;color:var(--txt-dim);margin-top:6px">时间以 Home Assistant 配置的时区为准。任务会显示在下方列表；也可以用语音「每天七点半打开热水器」创建。</div>
       </div>''',
 )
 
@@ -1446,7 +1446,7 @@ replace_exact(
     '''function selectDevice(hw,did){if(hw)document.getElementById('mi-hardware').value=hw;if(did)document.getElementById('mi-did').value=did}
 
 function miScopeNormIds(raw){var out=[];if(raw==null)return out;if(typeof raw==='string'){raw=raw.split(',');}if(!Array.isArray(raw))return out;raw.forEach(function(v){if(typeof v!=='string')return;var s=v.trim();if(!s)return;if(out.indexOf(s)<0)out.push(s);});return out}
-function miScopeSaved(){var mi=(cfg&&cfg.xiaomi)||{};var ids=miScopeNormIds(mi.device_ids);var single=String(mi.device_id||mi.device_did||'').trim();if(ids.length)return{mode:'selected',ids:ids};if(single)return{mode:'selected',ids:[single],legacy:true};return{mode:'all',ids:[]}}
+function miScopeSaved(){var mi=(cfg&&cfg.xiaomi)||{};var ids=miScopeNormIds(mi.device_ids);if(mi.device_scope==='all')return{mode:'all',ids:[]};if(mi.device_scope==='selected')return{mode:'selected',ids:ids};var single=String(mi.device_id||mi.device_did||'').trim();if(ids.length)return{mode:'selected',ids:ids};if(single)return{mode:'selected',ids:[single],legacy:true};return{mode:'all',ids:[]}}
 function miScopeInit(){if(globalThis.miScopeDraft)return globalThis.miScopeDraft;var s=miScopeSaved();globalThis.miScopeDraft={mode:s.mode,ids:s.ids.slice(),legacy:!!s.legacy};return globalThis.miScopeDraft}
 function miScopeReset(){globalThis.miScopeDraft=null}
 function miScopeRows(){var d=miScopeInit();var seen={};var rows=[];(globalThis.miScopeDevices||[]).forEach(function(dev){if(!dev||typeof dev!=='object')return;var id=String(dev.deviceID||dev.did||'').trim();if(!id||seen[id])return;seen[id]=1;rows.push({id:id,name:String(dev.name||'未知音箱'),hw:String(dev.hardware||dev.model||''),missing:false})});d.ids.forEach(function(id){if(seen[id])return;seen[id]=1;rows.push({id:id,name:'（当前未发现）',hw:'',missing:true})});return rows}
@@ -1629,7 +1629,7 @@ function scheduleValidate(){
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date))return '一次性任务需要选择日期';
     var when=new Date(date+'T'+(time.length===5?time+':00':time));
     if(isNaN(when.getTime()))return '日期格式无效';
-    if(when.getTime()<=Date.now())return '选择的时间已经过去，请换一个将来的时间';
+    // HA's timezone may differ from this browser; the server validates the moment.
   }else if(days==='custom'||!days){
     return '自定义重复至少要选一天';
   }
@@ -1681,7 +1681,8 @@ function editSchedule(id){
   opening=opening&&opening.style.display==='none'?scheduleFormToggle():Promise.resolve(true);
   opening.then(function(){
     scheduleEditId=String(id);
-    var entity=String(item.entity||'').trim();
+    var multi=Array.isArray(item.entity);
+    var entity=multi?item.entity.join(','):String(item.entity||'').trim();
     if(!entity)entity=String(item.entity_id||'').replace(/^automation\./,'');
     var sel=document.getElementById('sch-device');
     if(sel&&entity){
@@ -1723,7 +1724,7 @@ function editSchedule(id){
     if(dataEl)dataEl.value=(item.data&&Object.keys(item.data).length)?JSON.stringify(item.data):'';
     var simple=(scheduleActionsFor(item.domain)||[]).map(function(a){return a[0];});
     var adv=document.getElementById('sch-advanced');
-    if(adv&&item.service&&simple.indexOf(String(item.service))<0)adv.open=true;
+    if(adv&&(multi||(item.service&&simple.indexOf(String(item.service))<0)))adv.open=true;
     var banner=document.getElementById('sch-edit-banner');
     var nameEl=document.getElementById('sch-edit-name');
     var title=document.getElementById('sch-form-title');
@@ -1779,6 +1780,17 @@ async function createSchedule(){
     loadSchedules();
   }catch(e){if(st)st.textContent='✗ '+e.message;showAlert(a,'err','✗ '+(editing?'保存失败':'创建失败')+': '+e.message);}
   finally{if(btn)btn.disabled=false;}
+}
+
+async function cleanupSchedules(){
+  const a=document.getElementById('schedules-alert');
+  try{
+    const r=await fetch('/api/automations/cleanup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(!r.ok||!d.ok)throw new Error(d.detail||d.msg||'清理失败');
+    showAlert(a,'ok','已清理 '+d.removed+' 个已完成任务');
+    await loadSchedules();
+  }catch(e){showAlert(a,'err','清理失败: '+e.message);}
 }
 
 async function loadSchedules(){

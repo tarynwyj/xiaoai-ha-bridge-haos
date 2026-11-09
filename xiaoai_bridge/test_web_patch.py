@@ -1683,6 +1683,11 @@ test('scope: a fresh install listens to everything and pins no device', () => {
   checkEq('collect keeps the mode', picked.mode, 'all');
   checkEq('collect sends no ids', picked.ids.length, 0);
 });
+test('scope: an explicit empty selection stays selected and cannot become all', () => {
+  scopeFixture({device_scope:'selected',device_ids:[]});
+  checkEq('empty selected mode is preserved',miScopeSaved().mode,'selected');
+  checkEq('empty selected mode refuses saving',miScopeCollect().ok,false);
+});
 test('scope: a legacy device_did reads back as a one-device selection', () => {
   scopeFixture({ device_did: 'did-A' });
   const saved = miScopeSaved();

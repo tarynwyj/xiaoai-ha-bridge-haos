@@ -411,6 +411,8 @@ class FakeHAHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/":
             return self._send_json(200, {"message": "API running"})
+        if path == "/api/config":
+            return self._send_json(200, {"time_zone": getattr(self.store, "time_zone", "UTC")})
         if path == "/api/states":
             return self._send_json(200, self.store.snapshot_states())
         if path.startswith("/api/states/"):
@@ -441,6 +443,13 @@ class FakeHAHandler(BaseHTTPRequestHandler):
             return self._send(200, body.encode("utf-8"))
         if path.startswith("/api/config/automation/config/"):
             config_id = unquote(path[len("/api/config/automation/config/"):])
+            for action in (payload or {}).get("action", []):
+                target = (action.get("target") or {}).get("entity_id", [])
+                ids = target.split(",") if isinstance(target, str) else target
+                if not isinstance(ids, list) or any(
+                        not isinstance(eid, str) or not re.fullmatch(r"[a-z_][a-z0-9_]*\.[a-z0-9_]+", eid.strip())
+                        for eid in ids):
+                    return self._send_json(400, {"message": "Message malformed: invalid entity_id"})
             self.store.put_config(config_id, payload or {})
             return self._send_json(200, {"result": "ok"})
         if path == "/api/services/automation/reload":
@@ -1061,6 +1070,14 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
     store.set_last_triggered(purge_id, past.isoformat(timespec="seconds"))
     store.set_last_triggered(keep_id, None)
 
+    before_cleanup = client2.get("/api/automations")
+    eq("cleanup: GET is read-only and keeps completed configs", before_cleanup.status_code, 200)
+    check("cleanup: reading the list does not remove completed tasks", purge_id in store.configs)
+    cleanup_resp = client2.post("/api/automations/cleanup", headers=UI_HEADER, json_body={})
+    eq("cleanup: explicit cleanup succeeds", cleanup_resp.status_code, 200)
+    eq("cleanup: exactly one completed task is removed", cleanup_resp.json().get("removed"), 1)
+    repeated_cleanup = client2.post("/api/automations/cleanup", headers=UI_HEADER, json_body={})
+    eq("cleanup: a repeated cleanup is idempotent", repeated_cleanup.json().get("removed"), 0)
     cleaned_resp = client2.get("/api/automations")
     eq("cleanup: listing after the expiry still answers 200",
        cleaned_resp.status_code, 200)
@@ -1085,6 +1102,64 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
           purge_entity not in {state["entity_id"]
                                for state in store.snapshot_states()},
           purge_entity)
+
+    # Two concurrent cleanup calls must re-read after the lock, deleting only once.
+    store.put_config(purge_id, {"alias": "concurrent cleanup", "trigger": [], "action": []})
+    store.set_last_triggered(purge_id, past.isoformat(timespec="seconds"))
+    restarted._schedule_registry_add(purge_id, past.strftime("%H:%M"), [], "light.kitchen",
+                                    "light", "turn_on", "form", True,
+                                    once_at=past.strftime("%Y-%m-%d %H:%M"))
+    deletes_before = sum(x["method"] == "DELETE" and x["path"].endswith("/" + purge_id)
+                         for x in store.requests)
+    async def concurrent_cleanups():
+        return await asyncio.gather(restarted.cleanup_automations(), restarted.cleanup_automations())
+    outcomes = asyncio.run(concurrent_cleanups())
+    eq("cleanup: concurrent calls collectively remove exactly one task",
+       sum(x["removed"] for x in outcomes), 1)
+    deletes_after = sum(x["method"] == "DELETE" and x["path"].endswith("/" + purge_id)
+                        for x in store.requests)
+    eq("cleanup: concurrent calls send only one HA DELETE", deletes_after - deletes_before, 1)
+
+    # The form API must preserve a multi-target array all the way to HA storage.
+    target_ids = ["light.kitchen", "light.study_desk"]
+    multi = client2.post("/api/automations", headers=UI_HEADER, json_body={
+        "time": "09:10", "domain": "homeassistant", "service": "turn_on",
+        "entity_id": target_ids})
+    eq("multi: array target request is accepted", multi.status_code, 200)
+    mid = multi.json().get("automation_id")
+    if multi.status_code == 200:
+        eq("multi: final HA config retains the exact array",
+           store.configs[mid]["action"][0]["target"]["entity_id"], target_ids)
+        edited = client2.put("/api/automations/" + mid, headers=UI_HEADER, json_body={
+            "time": "09:20", "domain": "homeassistant", "service": "turn_off",
+            "entity_id": ",".join(target_ids)})
+        eq("multi: comma-separated editing preserves both targets", edited.status_code, 200)
+        eq("multi: edited config still contains an array",
+           store.configs[mid]["action"][0]["target"]["entity_id"], target_ids)
+        client2.delete("/api/automations/" + mid, headers=UI_HEADER)
+    invalid = client2.post("/api/automations", headers=UI_HEADER, json_body={
+        "time": "09:10", "domain": "homeassistant", "service": "turn_on", "entity_id": str(target_ids)})
+    eq("multi: a Python-list string is rejected", invalid.status_code, 400)
+    malformed_status, _ = http_json(base, "/api/config/automation/config/xiaoai_bridge_malformed",
+        "POST", {"alias": "malformed", "action": [{"service": "light.turn_on",
+                           "target": {"entity_id": str(target_ids)}}]})
+    eq("multi: fake HA enforces the invalid-target contract too", malformed_status, 400)
+
+    store.time_zone = "Asia/Shanghai"
+    restarted._schedule_clock["at"] = 0
+    client2.get("/api/automations")
+    eq("clock: the real HTTP config endpoint supplies HA's timezone",
+       str(restarted._schedule_clock["zone"]), "Asia/Shanghai")
+    eq("clock: HA UTC trigger timestamps convert to HA's calendar date",
+       restarted._schedule_local_naive("2030-11-08T18:30:00Z"), datetime(2030, 11, 9, 2, 30))
+    store.time_zone = "No/SuchZone"
+    restarted._schedule_clock.update(zone=None, at=0)
+    unknown_clock = client2.post("/api/automations", headers=UI_HEADER, json_body={
+        "time": "08:00", "once": True, "date": tomorrow, "domain": "light",
+        "service": "turn_on", "entity_id": "light.kitchen"})
+    eq("clock: unknown HA timezone refuses one-shots instead of guessing", unknown_clock.status_code, 503)
+    store.time_zone = "UTC"
+    restarted._schedule_clock.update(zone=None, at=0)
 
     # ── I: nothing reached HA's config store without the configured token ──
     denied_path = "/api/config/automation/config/" + denied_id

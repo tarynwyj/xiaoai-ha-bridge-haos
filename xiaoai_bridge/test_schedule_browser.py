@@ -64,6 +64,7 @@ def main() -> int:
     posted: list[dict] = []
     toggles: list[dict] = []
     updated: list[dict] = []
+    cleanups: list[str] = []
     state = {"fail_create": False, "automations": []}
 
     def open_page(page):
@@ -71,6 +72,11 @@ def main() -> int:
             request = route.request
             path = request.url.split("://", 1)[-1]
             path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+            if path == "/api/automations/cleanup":
+                cleanups.append(request.method)
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True, "removed": 1}))
+                return
             if path.startswith("/api/automations/") and path.endswith("/toggle"):
                 toggles.append(json.loads(request.post_data or "{}"))
                 route.fulfill(status=200, content_type="application/json",
@@ -340,6 +346,25 @@ def main() -> int:
                       "xiaoai_bridge_0730_switch_reshui")
             result.eq("the PUT keeps the service", body.get("service"), "turn_on")
 
+            page.evaluate("""() => {
+                scheduleItems=[{config_id:'xiaoai_bridge_multi',entity:['light.kitchen','light.study_desk'],
+                  domain:'light',service:'turn_on',time:'08:00',weekdays:[],data:{brightness_pct:35}}];
+                editSchedule('xiaoai_bridge_multi');
+            }""")
+            page.wait_for_timeout(400)
+            result.check("editing multiple targets opens advanced mode",
+                         page.eval_on_selector('#sch-advanced', 'el => el.open'))
+            result.eq("editing keeps both targets in the entity field",
+                      page.input_value('#sch-entity'), 'light.kitchen,light.study_desk')
+            updated.clear()
+            page.click('#sch-create')
+            page.wait_for_timeout(400)
+            result.eq("saving a multi-target edit keeps both target ids",
+                      (updated[0] if updated else {}).get('entity_id'), 'light.kitchen,light.study_desk')
+            result.eq("reading the list never calls cleanup", cleanups, [])
+            page.locator('button[onclick="cleanupSchedules()"]').click()
+            page.wait_for_timeout(400)
+            result.eq("explicit cleanup sends POST exactly once", cleanups, ['POST'])
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()
     finally:

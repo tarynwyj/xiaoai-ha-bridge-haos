@@ -448,6 +448,21 @@ def main():
         assert [t["deviceID"] for t in targets] == ["speaker-A", "speaker-C"], targets
         ok("a saved listening scope survives the round trip and drives _poll_targets")
 
+        before_scope = (root / "config" / "config.yaml").read_bytes()
+        for invalid in ([], [" "], [None], 42):
+            refused = client.post("/api/config", headers=UI_HEADER, json_body={
+                "section": "xiaomi",
+                "revision": client.get("/api/config").json()["_section_revisions"]["xiaomi"],
+                "config": {"xiaomi": {"device_scope": "selected", "device_ids": invalid,
+                                       "device_id": "", "device_did": ""}}})
+            assert refused.status_code == 400, refused.text
+            assert (root / "config" / "config.yaml").read_bytes() == before_scope
+        legacy_refused = client.post("/api/config", headers=UI_HEADER, json_body={
+            "config": {"xiaomi": {"device_scope": "selected", "device_ids": []}}})
+        assert legacy_refused.status_code == 400, legacy_refused.text
+        assert bridge._poll_targets({"device_scope": "selected", "device_ids": []}, devices) == []
+        ok("empty/invalid selections are refused by scoped and legacy APIs and fail closed at runtime")
+
         all_rev = client.get("/api/config").json()["_section_revisions"]["xiaomi"]
         all_save = client.post(
             "/api/config", headers=UI_HEADER,

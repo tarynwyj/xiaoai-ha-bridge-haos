@@ -44,6 +44,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -1146,7 +1147,9 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
     eq("multi: fake HA enforces the invalid-target contract too", malformed_status, 400)
 
     store.time_zone = "Asia/Shanghai"
-    restarted._schedule_clock["at"] = 0
+    # monotonic() may be < 300 on a freshly booted CI runner; zero is not
+    # necessarily older than the five-minute cache TTL.
+    restarted._schedule_clock["at"] = time.monotonic() - 301
     client2.get("/api/automations")
     eq("clock: the real HTTP config endpoint supplies HA's timezone",
        str(restarted._schedule_clock["zone"]), "Asia/Shanghai")

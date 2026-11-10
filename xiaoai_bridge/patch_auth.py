@@ -1326,6 +1326,110 @@ async def clear_xiaomi_login():
 ''',
 )
 
+# ──────────────── 实时音箱列表：面板「刷新」不能只读 /api/status 缓存 ────────────────
+replace_exact(
+    "live speaker list endpoint",
+    '''@app.get("/api/status")
+async def get_status():
+    uptime = None
+    if bridge_state["start_time"]:
+        uptime = int(time.time() - bridge_state["start_time"])
+    return {**bridge_state, "uptime": uptime}
+''',
+    '''@app.get("/api/status")
+async def get_status():
+    uptime = None
+    if bridge_state["start_time"]:
+        uptime = int(time.time() - bridge_state["start_time"])
+    return {**bridge_state, "uptime": uptime}
+
+
+def _speaker_list(devices) -> list:
+    """Only the fields the panel renders; never expose other account data."""
+    result = []
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        device_id = str(device.get("deviceID") or device.get("did") or "").strip()
+        if not device_id:
+            continue
+        result.append({
+            "deviceID": device_id,
+            "name": str(device.get("name") or "未知音箱"),
+            "hardware": str(device.get("hardware") or device.get("model") or ""),
+        })
+    return result
+
+
+def _cached_speakers() -> list:
+    cached = bridge_state.get("devices")
+    return _speaker_list(cached) if isinstance(cached, list) else []
+
+
+@app.get("/api/xiaomi/speakers")
+async def xiaomi_speakers():
+    """Ask Xiaomi for the speaker list instead of replaying /api/status.
+
+    The saved micoapi token is enough for device_list, so the panel can refresh
+    while the bridge is stopped, right after a page reload and after switching
+    accounts. A failure returns the cached list (ok=false) instead of clearing
+    what the panel already has.
+    """
+    cfg = load_config()
+    if not _load_saved_xiaomi_identity():
+        return JSONResponse(
+            {"ok": False, "code": "login_required", "devices": [],
+             "msg": "还没有保存的小米登录信息，请先在「小米账号」页登录"},
+            status_code=401,
+        )
+    try:
+        from miservice import MiNAService
+    except ImportError:
+        return JSONResponse(
+            {"ok": False, "code": "dependency_missing", "devices": [],
+             "msg": "缺少 miservice 依赖，无法向小米获取音箱列表"},
+            status_code=500,
+        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            account = _build_token_account(session, cfg)
+            _set_token(account, cfg)
+            token = getattr(account, "token", None)
+            if not isinstance(token, dict) or not token.get("micoapi"):
+                return JSONResponse(
+                    {"ok": False, "code": "login_incomplete", "devices": [],
+                     "msg": "已保存的登录信息不完整，请重新登录（或先启动一次桥接器）"},
+                    status_code=401,
+                )
+            devices = await MiNAService(account).device_list()
+    except Exception as exc:
+        cached = _cached_speakers()
+        verdict = _miservice_auth_failure(exc)
+        if verdict:
+            log.warning("刷新音箱列表失败（登录态）: %s", verdict.get("message"))
+            return JSONResponse(
+                {"ok": False, "code": "login_expired", "devices": cached,
+                 "source": "cache" if cached else "none",
+                 "msg": verdict.get("message") or "小米登录已失效，请重新登录"},
+                status_code=401,
+            )
+        log.warning("刷新音箱列表失败: %s", type(exc).__name__)
+        return JSONResponse(
+            {"ok": False, "code": "xiaomi_unavailable", "devices": cached,
+             "source": "cache" if cached else "none",
+             "msg": "向小米获取音箱列表失败，已保留原来的列表与选择"},
+            status_code=502,
+        )
+    speakers = _speaker_list(devices)
+    if isinstance(devices, list):
+        bridge_state["devices"] = devices
+    return {"ok": True, "source": "xiaomi", "devices": speakers,
+            "count": len(speakers),
+            "msg": ("已从小米获取 %d 台音箱" % len(speakers)) if speakers
+                   else "小米账号下没有发现小爱音箱"}
+''',
+)
+
 # ──────────────── B: 恢复扫码登录流程的 TLS 证书校验 ────────────────
 replace_exact(
     "qr service login tls",

@@ -1469,6 +1469,7 @@ replace_exact(
         <div class="field"><label class="toggle-label"><input type="radio" name="mi-scope-mode" id="mi-scope-mode-selected" value="selected" onchange="setMiScopeMode('selected')"> 仅监听所选音箱</label></div>
         <div id="mi-scope-list" style="margin:8px 0"></div>
         <div id="mi-scope-status" style="font-size:12px;color:var(--txt-muted);line-height:1.7"></div>
+        <div id="mi-scope-notice" style="font-size:12px;line-height:1.7;min-height:18px"></div>
         <div class="input-row" style="margin-top:8px"><button type="button" class="btn btn-mini" id="mi-scope-refresh" onclick="refreshMiSpeakers()">&#8635; 刷新音箱列表</button></div>
       </div>''',
 )
@@ -1485,16 +1486,40 @@ replace_exact(
     '''function selectDevice(hw,did){if(hw)document.getElementById('mi-hardware').value=hw;if(did)document.getElementById('mi-did').value=did}
 
 async function refreshMiSpeakers(){
-  /* 页面刷新/切换回来时重新取一次音箱列表：之前只有登录成功那一刻才有数据，
-     卡片随后就一直是 display:none，用户找不到监听范围入口。 */
+  /* 页面刷新/切换回来时：先按已保存的选择把卡片显示出来，再向小米要一次实时列表。
+     后端用 /data 里保存的登录态调用 device_list，所以桥接器没运行时也能刷新。
+     任何失败都只改提示文字，绝不清空已保存或未保存的勾选。 */
+  renderMiScope();
+  if(globalThis.miScopeRefreshing)return;
+  globalThis.miScopeRefreshing=true;
+  var btn=document.getElementById('mi-scope-refresh');
+  var had=Array.isArray(globalThis.miScopeDevices)?globalThis.miScopeDevices.length:0;
+  if(btn){btn.disabled=true;btn.textContent='⟳ 正在获取…'}
+  miScopeNotice('正在向小米获取音箱列表…','muted');
   try{
-    const r=await fetch('/api/status');
-    const d=await r.json();
-    renderMiScope(Array.isArray(d.devices)?d.devices:[]);
+    var r=await fetch('/api/xiaomi/speakers');
+    var d={};try{d=await r.json()}catch(e){}
+    if(r.ok&&d&&d.ok&&Array.isArray(d.devices)){
+      var list=miScopeDeviceList(d.devices);
+      renderMiScope(list);
+      miScopeNotice(list.length?('已从小米获取 '+list.length+' 台音箱。'):'小米账号下没有发现音箱；已保存的选择会标为「当前未发现」。',list.length?'ok':'warn');
+    }else if(d&&Array.isArray(d.devices)&&d.devices.length&&!had){
+      renderMiScope(miScopeDeviceList(d.devices));
+      miScopeNotice('刷新失败，先显示上次缓存的音箱列表。'+(d.msg||''),'warn');
+    }else{
+      var why=(d&&(d.msg||d.detail))?String(d.msg||d.detail):('HTTP '+r.status);
+      miScopeNotice('刷新失败：'+why+'；已保留当前列表与选择。','err');
+    }
   }catch(e){
-    renderMiScope([]);
+    miScopeNotice('无法连接桥接器，已保留当前列表与选择。','err');
+  }finally{
+    globalThis.miScopeRefreshing=false;
+    globalThis.miScopeRefreshDone=(globalThis.miScopeRefreshDone||0)+1;
+    if(btn){btn.disabled=false;btn.textContent='↻ 刷新音箱列表'}
   }
 }
+function miScopeDeviceList(devices){var out=[];(Array.isArray(devices)?devices:[]).forEach(function(dev){if(!dev||typeof dev!=='object')return;var id=String(dev.deviceID||dev.did||'').trim();if(!id)return;out.push({deviceID:id,name:String(dev.name||'未知音箱'),hardware:String(dev.hardware||dev.model||'')})});return out}
+function miScopeNotice(text,kind){var box=document.getElementById('mi-scope-notice');if(!box)return;box.textContent=text||'';box.style.color=kind==='err'?'var(--red)':(kind==='warn'?'var(--orange)':'var(--txt-muted)')}
 
 function miScopeNormIds(raw){var out=[];if(raw==null)return out;if(typeof raw==='string'){raw=raw.split(',');}if(!Array.isArray(raw))return out;raw.forEach(function(v){if(typeof v!=='string')return;var s=v.trim();if(!s)return;if(out.indexOf(s)<0)out.push(s);});return out}
 function miScopeSaved(){var mi=(cfg&&cfg.xiaomi)||{};var ids=miScopeNormIds(mi.device_ids);if(mi.device_scope==='all')return{mode:'all',ids:[]};if(mi.device_scope==='selected')return{mode:'selected',ids:ids};var single=String(mi.device_id||mi.device_did||'').trim();if(ids.length)return{mode:'selected',ids:ids};if(single)return{mode:'selected',ids:[single],legacy:true};return{mode:'all',ids:[]}}
@@ -1508,7 +1533,7 @@ function miScopeClearAll(){var d=miScopeInit();d.mode='selected';d.legacy=false;
 function miScopeCollect(){var d=miScopeInit();if(d.mode==='all')return{ok:true,mode:'all',ids:[]};if(!d.ids.length)return{ok:false,mode:'selected',ids:[],msg:'“仅监听所选”至少要选一台音箱'};return{ok:true,mode:'selected',ids:d.ids.slice()}}
 function miScopeDirty(){var s=miScopeSaved();var d=miScopeInit();if(s.mode!==d.mode)return true;if(s.mode==='all')return false;if(s.ids.length!==d.ids.length)return true;for(var i=0;i<s.ids.length;i++){if(d.ids.indexOf(s.ids[i])<0)return true}return false}
 function miScopeStatus(){var box=document.getElementById('mi-scope-status');var cnt=document.getElementById('mi-scope-count');var d=miScopeInit();var rows=miScopeRows();var missing=rows.filter(function(r){return r.missing}).length;if(cnt)cnt.textContent='('+(d.mode==='all'?'全部':d.ids.length+' 台')+')';if(!box)return;var text='';if(d.mode==='all'){text='当前监听：全部小爱音箱，下面已全部勾选。要逐台选择，请先切换到「仅监听所选音箱」。新发现的音箱会自动纳入。'}else if(!d.ids.length){text='当前监听：未选择任何音箱，保存会被拒绝。'}else{text='当前监听：已选 '+d.ids.length+' 台。'}if(missing>0)text+=' 其中 '+missing+' 台当前未发现，已保留配置。';if(d.legacy)text+=' 这是旧版单台配置，保存后会转为“仅监听所选”。';text+=miScopeDirty()?' 有未保存的修改。':' 已保存。';box.textContent=text}
-function renderMiScope(devices){if(devices!==undefined)globalThis.miScopeDevices=devices||[];var card=document.getElementById('mi-scope-card');var list=document.getElementById('mi-scope-list');if(!card||!list)return;card.style.display='';var d=miScopeInit();var all=document.getElementById('mi-scope-mode-all');var sel=document.getElementById('mi-scope-mode-selected');if(all)all.checked=d.mode==='all';if(sel)sel.checked=d.mode==='selected';var rows=miScopeRows();list.innerHTML=rows.map(function(r,i){var checked=(d.mode==='all'||d.ids.indexOf(r.id)>=0)?' checked':'';var disabled=(d.mode==='all')?' disabled':'';return'<label class="rule-item" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" class="mi-scope-box" data-index="'+i+'"'+checked+disabled+' onchange="toggleMiScopeIndex('+i+',this.checked)"><span style="color:var(--txt-primary);font-size:14px">'+escHtml(r.name)+'</span><span style="color:var(--txt-muted);font-size:11px">'+escHtml(r.hw)+'</span><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">'+escHtml(r.id.length>12?r.id.substring(0,12)+'...':r.id)+'</span></label>'}).join('');if(!rows.length){list.innerHTML='<div class="entity-empty" style="padding:6px">还没拿到音箱列表：先到仪表盘点「启动」，或点下方「刷新音箱列表」。</div>'}miScopeStatus()}''',
+function renderMiScope(devices){if(devices!==undefined)globalThis.miScopeDevices=devices||[];var card=document.getElementById('mi-scope-card');var list=document.getElementById('mi-scope-list');if(!card||!list)return;card.style.display='';var d=miScopeInit();var all=document.getElementById('mi-scope-mode-all');var sel=document.getElementById('mi-scope-mode-selected');if(all)all.checked=d.mode==='all';if(sel)sel.checked=d.mode==='selected';var rows=miScopeRows();list.innerHTML=rows.map(function(r,i){var checked=(d.mode==='all'||d.ids.indexOf(r.id)>=0)?' checked':'';var disabled=(d.mode==='all')?' disabled':'';return'<label class="rule-item" style="display:flex;align-items:center;gap:8px;cursor:pointer"><input type="checkbox" class="mi-scope-box" data-index="'+i+'" data-id="'+escAttr(r.id)+'"'+checked+disabled+' onchange="toggleMiScopeIndex('+i+',this.checked)"><span style="color:var(--txt-primary);font-size:14px">'+escHtml(r.name)+'</span><span style="color:var(--txt-muted);font-size:11px">'+escHtml(r.hw)+'</span><span style="color:var(--txt-dim);font-size:10px;font-family:JetBrains Mono,monospace">'+escHtml(r.id.length>12?r.id.substring(0,12)+'...':r.id)+'</span></label>'}).join('');if(!rows.length){list.innerHTML='<div class="entity-empty" style="padding:6px">还没拿到音箱列表：先到仪表盘点「启动」，或点下方「刷新音箱列表」。</div>'}miScopeStatus()}''',
 )
 
 replace_exact(

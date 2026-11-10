@@ -214,11 +214,16 @@ def main() -> int:
             " && (globalThis.miScopeRefreshDone || 0) > n",
             arg=after, timeout=5000)
 
+    def wait_config(page):
+        page.wait_for_function(
+            "() => { const el = document.getElementById('mi-username');"
+            " return el && el.value === 'u@example.com'; }", timeout=5000)
+
     def reload_page(page, mi, status_devices=None, speakers=None,
                     expect_http_error=False):
         """Re-open the panel with a fresh config / speaker backend state."""
         state["config"] = json.loads(json.dumps(BASE_CONFIG))
-        state["config"]["xiaomi"] = json.loads(json.dumps(mi))
+        state["config"]["xiaomi"].update(json.loads(json.dumps(mi)))
         state["revisions"] = {key: "fixture-" + key + "-0"
                               for key in ("xiaomi", "ha", "rules", "adv")}
         state["status_devices"] = json.loads(
@@ -229,6 +234,7 @@ def main() -> int:
         state["expect_http_error"] = expect_http_error
         page.reload()
         page.wait_for_function("typeof renderDeviceList === 'function'")
+        wait_config(page)
         page.click('.sidebar-item[data-page="xiaomi"]')
         page.wait_for_selector("#mi-scope-card", state="visible", timeout=5000)
         wait_refresh(page)
@@ -254,6 +260,7 @@ def main() -> int:
             open_page(page)
             page.goto(url)
             page.wait_for_function("typeof renderDeviceList === 'function'")
+            wait_config(page)
             # The 小米账号 page is a tab; the scope card lives on it, so open it
             # the way a user would instead of poking at a hidden subtree.
             page.click('.sidebar-item[data-page="xiaomi"]')

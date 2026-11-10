@@ -6049,6 +6049,43 @@ replace_exact(
 TOKEN_REFRESH_RETRY = 300
 
 
+def _proactive_refresh_retry_plan(outcome: dict | None,
+                                  failure: dict | None) -> tuple:
+    '''(fatal, wait_seconds, message) for a failed proactive renewal.
+
+    Unlike the 401 recovery path the current serviceToken normally still works.
+    A transient network/STS failure keeps polling and retries soon. A rejected
+    credential is terminal for the auto-renewal path: retrying every 300 s only
+    repeats the same rejection, so auto renewal stops until a new login changes
+    the saved credentials (bridge_loop watches their fingerprint).
+    '''
+    outcome = outcome or {}
+    failure = failure or {}
+    stage = str(outcome.get("stage") or "")
+    # A login change raced the exchange; the next loop iteration re-reads the
+    # credentials and retries immediately, so this is not a terminal rejection.
+    if stage == "superseded":
+        return (False, TOKEN_REFRESH_RETRY,
+                "登录凭据已变化，正在切换到新的登录态；当前监听仍可用")
+    if failure.get("fatal"):
+        kind = failure.get("kind")
+        if kind == "identity":
+            message = ("自动续期已停止：小米返回的账号与已保存账号不一致。"
+                       "请确认账号后重新登录；当前监听仍可用")
+        elif kind == "missing":
+            message = ("自动续期已停止：已保存的登录凭据不完整。"
+                       "请重新扫码登录；当前监听仍可用")
+        else:
+            message = ("自动续期已停止：小米拒绝了这份登录凭据（code=%s），"
+                       "重试不会恢复。请到「小米账号」页重新扫码登录；"
+                       "当前监听仍可用" % failure.get("code"))
+        return (True, None, message)
+    message = ("自动续期异常（%s），%ss 后重试；当前监听仍可用"
+               % (failure.get("message") or outcome.get("message") or "未知原因",
+                  TOKEN_REFRESH_RETRY))
+    return (False, TOKEN_REFRESH_RETRY, message)
+
+
 def _refresh_interval_seconds(mi_cfg: dict | None = None) -> int:
     \"\"\"How often to renew the micoapi session before it expires (default 6h).\"\"\"
     import math
@@ -6139,15 +6176,20 @@ replace_exact(
                             log.error("登录态已续期但未能持久化: %s",
                                       outcome.get("message") or "写入失败")
                     else:
-                        # 续期失败不等于登录失败：当前 serviceToken 还能用，先重试，
-                        # 不要把它写成面板错误，否则用户会被误导去重新扫码。
-                        next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
-                        bridge_state["renewal"] = (
-                            "当前登录仍可用，但自动续期异常（%s），%ss 后重试"
-                            % (outcome.get("message") or "未知原因", TOKEN_REFRESH_RETRY)
-                        )
-                        log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
-                                    TOKEN_REFRESH_RETRY)
+                        # 续期失败不等于登录失败：当前 serviceToken 通常还能用，轮询继续。
+                        # 临时网络/STS 故障按短间隔重试；小米明确拒绝凭据时停止自动换票
+                        # （不再每 5 分钟重复同一次拒绝），等用户重新登录后由凭据指纹
+                        # 变化自动恢复。
+                        fatal, wait_seconds, message = _proactive_refresh_retry_plan(
+                            outcome, _last_refresh_failure)
+                        bridge_state["renewal"] = message
+                        if fatal:
+                            next_refresh_at = float("inf")
+                            log.error("%s", message)
+                        else:
+                            next_refresh_at = time.time() + wait_seconds
+                            log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
+                                        wait_seconds)
 
                 device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
 """,

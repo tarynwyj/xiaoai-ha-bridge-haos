@@ -1980,6 +1980,12 @@ async function verifyCookieTicket(){
 async function qrLogin(){""",
 )
 
+replace_exact(
+    "dashboard shows proactive renewal warnings",
+    """  if(s.error){showAlert(a,'err','✗ '+s.error)}else{a.classList.remove('show')}""",
+    """  if(s.error){showAlert(a,'err','✗ '+s.error)}else if(s.renewal){showAlert(a,'warn','⚠ '+s.renewal)}else{a.classList.remove('show')}""",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

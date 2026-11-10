@@ -395,6 +395,11 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "relative API base / CSRF header wrapper missing",
         ),
         (
+            "dashboard surfaces proactive renewal warnings",
+            "else if(s.renewal){showAlert(a,'warn'" in html,
+            "the renewal warning from /api/status is not rendered on the dashboard",
+        ),
+        (
             "clear saved login credentials button added",
             'onclick="clearXiaomiLogin()"' in html
             and "async function clearXiaomiLogin()" in html

@@ -80,6 +80,7 @@ WANTED_FUNCS = [
     "_relogin_and_refresh",
     "_relogin_failure_from",
     "_relogin_retry_plan",
+    "_proactive_refresh_retry_plan",
     "_credential_fingerprint",
     "_wait_for_relogin",
     "_refresh_interval_seconds",
@@ -1046,15 +1047,154 @@ def scenario_renewal_failure_stays_quiet(root: Path):
         FakeAccount.transport_error = False
 
     assert harness.bridge_state["error"] is None, (
-        "a failed renewal must not become a panel error while polling still works, "
+        "a temporary renewal failure must not become a panel error while polling still works, "
         f"got {harness.bridge_state['error']!r}"
     )
     assert harness.log.has("登录态续期失败"), "the failure must still be visible in the log"
+    renewal = harness.bridge_state.get("renewal") or ""
+    assert "自动续期异常" in renewal and "300s 后重试" in renewal, (
+        f"a temporary failure must use the short retry window, got {renewal!r}"
+    )
     attempts = [m for m in harness.log.messages if "登录态主动续期" in m]
     assert len(attempts) == 1, (
         f"a failed renewal must back off, not retry on every poll, got {attempts}"
     )
-    return "a failed renewal retries quietly instead of demanding a new login"
+    token_after = harness.read_token()
+    assert token_after["micoapi"][1] == "valid-service", (
+        "a failed exchange must never clobber the still-working serviceToken"
+    )
+    assert harness.polled_devices, "polling must continue while the current token still works"
+    return "a temporary renewal failure retries in 300s without touching the working session"
+
+
+def scenario_proactive_renewal_rejected_stops_exchanging(root: Path):
+    """A 70016 rejection must stop auto renewal, not repeat it every 300 seconds."""
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 8
+    FakeAccount.reject_service_login = True
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 5:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    renewal = harness.bridge_state.get("renewal") or ""
+    assert "70016" in renewal, f"the panel message must show the Xiaomi code, got {renewal!r}"
+    assert "重新扫码" in renewal and "当前监听仍可用" in renewal, (
+        f"a rejection must ask for a new login and keep the current session, got {renewal!r}"
+    )
+    assert "正在自动重试" not in renewal, (
+        f"a terminal rejection must not promise a retry, got {renewal!r}"
+    )
+    assert harness.bridge_state["error"] is None, (
+        "a rejection must not be reported as a bridge error while polling still works"
+    )
+    attempts = [m for m in harness.log.messages if "登录态主动续期" in m]
+    assert len(attempts) == 1, (
+        f"a rejected credential must not be exchanged again every 300s, got {attempts}"
+    )
+    assert 300 not in harness.sleeps, (
+        f"the terminal pause must not schedule the 300s retry loop, got {harness.sleeps}"
+    )
+    token_after = harness.read_token()
+    assert token_after["micoapi"][1] == "valid-service", (
+        "a rejection must keep the still-valid token and credentials on disk"
+    )
+    assert len(harness.polled_devices) >= 2, (
+        f"polling must continue after a rejected auto renewal, got {harness.polled_devices}"
+    )
+    return "70016 stops auto renewal and keeps polling on the still-valid token"
+
+
+def scenario_proactive_renewal_rejected_recovers_after_login(root: Path):
+    """A fresh login must wake the terminal pause and restart renewal + polling."""
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 12
+    FakeAccount.reject_service_login = True
+    captured = {}
+
+    async def bounded_sleep(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) == 1:
+            captured["token_before"] = harness.read_token()
+            captured["polls_before"] = len(harness.polled_devices)
+            FakeAccount.reject_service_login = False
+            harness.write_token(
+                {
+                    "userId": "user-1",
+                    "passToken": "pass-2",
+                    "deviceId": "account-device",
+                    "micoapi": ["old-ssecurity", "valid-service"],
+                    "issued_at": int(time.time()) - 10 * 3600,
+                }
+            )
+            harness.write_auth(
+                {"userId": "user-1", "passToken": "pass-2", "deviceId": "account-device"}
+            )
+        if len(harness.sleeps) >= 5:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = bounded_sleep
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    assert captured["token_before"]["micoapi"][1] == "valid-service", (
+        "the rejected exchange must not delete the working token before the user logs in"
+    )
+    token_after = harness.read_token()
+    assert token_after["passToken"] in ("pass-2", "pass-token-rotated"), (
+        f"the new login must replace the rejected credential, got {token_after}"
+    )
+    assert token_after["micoapi"][1] == "fresh-service-token", (
+        f"a new login must restart automatic renewal, got {token_after}"
+    )
+    assert harness.bridge_state["renewal"] is None, (
+        f"a successful renewal must clear the warning, got {harness.bridge_state['renewal']!r}"
+    )
+    assert harness.bridge_state["error"] is None
+    assert harness.log.has("检测到登录凭据变化"), (
+        f"the loop must notice the new credential file, log={harness.log.messages}"
+    )
+    assert harness.log.has("登录态续期成功"), (
+        f"the new login must restart proactive renewal, log={harness.log.messages}"
+    )
+    assert len(harness.polled_devices) > captured["polls_before"], (
+        "polling must resume after the fresh login, "
+        f"before={captured['polls_before']}, after={len(harness.polled_devices)}"
+    )
+    return "a new login wakes the paused renewal immediately and polling continues"
 
 
 def scenario_device_id_stays_stable(root: Path):
@@ -1428,6 +1568,8 @@ def main():
         scenario_unsaved_renewal_retries_persistence,
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
+        scenario_proactive_renewal_rejected_stops_exchanging,
+        scenario_proactive_renewal_rejected_recovers_after_login,
         scenario_device_id_stays_stable,
         scenario_every_xiaoai_device_is_polled,
         scenario_poll_target_filtering,

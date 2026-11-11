@@ -263,6 +263,10 @@ def main():
                     f"got {response.status_code}"
                 )
                 assert response.json().get("auth_required") is True
+                assert response.header("x-bridge-auth") == "panel", (
+                    f"{method} {path} must mark a panel-auth 401, "
+                    f"got {response.header('x-bridge-auth')!r}"
+                )
         ok(f"all {len(paths)} /api routes reject unauthenticated access")
 
         # ── public docs must be disabled (no schema disclosure) ──
@@ -841,6 +845,9 @@ def main():
             anonymous = client.get("/api/xiaomi/speakers",
                                    headers={"Authorization": f"Bearer {token}"})
             assert anonymous.status_code == 401, anonymous.text
+            assert anonymous.header("x-bridge-auth") == "xiaomi", (
+                "a Xiaomi-login 401 must not look like an expired panel session"
+            )
             assert anonymous.json()["code"] == "login_required"
             ok("刷新 without saved Xiaomi credentials answers 401 login_required")
         finally:

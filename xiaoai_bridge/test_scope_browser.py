@@ -171,8 +171,12 @@ def main() -> int:
             if path.startswith("/api/xiaomi/speakers"):
                 state["speaker_calls"] += 1
                 spec = state["speakers"]
+                # Mirror the real backend: a Xiaomi-login 401 is marked so the
+                # page does not mistake it for an expired panel session.
+                headers = ({"X-Bridge-Auth": "xiaomi"}
+                           if spec["status"] == 401 else {})
                 route.fulfill(status=spec["status"], content_type="application/json",
-                              body=json.dumps(spec["body"]))
+                              headers=headers, body=json.dumps(spec["body"]))
                 return
             if path.startswith("/api/status"):
                 state["status_calls"] += 1
@@ -412,10 +416,8 @@ def main() -> int:
                                  "body": {"ok": False, "code": "login_expired",
                                           "msg": "小米登录已失效，请重新登录"}}
             state["expect_http_error"] = True
-            # The global fetch wrapper reloads on 401; this scenario is about the
-            # endpoint handler, so opt out of that reload the way the wrapper does
-            # after its first pass.
-            page.evaluate("window.__bridgeAuthReloaded=true")
+            # No __bridgeAuthReloaded bypass here: a Xiaomi-login 401 must not
+            # trigger the panel-session reload at all.
             before_refresh = refresh_count(page)
             page.click("#mi-scope-refresh")
             wait_refresh(page, before_refresh)
@@ -426,6 +428,8 @@ def main() -> int:
             result.check("401: the draft is still marked unsaved",
                          "未保存" in scope_status(page), scope_status(page))
             result.eq("401: the page was not reloaded", page.url, url)
+            result.check("401: the panel-reload guard was not armed",
+                         page.evaluate("() => window.__bridgeAuthReloaded === true") is False)
             state["expect_http_error"] = False
 
             # 4) 500 while refreshing: the discovered list and the picks stay.

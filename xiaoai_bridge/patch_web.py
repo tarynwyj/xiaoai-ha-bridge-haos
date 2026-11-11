@@ -37,7 +37,7 @@ replace_exact(
       else{init.headers=Object.assign({},h||{},{'X-Requested-With':'xiaoai-bridge'});}
     }
     return nativeFetch(input,init).then(function(r){
-      if(r.status===401&&!window.__bridgeAuthReloaded){
+      if(r.status===401&&(!r.headers||r.headers.get('X-Bridge-Auth')!=='xiaomi')&&!window.__bridgeAuthReloaded){
         window.__bridgeAuthReloaded=true;
         document.documentElement.innerHTML='<body style="font-family:system-ui;padding:40px;color:#111">会话已失效，正在返回登录页…</body>';
         setTimeout(function(){location.reload()},600);

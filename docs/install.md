@@ -57,7 +57,7 @@ https://github.com/tarynwyj/xiaoai-ha-bridge-haos
    `http://homeassistant.local:8123`；如果你的 HA 换了端口或地址，填实际能访问的那个。
 2. 填长期访问令牌。在 Home Assistant 里点左下角头像 → 个人资料 → 拉到最下面
    「长期访问令牌」→ 创建令牌 → 复制。
-3. 点「测试」。提示连接成功即可。
+3. 点「测试」确认能连上，再点「保存」。只点「测试」不会保存地址和令牌。
 
 令牌只保存在本加载项的 `/data` 里，用来调用 Home Assistant 的服务。
 

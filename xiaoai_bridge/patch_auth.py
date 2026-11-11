@@ -1109,6 +1109,7 @@ async def _enforce_access_control(request: Request, call_next):
                     "msg": "未授权：请通过 Home Assistant Ingress 面板访问，或先登录直连令牌",
                 },
                 status_code=401,
+                headers={"X-Bridge-Auth": "panel"},
             )
         if path in ("/", "/index.html"):
             return HTMLResponse(LOGIN_PAGE_HTML)
@@ -1366,6 +1367,17 @@ def _cached_speakers() -> list:
     return _speaker_list(cached) if isinstance(cached, list) else []
 
 
+def _xiaomi_auth_response(payload: dict) -> JSONResponse:
+    """A 401 about the Xiaomi account, not about the panel session.
+
+    The browser fetch wrapper reloads the whole page on panel-session 401s.
+    This header keeps "Xiaomi is not logged in yet" from being mistaken for an
+    expired Ingress/direct session (which would interrupt first-time setup).
+    """
+    return JSONResponse(payload, status_code=401,
+                        headers={"X-Bridge-Auth": "xiaomi"})
+
+
 @app.get("/api/xiaomi/speakers")
 async def xiaomi_speakers():
     """Ask Xiaomi for the speaker list instead of replaying /api/status.
@@ -1377,11 +1389,9 @@ async def xiaomi_speakers():
     """
     cfg = load_config()
     if not _load_saved_xiaomi_identity():
-        return JSONResponse(
+        return _xiaomi_auth_response(
             {"ok": False, "code": "login_required", "devices": [],
-             "msg": "还没有保存的小米登录信息，请先在「小米账号」页登录"},
-            status_code=401,
-        )
+             "msg": "还没有保存的小米登录信息，请先在「小米账号」页登录"})
     try:
         from miservice import MiNAService
     except ImportError:
@@ -1396,23 +1406,19 @@ async def xiaomi_speakers():
             _set_token(account, cfg)
             token = getattr(account, "token", None)
             if not isinstance(token, dict) or not token.get("micoapi"):
-                return JSONResponse(
+                return _xiaomi_auth_response(
                     {"ok": False, "code": "login_incomplete", "devices": [],
-                     "msg": "已保存的登录信息不完整，请重新登录（或先启动一次桥接器）"},
-                    status_code=401,
-                )
+                     "msg": "已保存的登录信息不完整，请重新登录（或先启动一次桥接器）"})
             devices = await MiNAService(account).device_list()
     except Exception as exc:
         cached = _cached_speakers()
         verdict = _miservice_auth_failure(exc)
         if verdict:
             log.warning("刷新音箱列表失败（登录态）: %s", verdict.get("message"))
-            return JSONResponse(
+            return _xiaomi_auth_response(
                 {"ok": False, "code": "login_expired", "devices": cached,
                  "source": "cache" if cached else "none",
-                 "msg": verdict.get("message") or "小米登录已失效，请重新登录"},
-                status_code=401,
-            )
+                 "msg": verdict.get("message") or "小米登录已失效，请重新登录"})
         log.warning("刷新音箱列表失败: %s", type(exc).__name__)
         return JSONResponse(
             {"ok": False, "code": "xiaomi_unavailable", "devices": cached,

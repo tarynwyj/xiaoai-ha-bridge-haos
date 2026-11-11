@@ -395,6 +395,11 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "relative API base / CSRF header wrapper missing",
         ),
         (
+            "panel 401 reload is scoped to panel auth",
+            "r.headers.get('X-Bridge-Auth')!=='xiaomi'" in html,
+            "a Xiaomi-login 401 would be treated as an expired panel session",
+        ),
+        (
             "clear saved login credentials button added",
             'onclick="clearXiaomiLogin()"' in html
             and "async function clearXiaomiLogin()" in html

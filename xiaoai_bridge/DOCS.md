@@ -85,7 +85,7 @@
 | 直连令牌 | `/data/config/.access_token` |
 | 日志 | `/data/logs/bridge.log` |
 
-数据不上传给作者，但运行时会与小米服务端、你填写的 Home Assistant 通信；开启「AI托管」后，
+数据不会上传到作者服务器，但运行时会与小米服务端、你填写的 Home Assistant 通信；开启「AI托管」后，
 未匹配的语音文本会发给你配置的 AI 接口（默认关闭）。`/data` 会随 HA 备份一起备份，
 **备份里含凭据**，请自己保管。
 

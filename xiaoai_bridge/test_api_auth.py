@@ -263,6 +263,10 @@ def main():
                     f"got {response.status_code}"
                 )
                 assert response.json().get("auth_required") is True
+                assert response.header("x-bridge-auth") == "panel", (
+                    f"{method} {path} must mark a panel-auth 401, "
+                    f"got {response.header('x-bridge-auth')!r}"
+                )
         ok(f"all {len(paths)} /api routes reject unauthenticated access")
 
         # ── public docs must be disabled (no schema disclosure) ──
@@ -767,6 +771,91 @@ def main():
         assert cfg_final["xiaomi"]["cookie_text"] == ""
         assert not (root / "config" / ".mi.token").exists()
         ok("cleared credentials stay cleared (no silent resurrection)")
+
+        # ── 刷新音箱列表 must ask Xiaomi, not replay the /api/status cache ──
+        import types as _types
+
+        token_file.write_text(json.dumps({
+            "userId": "speaker-user", "passToken": "speaker-pass",
+            "deviceId": "login-device", "micoapi": ["speaker-sec", "speaker-service"],
+        }), encoding="utf-8")
+        auth_file.write_text(json.dumps({
+            "userId": "speaker-user", "passToken": "speaker-pass",
+            "deviceId": "login-device",
+        }), encoding="utf-8")
+        speaker_calls = []
+
+        class FakeMiAccount:
+            def __init__(self, *args, **kwargs):
+                self.token = {}
+
+        class FakeMiNAService:
+            def __init__(self, account):
+                self.account = account
+
+            async def device_list(self):
+                speaker_calls.append(self.account)
+                return [{"deviceID": "speaker-live", "name": "客厅音箱",
+                         "hardware": "L05C", "miotDID": "internal-only"}]
+
+        fake_miservice = _types.ModuleType("miservice")
+        fake_miservice.MiAccount = FakeMiAccount
+        fake_miservice.MiNAService = FakeMiNAService
+        fake_miaccount = _types.ModuleType("miservice.miaccount")
+        fake_miaccount.get_random = lambda n: "LOGINDEVICEID"
+        previous_modules = {name: sys.modules.get(name)
+                            for name in ("miservice", "miservice.miaccount")}
+        sys.modules["miservice"] = fake_miservice
+        sys.modules["miservice.miaccount"] = fake_miaccount
+        try:
+            bridge.bridge_state["devices"] = [
+                {"deviceID": "stale-cache", "name": "旧缓存音箱"}]
+            live = client.get("/api/xiaomi/speakers",
+                              headers={"Authorization": f"Bearer {token}"})
+            assert live.status_code == 200, live.text
+            payload = live.json()
+            assert payload["ok"] is True and payload["source"] == "xiaomi"
+            assert [d["deviceID"] for d in payload["devices"]] == ["speaker-live"]
+            assert "miotDID" not in payload["devices"][0]
+            assert len(speaker_calls) == 1, "device_list must be called for 刷新"
+            assert bridge.bridge_state["devices"][0]["deviceID"] == "speaker-live"
+            ok("刷新音箱列表 calls Xiaomi device_list and ignores the status cache")
+
+            bridge.bridge_state["devices"] = [
+                {"deviceID": "cached-speaker", "name": "缓存音箱"}]
+
+            class FailingMiNAService(FakeMiNAService):
+                async def device_list(self):
+                    raise TimeoutError("scripted Xiaomi timeout")
+
+            fake_miservice.MiNAService = FailingMiNAService
+            failed = client.get("/api/xiaomi/speakers",
+                                headers={"Authorization": f"Bearer {token}"})
+            assert failed.status_code == 502, failed.text
+            failed_payload = failed.json()
+            assert failed_payload["ok"] is False
+            assert [d["deviceID"] for d in failed_payload["devices"]] == ["cached-speaker"], (
+                "a failed refresh must return the cached list instead of clearing it"
+            )
+            ok("failed 刷新 returns 502 with the cached list, never an empty one")
+
+            token_file.unlink()
+            auth_file.unlink()
+            bridge.bridge_state["devices"] = []
+            anonymous = client.get("/api/xiaomi/speakers",
+                                   headers={"Authorization": f"Bearer {token}"})
+            assert anonymous.status_code == 401, anonymous.text
+            assert anonymous.header("x-bridge-auth") == "xiaomi", (
+                "a Xiaomi-login 401 must not look like an expired panel session"
+            )
+            assert anonymous.json()["code"] == "login_required"
+            ok("刷新 without saved Xiaomi credentials answers 401 login_required")
+        finally:
+            for name, module in previous_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
         # ── deterministically race a stale authentication request with clear ──
         async def race_stale_write_against_clear():

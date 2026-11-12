@@ -400,6 +400,12 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "a Xiaomi-login 401 would be treated as an expired panel session",
         ),
         (
+            "QR success without devices points at the refresh entry",
+            "登录已保存，但暂时没读到音箱列表" in html
+            and "refreshMiSpeakers()" in html,
+            "a QR login that saved credentials but found no devices gives no recovery hint",
+        ),
+        (
             "clear saved login credentials button added",
             'onclick="clearXiaomiLogin()"' in html
             and "async function clearXiaomiLogin()" in html

@@ -1936,6 +1936,12 @@ replace_exact(
     '<div id="sch-device-selected" style="font-size:12px;color:var(--txt-secondary);margin-top:6px"></div>',
 )
 
+replace_exact(
+    "QR success without devices points at the refresh entry",
+    "if(d2.ok&&d2.devices&&d2.devices.length>0)renderDeviceList(d2.devices)}else if(!d.ok)",
+    "if(d2.ok&&d2.devices&&d2.devices.length>0){renderDeviceList(d2.devices)}else{showAlert(a,'warn','⚠ 登录已保存，但暂时没读到音箱列表；可点「刷新音箱列表」重试');refreshMiSpeakers()}}else if(!d.ok)",
+)
+
 # ════════════════ 浏览器代签：绕开「服务器换票被小米拒绝」（1.0.19） ════════════════
 replace_exact(
     "xiaomi login: browser-signed ticket handler",

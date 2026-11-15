@@ -78,9 +78,9 @@ class Response:
         return None
 
 
-def call(app, method, path, *, headers=None, json_body=None, body=b"",
-         cookies=None, client=("testclient", 50000)):
-    """Invoke the ASGI app once and collect the response."""
+async def acall(app, method, path, *, headers=None, json_body=None, body=b"",
+                cookies=None, client=("testclient", 50000)):
+    """Drive the ASGI app once inside an already-running event loop."""
     header_pairs = []
     payload = body
     if json_body is not None:
@@ -128,8 +128,13 @@ def call(app, method, path, *, headers=None, json_body=None, body=b"",
         elif message["type"] == "http.response.body":
             received["body"].extend(message.get("body", b""))
 
-    asyncio.run(app(scope, receive, send))
+    await app(scope, receive, send)
     return Response(received["status"], received["headers"], bytes(received["body"]))
+
+
+def call(app, method, path, **kwargs):
+    """Invoke the ASGI app once and collect the response."""
+    return asyncio.run(acall(app, method, path, **kwargs))
 
 
 class Client:
@@ -775,14 +780,18 @@ def main():
         # ── 刷新音箱列表 must ask Xiaomi, not replay the /api/status cache ──
         import types as _types
 
-        token_file.write_text(json.dumps({
-            "userId": "speaker-user", "passToken": "speaker-pass",
-            "deviceId": "login-device", "micoapi": ["speaker-sec", "speaker-service"],
-        }), encoding="utf-8")
-        auth_file.write_text(json.dumps({
-            "userId": "speaker-user", "passToken": "speaker-pass",
-            "deviceId": "login-device",
-        }), encoding="utf-8")
+        def save_login(user_id):
+            token_file.write_text(json.dumps({
+                "userId": user_id, "passToken": user_id + "-pass",
+                "deviceId": "login-device",
+                "micoapi": ["speaker-sec", user_id + "-service"],
+            }), encoding="utf-8")
+            auth_file.write_text(json.dumps({
+                "userId": user_id, "passToken": user_id + "-pass",
+                "deviceId": "login-device",
+            }), encoding="utf-8")
+
+        save_login("speaker-user")
         speaker_calls = []
 
         class FakeMiAccount:
@@ -819,10 +828,14 @@ def main():
             assert "miotDID" not in payload["devices"][0]
             assert len(speaker_calls) == 1, "device_list must be called for 刷新"
             assert bridge.bridge_state["devices"][0]["deviceID"] == "speaker-live"
-            ok("刷新音箱列表 calls Xiaomi device_list and ignores the status cache")
+            assert bridge._device_cache_owner == "speaker-user", (
+                "a successful refresh must bind the cached list to the current account"
+            )
+            ok("刷新音箱列表 calls Xiaomi device_list and binds the cache to that account")
 
-            bridge.bridge_state["devices"] = [
-                {"deviceID": "cached-speaker", "name": "缓存音箱"}]
+            # 账号绑定语义：只有「同一个账号成功刷新过」之后，失败才允许回退缓存。
+            bridge._set_device_cache(
+                [{"deviceID": "cached-speaker", "name": "缓存音箱"}], "speaker-user")
 
             class FailingMiNAService(FakeMiNAService):
                 async def device_list(self):
@@ -835,13 +848,140 @@ def main():
             failed_payload = failed.json()
             assert failed_payload["ok"] is False
             assert [d["deviceID"] for d in failed_payload["devices"]] == ["cached-speaker"], (
-                "a failed refresh must return the cached list instead of clearing it"
+                "a failed refresh for this account must return its own cached list"
             )
-            ok("failed 刷新 returns 502 with the cached list, never an empty one")
+            assert failed_payload["source"] == "cache"
+            ok("failed 刷新 for the same account returns 502 with its own cached list")
+
+            # ── 账号在 device_list await 期间被换掉：迟到结果必须整份丢弃 ──
+            async def race_late_speaker_refresh():
+                begun = asyncio.Event()
+                resume = asyncio.Event()
+
+                class SlowMiNAService(FakeMiNAService):
+                    async def device_list(self):
+                        begun.set()
+                        await resume.wait()
+                        return [{"deviceID": "old-account-late",
+                                 "name": "旧账号迟到音箱"}]
+
+                fake_miservice.MiNAService = SlowMiNAService
+                pending = asyncio.create_task(acall(
+                    bridge.app, "GET", "/api/xiaomi/speakers",
+                    headers={"Authorization": f"Bearer {token}"}))
+                await begun.wait()
+                # 请求还挂在 device_list 上时，用户切到了另一个小米账号。
+                save_login("speaker-user-b")
+                resume.set()
+                return await pending
+
+            bridge._set_device_cache(
+                [{"deviceID": "cached-speaker", "name": "缓存音箱"}], "speaker-user")
+            late = asyncio.run(race_late_speaker_refresh())
+            assert late.status_code == 409, late.text
+            late_payload = late.json()
+            assert late_payload["ok"] is False
+            assert late_payload["code"] == "account_changed", late.text
+            assert late_payload["devices"] == []
+            assert late_payload["source"] == "none"
+            assert "speaker-user" not in late.text, (
+                "a 409 must describe the switch without exposing the account id"
+            )
+            assert bridge.bridge_state["devices"][0]["deviceID"] == "cached-speaker", (
+                "the late response must not overwrite the shared device cache"
+            )
+            assert bridge._device_cache_owner == "speaker-user"
+            ok("late 刷新 after an account switch answers 409 and leaves the cache intact")
+
+            # 新账号失败时不得回退到上一个账号的缓存。
+            fake_miservice.MiNAService = FailingMiNAService
+            fallback = client.get("/api/xiaomi/speakers",
+                                  headers={"Authorization": f"Bearer {token}"})
+            assert fallback.status_code == 502, fallback.text
+            fallback_payload = fallback.json()
+            assert fallback_payload["devices"] == [], (
+                "the new account must not receive the previous account's cached speakers"
+            )
+            assert fallback_payload["source"] == "none"
+            assert "cached-speaker" not in fallback.text
+            ok("a failed 刷新 after switching accounts never falls back to the old cache")
+
+            # 新账号刷新成功之后，缓存归属跟着切过去。
+            fake_miservice.MiNAService = FakeMiNAService
+            rebound = client.get("/api/xiaomi/speakers",
+                                 headers={"Authorization": f"Bearer {token}"})
+            assert rebound.status_code == 200, rebound.text
+            assert bridge._device_cache_owner == "speaker-user-b"
+            ok("a successful 刷新 after switching accounts rebinds the cache to the new one")
+
+            # ── pinned miservice 2.9.3 wraps an expired login in a plain string ──
+            device_list_url = "https://api2.mina.mi.com/admin/v2/device_list?master=0"
+
+            def string_failure(message):
+                class StringFailureMiNAService(FakeMiNAService):
+                    async def device_list(self):
+                        # 与 miservice_fork 2.9.3 的
+                        # raise Exception(f"Error {url}: {resp}") 完全同格式。
+                        raise Exception(f"Error {device_list_url}: {message}")
+                return StringFailureMiNAService
+
+            bridge._clear_device_cache()
+            fake_miservice.MiNAService = string_failure("Login failed")
+            relogin_failed = client.get("/api/xiaomi/speakers",
+                                        headers={"Authorization": f"Bearer {token}"})
+            assert relogin_failed.status_code == 401, relogin_failed.text
+            assert relogin_failed.header("x-bridge-auth") == "xiaomi", (
+                "an expired Xiaomi login is not an expired panel session"
+            )
+            assert relogin_failed.json()["code"] == "login_expired", relogin_failed.text
+            for message in ("unauthorized", "auth failed", "401", ""):
+                fake_miservice.MiNAService = string_failure(message)
+                expired = client.get("/api/xiaomi/speakers",
+                                     headers={"Authorization": f"Bearer {token}"})
+                assert expired.status_code == 401, (message, expired.text)
+                assert expired.header("x-bridge-auth") == "xiaomi"
+                assert expired.json()["code"] == "login_expired", expired.text
+                assert expired.json()["devices"] == []
+            ok("pinned miservice 401 string wrappers answer 401 login_expired, not 502")
+
+            fake_miservice.MiNAService = string_failure("Internal Server Error")
+            broken = client.get("/api/xiaomi/speakers",
+                                headers={"Authorization": f"Bearer {token}"})
+            assert broken.status_code == 502, broken.text
+            assert broken.json()["code"] == "xiaomi_unavailable"
+            ok("a non-authentication string failure still answers 502 xiaomi_unavailable")
+
+            # ── 换账号登录后旧缓存要清掉，同一账号续期不清 ──
+            bridge._set_device_cache(
+                [{"deviceID": "cached-speaker", "name": "缓存音箱"}], "speaker-user-b")
+            bridge._persist_sms_credentials({
+                "userId": "speaker-user-b", "passToken": "renewed-pass",
+                "deviceId": "login-device", "ssecurity": "renewed-sec",
+                "serviceToken": "renewed-service",
+            })
+            assert bridge._device_cache_owner == "speaker-user-b", (
+                "a same-account renewal must keep the cached device list"
+            )
+            assert bridge.bridge_state["devices"]
+            bridge._persist_sms_credentials({
+                "userId": "speaker-user-c", "passToken": "other-pass",
+                "deviceId": "login-device", "ssecurity": "other-sec",
+                "serviceToken": "other-service",
+            })
+            assert bridge._device_cache_owner == "", (
+                "persisting another account's credentials must drop the old cache"
+            )
+            assert bridge.bridge_state["devices"] == []
+            ok("换账号写盘 drops the cached device list, a same-account renewal keeps it")
 
             token_file.unlink()
             auth_file.unlink()
-            bridge.bridge_state["devices"] = []
+            # _persist_sms_credentials 会把 cookie_text 一并写好，这里必须一起清掉，
+            # 否则 _load_saved_xiaomi_identity() 仍能从 cookie_text 还原出账号。
+            leftover = read_config(root)
+            leftover["xiaomi"]["cookie_text"] = ""
+            bridge.save_config(leftover)
+            bridge._clear_device_cache()
             anonymous = client.get("/api/xiaomi/speakers",
                                    headers={"Authorization": f"Bearer {token}"})
             assert anonymous.status_code == 401, anonymous.text

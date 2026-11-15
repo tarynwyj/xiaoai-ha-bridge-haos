@@ -20,7 +20,11 @@ What it proves that the Node DOM stub cannot:
     /api/status cache, including when the bridge never ran (empty cache), when
     Xiaomi answers with an empty list, and after switching accounts;
   * a 401/500 from that endpoint keeps both saved and unsaved picks, and a
-    saved speaker that is no longer discovered keeps its slot and is saved back.
+    saved speaker that is no longer discovered keeps its slot and is saved back;
+  * a refresh that was still in flight when a new account logged in is dropped:
+    the late response never replaces the new account's list or the selection
+    (the PR #20 race — the fetch is held inside the page, so the response
+    provably arrives after the login rendered the new account).
 """
 
 from __future__ import annotations
@@ -496,6 +500,92 @@ def main() -> int:
                       checked_ids(page), ["speaker-A"])
             result.check("switch: the old saved pick is marked missing",
                          "当前未发现" in scope_status(page), scope_status(page))
+
+            # 7) The PR #20 race: a refresh started for the previous account must
+            #    not overwrite the list that a successful login just rendered.
+            #    The fetch is held inside the page (a Promise that only the test
+            #    resolves), so the response provably arrives after
+            #    renderDeviceList() ran for the new account.
+            reload_page(page, {"device_scope": "selected",
+                               "device_ids": ["speaker-A"]})
+            page.evaluate(
+                """() => {
+                  globalThis.__scopeNativeFetch = window.fetch;
+                  globalThis.__scopeHeld = 0;
+                  globalThis.__scopeRelease = null;
+                  window.fetch = function(input, init){
+                    const url = String(input);
+                    if (url.indexOf('/api/xiaomi/speakers') >= 0){
+                      globalThis.__scopeHeld += 1;
+                      return new Promise(function(resolve){
+                        globalThis.__scopeRelease = function(){
+                          resolve(new Response(JSON.stringify({
+                            ok: true, source: 'xiaomi',
+                            devices: [{deviceID: 'speaker-OLD',
+                                       name: '旧账号音箱',
+                                       hardware: 'L05C'}]
+                          }), {status: 200,
+                               headers: {'Content-Type': 'application/json'}}));
+                        };
+                      });
+                    }
+                    return globalThis.__scopeNativeFetch.call(window, input, init);
+                  };
+                }"""
+            )
+            before_refresh = refresh_count(page)
+            page.click("#mi-scope-refresh")
+            page.wait_for_function(
+                "() => globalThis.__scopeHeld === 1", timeout=5000)
+            result.check("late refresh: the request really is in flight",
+                         page.evaluate("() => globalThis.miScopeRefreshing === true"))
+            result.check("late refresh: the button reports progress",
+                         page.evaluate("() => document.getElementById('mi-scope-refresh').disabled === true"))
+            result.check("late refresh: the fetching notice is shown",
+                         "正在向小米获取" in scope_notice(page), scope_notice(page))
+
+            # The login success path renders the NEW account while the old
+            # request is still pending.
+            page.evaluate("devices => renderDeviceList(devices)", ALT_DEVICES)
+            labels = " ".join(page.eval_on_selector_all(
+                "#mi-scope-list label.rule-item", "els => els.map(e => e.textContent)"))
+            result.check("late refresh: the new account list is on screen",
+                         "书房音箱" in labels and "厨房音箱" in labels, labels)
+            result.check("late refresh: the login cleared the busy state",
+                         page.evaluate("() => globalThis.miScopeRefreshing === false"))
+            result.check("late refresh: the login re-enabled the button",
+                         page.evaluate("() => document.getElementById('mi-scope-refresh').disabled === false"))
+            result.check("late refresh: the discarded refresh is explained",
+                         "已作废" in scope_notice(page), scope_notice(page))
+            # An unsaved pick made on the NEW account's list must survive too: the
+            # stale response carries none of these speakers.
+            page.locator(".mi-scope-box").nth(1).click()  # speaker-Y, not saved yet
+            result.eq("late refresh: the new account pick was added",
+                      sorted(checked_ids(page)), ["speaker-A", "speaker-Y"])
+
+            # Now the old account's response finally arrives.
+            page.evaluate("() => globalThis.__scopeRelease()")
+            wait_refresh(page, before_refresh)
+            page.evaluate("() => { window.fetch = globalThis.__scopeNativeFetch; }")
+            labels = " ".join(page.eval_on_selector_all(
+                "#mi-scope-list label.rule-item", "els => els.map(e => e.textContent)"))
+            result.check("late refresh: the new account list survived the late response",
+                         "书房音箱" in labels and "厨房音箱" in labels, labels)
+            result.check("late refresh: the old account name never appears",
+                         "旧账号音箱" not in labels, labels)
+            result.check("late refresh: the stale speaker id never reaches the list",
+                         "speaker-OLD" not in labels, labels)
+            result.eq("late refresh: the new list still has its two speakers plus the saved slot",
+                      page.eval_on_selector_all(".mi-scope-box", "els => els.length"), 3)
+            result.eq("late refresh: the saved pick and the new unsaved pick both survive",
+                      sorted(checked_ids(page)), ["speaker-A", "speaker-Y"])
+            result.check("late refresh: the late response is not reported as a success",
+                         "已从小米获取" not in scope_notice(page), scope_notice(page))
+            result.check("late refresh: the discard notice stays on screen",
+                         "已作废" in scope_notice(page), scope_notice(page))
+            result.eq("late refresh: the refresh counter advanced exactly once",
+                      refresh_count(page), before_refresh + 1)
+            result.eq("late refresh: the page was not reloaded", page.url, url)
 
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()

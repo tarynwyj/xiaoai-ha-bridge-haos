@@ -67,6 +67,8 @@ async function clearXiaomiLogin(){
     const d=await r.json();
     showAlert(a,d.ok?'ok':'err',(d.ok?'✓ ':'✗ ')+(d.msg||''));
     if(d.ok){
+      /* 清除登录后，旧账号在途的刷新请求必须作废，否则迟到的列表会写回一个已清空的账号。 */
+      miScopeInvalidate();
       try{
         const fresh=await (await fetch('/api/config')).json();
         cfg.xiaomi=(fresh&&fresh.xiaomi)||{};
@@ -1481,9 +1483,31 @@ replace_exact(
 )
 
 replace_exact(
+    "login success invalidates in-flight speaker refreshes",
+    '''function renderDeviceList(devices){const box=document.getElementById('mi-device-list');''',
+    '''function renderDeviceList(devices){
+/* 登录成功 / 切换账号 / 浏览器代签都会走到这里：让上一个账号在途的刷新请求失效，
+   否则旧账号迟到的列表会覆盖刚渲染的新账号列表，用户可能把旧账号的 ID 存进新账号。 */
+miScopeInvalidate();const box=document.getElementById('mi-device-list');''',
+)
+
+replace_exact(
     "listening scope helpers",
     '''function selectDevice(hw,did){if(hw)document.getElementById('mi-hardware').value=hw;if(did)document.getElementById('mi-did').value=did}''',
     '''function selectDevice(hw,did){if(hw)document.getElementById('mi-hardware').value=hw;if(did)document.getElementById('mi-did').value=did}
+
+/* 刷新代次：登录成功、切换账号、清除登录都会让在途的刷新请求失效。
+   没有它，旧账号迟到的 /api/xiaomi/speakers 响应会覆盖新账号刚渲染的列表，
+   用户就可能把旧账号的设备 ID 存进新账号的监听范围。 */
+function miScopeEpochNow(){return Number(globalThis.miScopeEpoch||0)}
+function miScopeInvalidate(){
+  var active=!!globalThis.miScopeRefreshing;
+  globalThis.miScopeEpoch=miScopeEpochNow()+1;
+  globalThis.miScopeRefreshing=false;
+  var btn=document.getElementById('mi-scope-refresh');
+  if(btn){btn.disabled=false;btn.textContent='↻ 刷新音箱列表'}
+  if(active)miScopeNotice('账号或登录状态已变化，上一次刷新已作废。','muted');
+}
 
 async function refreshMiSpeakers(){
   /* 页面刷新/切换回来时：先按已保存的选择把卡片显示出来，再向小米要一次实时列表。
@@ -1492,6 +1516,9 @@ async function refreshMiSpeakers(){
   renderMiScope();
   if(globalThis.miScopeRefreshing)return;
   globalThis.miScopeRefreshing=true;
+  var epoch=miScopeEpochNow();
+  /* 响应回来时代次已经变了（登录成功 / 切换账号 / 清除登录）⇒ 这是旧账号的迟到响应。 */
+  var stale=function(){return miScopeEpochNow()!==epoch};
   var btn=document.getElementById('mi-scope-refresh');
   var had=Array.isArray(globalThis.miScopeDevices)?globalThis.miScopeDevices.length:0;
   if(btn){btn.disabled=true;btn.textContent='⟳ 正在获取…'}
@@ -1499,10 +1526,14 @@ async function refreshMiSpeakers(){
   try{
     var r=await fetch('/api/xiaomi/speakers');
     var d={};try{d=await r.json()}catch(e){}
+    if(stale())return;
     if(r.ok&&d&&d.ok&&Array.isArray(d.devices)){
       var list=miScopeDeviceList(d.devices);
       renderMiScope(list);
       miScopeNotice(list.length?('已从小米获取 '+list.length+' 台音箱。'):'小米账号下没有发现音箱；已保存的选择会标为「当前未发现」。',list.length?'ok':'warn');
+    }else if(d&&d.code==='account_changed'){
+      /* 后端发现这次刷新拿的是另一个账号的登录态：只提示，保留当前列表与勾选。 */
+      miScopeNotice('账号已切换，本次刷新结果已丢弃，请重新刷新获取当前账号的音箱列表。','warn');
     }else if(d&&Array.isArray(d.devices)&&d.devices.length&&!had){
       renderMiScope(miScopeDeviceList(d.devices));
       miScopeNotice('刷新失败，先显示上次缓存的音箱列表。'+(d.msg||''),'warn');
@@ -1511,11 +1542,11 @@ async function refreshMiSpeakers(){
       miScopeNotice('刷新失败：'+why+'；已保留当前列表与选择。','err');
     }
   }catch(e){
+    if(stale())return;
     miScopeNotice('无法连接桥接器，已保留当前列表与选择。','err');
   }finally{
-    globalThis.miScopeRefreshing=false;
     globalThis.miScopeRefreshDone=(globalThis.miScopeRefreshDone||0)+1;
-    if(btn){btn.disabled=false;btn.textContent='↻ 刷新音箱列表'}
+    if(!stale()){globalThis.miScopeRefreshing=false;if(btn){btn.disabled=false;btn.textContent='↻ 刷新音箱列表'}}
   }
 }
 function miScopeDeviceList(devices){var out=[];(Array.isArray(devices)?devices:[]).forEach(function(dev){if(!dev||typeof dev!=='object')return;var id=String(dev.deviceID||dev.did||'').trim();if(!id)return;out.push({deviceID:id,name:String(dev.name||'未知音箱'),hardware:String(dev.hardware||dev.model||'')})});return out}

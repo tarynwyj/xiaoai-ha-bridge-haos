@@ -64,11 +64,17 @@ EXTRACT_FUNCTIONS = [
     "miScopeCollect",
     "miScopeDirty",
     "miScopeStatus",
+    "miScopeDeviceList",
+    "miScopeNotice",
+    "miScopeEpochNow",
+    "miScopeInvalidate",
+    "refreshMiSpeakers",
     "renderMiScope",
     "renderDeviceList",
     "saveXiaomi",
     # 通用
     "escHtml",
+    "escAttr",
     "extraJ",
     # 实体勾选框选择器
     "loadRuleDevices",
@@ -264,6 +270,15 @@ def extract_js_source(html: str) -> str:
 
 def source_invariants(html: str) -> list[tuple[str, bool, str]]:
     saved_rules = html.count("saveCfg('rules')")
+
+    def _fn(name: str) -> str:
+        """Extracted function body, or '' when the patch drifted it away."""
+        try:
+            return _extract_function(html, name)
+        except ValueError:
+            return ""
+
+    refresh_src = _fn("refreshMiSpeakers")
     return [
         (
             "no NodeList array-method misuse in the page script",
@@ -416,6 +431,35 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "clear-login button sits before the save button",
             html.find('onclick="clearXiaomiLogin()"') < html.find('onclick="saveXiaomi()"'),
             "clear-login button is not before saveXiaomi()",
+        ),
+        (
+            "speaker refresh captures the request generation before fetching",
+            "var epoch=miScopeEpochNow();" in refresh_src
+            and refresh_src.count("if(stale())return;") >= 2,
+            "refreshMiSpeakers() must bail out of both the success and error paths when the epoch moved on",
+        ),
+        (
+            "the busy state is only cleared by the current generation",
+            "if(!stale()){" in refresh_src
+            and "miScopeRefreshDone=(globalThis.miScopeRefreshDone||0)+1" in refresh_src,
+            "the finally block must keep counting refreshes but only reset the current generation",
+        ),
+        (
+            "renderDeviceList invalidates in-flight speaker refreshes",
+            re.search(r"function renderDeviceList\(devices\)\{\s*/\*.*?\*/\s*miScopeInvalidate\(\);",
+                      html, re.S) is not None,
+            "every login success path renders through renderDeviceList(); it must invalidate the old refresh",
+        ),
+        (
+            "clearXiaomiLogin invalidates in-flight speaker refreshes",
+            re.search(r"if\(d\.ok\)\{\s*/\*[^\n]*\*/\s*miScopeInvalidate\(\);", html) is not None,
+            "clearing the login must not let the old account's late list come back",
+        ),
+        (
+            "an account_changed 409 is explained instead of reported as a failure",
+            "d.code==='account_changed'" in html
+            and "账号已切换，本次刷新结果已丢弃" in html,
+            "the backend's account_changed answer must show a discard notice, not 刷新失败",
         ),
         (
             "xiaomi cookie_text round-trip untouched",
@@ -1819,6 +1863,108 @@ test('scope: a failed save keeps the draft and never claims success', async () =
 
   checkEq('the section is still dirty after the failure', miScopeDirty(), true);
 
+});
+
+// --- listening scope: a refresh must not cross a login (PR #20 review) --------
+function scopeMount(){
+  const ids = ['mi-device-list', 'mi-devices', 'mi-device-count',
+               'mi-scope-card', 'mi-scope-list', 'mi-scope-count', 'mi-scope-status',
+               'mi-scope-notice', 'mi-scope-refresh',
+               'mi-scope-mode-all', 'mi-scope-mode-selected'];
+  for (const id of ids){
+    if (document.getElementById(id)) continue;
+    const radio = id === 'mi-scope-mode-all' || id === 'mi-scope-mode-selected';
+    const el = document.createElement(radio ? 'input' : 'div');
+    el.id = id;
+    document.body.appendChild(el);
+  }
+  return document.getElementById('mi-scope-refresh');
+}
+function scopeListIds(){
+  return Array.from(document.querySelectorAll('#mi-scope-list .mi-scope-box'))
+    .map(el => el.getAttribute('data-id')).join(',');
+}
+function scopeNoticeText(){
+  const box = document.getElementById('mi-scope-notice');
+  return box ? box.textContent : '';
+}
+function scopeRaceFixture(mi){
+  scopeFixture(mi);
+  scopeMount();
+  globalThis.miScopeEpoch = 0;
+  globalThis.miScopeRefreshDone = 0;
+  globalThis.miScopeRefreshing = false;
+}
+
+test('scope: a late refresh from the previous account is dropped', async () => {
+  scopeRaceFixture({ device_scope: 'selected', device_ids: ['A'] });
+  globalThis.miScopeDevices = scopeDevices();
+  let release = null;
+  globalThis.fetch = () => new Promise(resolve => { release = resolve; });
+  const running = refreshMiSpeakers();
+  const btn = document.getElementById('mi-scope-refresh');
+  checkEq('the refresh is in flight', globalThis.miScopeRefreshing, true);
+  checkEq('the button reports progress', btn.textContent, '⟳ 正在获取…');
+  checkEq('the button is disabled while refreshing', btn.disabled, true);
+
+  // 登录成功：新账号的两台音箱先渲染，旧账号的响应随后才到（PR #20 复现的竞态）。
+  renderDeviceList([{ deviceID: 'X', name: '书房音箱', hardware: 'X08E' },
+                    { deviceID: 'Y', name: '厨房音箱', hardware: 'X10A' }]);
+  checkEq('the login rendered the new account list', scopeListIds(), 'X,Y,A');
+  checkEq('the login cleared the busy state', globalThis.miScopeRefreshing, false);
+  checkEq('the login re-enabled the button', btn.disabled, false);
+  check('the pending refresh is explained as void',
+        scopeNoticeText().indexOf('已作废') >= 0, scopeNoticeText());
+  toggleMiScopeIndex(1, true);  // speaker-Y：新账号上还没保存的勾选
+  checkEq('the new account pick was added', miScopeCollect().ids.join(','), 'A,Y');
+
+  release({ ok: true, status: 200, json: async () => ({ ok: true, devices: scopeDevices() }) });
+  await running;
+  checkEq('the stale response did not touch the list', scopeListIds(), 'X,Y,A');
+  checkEq('the stale response kept the new account devices',
+          globalThis.miScopeDevices.map(dev => dev.deviceID).join(','), 'X,Y');
+  checkEq('the stale response did not overwrite the unsaved pick',
+          miScopeCollect().ids.join(','), 'A,Y');
+  checkEq('the stale response did not claim success',
+          scopeNoticeText().indexOf('已从小米获取'), -1);
+  check('the stale response kept the void notice',
+        scopeNoticeText().indexOf('已作废') >= 0, scopeNoticeText());
+  checkEq('the refresh counter still advanced', globalThis.miScopeRefreshDone, 1);
+  checkEq('the stale response left the page idle', globalThis.miScopeRefreshing, false);
+});
+
+test('scope: a 409 account_changed keeps the list and explains the discard', async () => {
+  scopeRaceFixture({ device_scope: 'selected', device_ids: ['A'] });
+  globalThis.miScopeDevices = [{ deviceID: 'X', name: '书房音箱', hardware: 'X08E' }];
+  globalThis.fetch = async () => ({ ok: false, status: 409,
+    json: async () => ({ ok: false, code: 'account_changed', msg: '账号已切换' }) });
+  await refreshMiSpeakers();
+  check('the discard is explained',
+        scopeNoticeText().indexOf('账号已切换，本次刷新结果已丢弃') === 0, scopeNoticeText());
+  checkEq('the discard is not reported as a failure',
+          scopeNoticeText().indexOf('刷新失败'), -1);
+  checkEq('the current list is untouched', globalThis.miScopeDevices.length, 1);
+  checkEq('the current device is kept', globalThis.miScopeDevices[0].deviceID, 'X');
+  checkEq('the refresh counter advanced', globalThis.miScopeRefreshDone, 1);
+  checkEq('the page is not left busy', globalThis.miScopeRefreshing, false);
+});
+
+test('scope: invalidating a refresh keeps the rendered list and clears the busy state', () => {
+  scopeRaceFixture({ device_scope: 'selected', device_ids: ['A'] });
+  globalThis.miScopeDevices = scopeDevices();
+  renderMiScope();
+  const btn = document.getElementById('mi-scope-refresh');
+  globalThis.miScopeRefreshing = true;
+  btn.disabled = true;
+  btn.textContent = '⟳ 正在获取…';
+  const before = scopeListIds();
+  miScopeInvalidate();
+  checkEq('the rendered list was not touched', scopeListIds(), before);
+  checkEq('the busy state is gone', globalThis.miScopeRefreshing, false);
+  checkEq('the button label is restored', btn.textContent, '↻ 刷新音箱列表');
+  checkEq('the button is usable again', btn.disabled, false);
+  checkEq('the epoch moved on', globalThis.miScopeEpoch, 1);
+  checkEq('invalidating is not a refresh', globalThis.miScopeRefreshDone, 0);
 });
 
 // --- runner -----------------------------------------------------------------

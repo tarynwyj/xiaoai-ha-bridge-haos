@@ -456,6 +456,12 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "clearing the login must not let the old account's late list come back",
         ),
         (
+            "clearXiaomiLogin removes the old account's device list",
+            "globalThis.miScopeDevices=[];renderMiScope([]);" in html
+            and "if(devCard)devCard.style.display='none';" in html,
+            "clearing the login must remove the previous account's speaker names from the page",
+        ),
+        (
             "an account_changed 409 is explained instead of reported as a failure",
             "d.code==='account_changed'" in html
             and "账号已切换，本次刷新结果已丢弃" in html,

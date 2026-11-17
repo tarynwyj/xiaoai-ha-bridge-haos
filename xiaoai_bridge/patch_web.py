@@ -69,6 +69,10 @@ async function clearXiaomiLogin(){
     if(d.ok){
       /* 清除登录后，旧账号在途的刷新请求必须作废，否则迟到的列表会写回一个已清空的账号。 */
       miScopeInvalidate();
+      globalThis.miScopeDevices=[];renderMiScope([]);
+      miScopeNotice('已清除登录凭据，请重新登录后刷新音箱列表。','muted');
+      const devCard=document.getElementById('mi-device-list');if(devCard)devCard.style.display='none';
+      const devList=document.getElementById('mi-devices');if(devList)devList.innerHTML='';
       try{
         const fresh=await (await fetch('/api/config')).json();
         cfg.xiaomi=(fresh&&fresh.xiaomi)||{};

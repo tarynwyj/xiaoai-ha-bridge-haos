@@ -759,9 +759,15 @@ def main():
         bridge._pending_session = legacy_pending
         bridge._pending_login.update({"username": "test"})
         bridge._qr_state.update({"ready": True, "lp_url": "https://example.invalid"})
+        bridge._set_device_cache(
+            [{"deviceID": "stale-before-clear", "name": "旧账号音箱"}], "stale-user")
         cleared = client.post("/api/xiaomi/clear-login", headers=UI_HEADER)
         assert cleared.status_code == 200, cleared.text
         assert cleared.json()["ok"] is True
+        assert bridge.bridge_state["devices"] == [], (
+            "clear-login must drop the cached speaker list"
+        )
+        assert bridge._device_cache_owner == ""
         assert otp_pending.closed and legacy_pending.closed
         assert not bridge._otp_login and not bridge._pending_login and not bridge._qr_state
 
@@ -934,7 +940,8 @@ def main():
                 "an expired Xiaomi login is not an expired panel session"
             )
             assert relogin_failed.json()["code"] == "login_expired", relogin_failed.text
-            for message in ("unauthorized", "auth failed", "401", ""):
+            for message in ("unauthorized", "auth failed", "authentication required",
+                            "401", ""):
                 fake_miservice.MiNAService = string_failure(message)
                 expired = client.get("/api/xiaomi/speakers",
                                      headers={"Authorization": f"Bearer {token}"})
@@ -944,12 +951,14 @@ def main():
                 assert expired.json()["devices"] == []
             ok("pinned miservice 401 string wrappers answer 401 login_expired, not 502")
 
-            fake_miservice.MiNAService = string_failure("Internal Server Error")
-            broken = client.get("/api/xiaomi/speakers",
-                                headers={"Authorization": f"Bearer {token}"})
-            assert broken.status_code == 502, broken.text
-            assert broken.json()["code"] == "xiaomi_unavailable"
-            ok("a non-authentication string failure still answers 502 xiaomi_unavailable")
+            for message in ("Internal Server Error",
+                            "<html>authentication gateway unavailable</html>"):
+                fake_miservice.MiNAService = string_failure(message)
+                broken = client.get("/api/xiaomi/speakers",
+                                    headers={"Authorization": f"Bearer {token}"})
+                assert broken.status_code == 502, (message, broken.text)
+                assert broken.json()["code"] == "xiaomi_unavailable", (message, broken.text)
+            ok("non-authentication string failures still answer 502 xiaomi_unavailable")
 
             # ── 换账号登录后旧缓存要清掉，同一账号续期不清 ──
             bridge._set_device_cache(

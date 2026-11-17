@@ -172,6 +172,13 @@ def main() -> int:
                               body=json.dumps({**state["config"],
                                                "_section_revisions": state["revisions"]}))
                 return
+            if path.startswith("/api/xiaomi/clear-login"):
+                state["config"]["xiaomi"].update(
+                    {"username": "", "password": "", "cookie_text": ""})
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps({"ok": True,
+                                               "msg": "已清除登录凭据，请重新扫码登录"}))
+                return
             if path.startswith("/api/xiaomi/speakers"):
                 state["speaker_calls"] += 1
                 spec = state["speakers"]
@@ -586,6 +593,32 @@ def main() -> int:
             result.eq("late refresh: the refresh counter advanced exactly once",
                       refresh_count(page), before_refresh + 1)
             result.eq("late refresh: the page was not reloaded", page.url, url)
+
+            # 8) Clearing the login must remove the previous account's speakers
+            #    from both the scope card and the discovered-device card.
+            reload_page(page, {"device_scope": "selected",
+                               "device_ids": ["speaker-A"]})
+            page.evaluate("devices => renderDeviceList(devices)", DEVICES)
+            before_labels = " ".join(page.eval_on_selector_all(
+                "#mi-scope-list label.rule-item", "els => els.map(e => e.textContent)"))
+            result.check("clear: the old account list is on screen before clearing",
+                         "客厅音箱" in before_labels, before_labels)
+            page.once("dialog", lambda dialog: dialog.accept())
+            page.click('button[onclick="clearXiaomiLogin()"]')
+            page.wait_for_function(
+                "() => !globalThis.miScopeDevices || globalThis.miScopeDevices.length === 0",
+                timeout=5000)
+            labels = " ".join(page.eval_on_selector_all(
+                "#mi-scope-list label.rule-item", "els => els.map(e => e.textContent)"))
+            result.check("clear: the old account names are gone",
+                         "客厅音箱" not in labels, labels)
+            result.eq("clear: the saved pick stays as not found",
+                      checked_ids(page), ["speaker-A"])
+            result.check("clear: the discovered-device card is hidden",
+                         page.is_visible("#mi-device-list") is False)
+            result.check("clear: the page explains the login is gone",
+                         "已清除登录凭据" in scope_notice(page), scope_notice(page))
+            result.eq("clear: the page was not reloaded", page.url, url)
 
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()

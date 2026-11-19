@@ -1109,6 +1109,7 @@ async def _enforce_access_control(request: Request, call_next):
                     "msg": "未授权：请通过 Home Assistant Ingress 面板访问，或先登录直连令牌",
                 },
                 status_code=401,
+                headers={"X-Bridge-Auth": "panel"},
             )
         if path in ("/", "/index.html"):
             return HTMLResponse(LOGIN_PAGE_HTML)
@@ -1316,6 +1317,8 @@ async def clear_xiaomi_login():
             status_code=500,
         )
     bridge_state["error"] = None
+    # 登录已清除：不能让 /api/status 或旧请求继续看到上一个账号的设备列表。
+    _clear_device_cache()
     log.info("已清除已保存的小米登录凭据: %s", ", ".join(removed) or "无")
     return {
         "ok": True,
@@ -1323,6 +1326,177 @@ async def clear_xiaomi_login():
         "revision": _config_section_revision(load_config(), "xiaomi"),
         "msg": "已清除已保存的小米登录凭据，请重新扫码登录",
     }
+''',
+)
+
+# ──────────────── 实时音箱列表：面板「刷新」不能只读 /api/status 缓存 ────────────────
+replace_exact(
+    "live speaker list endpoint",
+    '''@app.get("/api/status")
+async def get_status():
+    uptime = None
+    if bridge_state["start_time"]:
+        uptime = int(time.time() - bridge_state["start_time"])
+    return {**bridge_state, "uptime": uptime}
+''',
+    '''@app.get("/api/status")
+async def get_status():
+    uptime = None
+    if bridge_state["start_time"]:
+        uptime = int(time.time() - bridge_state["start_time"])
+    return {**bridge_state, "uptime": uptime}
+
+
+def _speaker_list(devices) -> list:
+    """Only the fields the panel renders; never expose other account data."""
+    result = []
+    for device in devices or []:
+        if not isinstance(device, dict):
+            continue
+        device_id = str(device.get("deviceID") or device.get("did") or "").strip()
+        if not device_id:
+            continue
+        result.append({
+            "deviceID": device_id,
+            "name": str(device.get("name") or "未知音箱"),
+            "hardware": str(device.get("hardware") or device.get("model") or ""),
+        })
+    return result
+
+
+# 设备列表缓存必须绑定账号：切换账号后旧账号的结果既不能覆盖缓存，
+# 也不能在刷新失败时被当成本账号的列表回退给面板。
+_device_cache_owner = ""
+
+
+def _device_cache_account() -> str:
+    # 缓存属于「当前已保存账号」；读不到登录信息时视为没有账号。
+    try:
+        return str((_load_saved_xiaomi_identity() or {}).get("userId") or "")
+    except Exception:
+        return ""
+
+
+def _set_device_cache(devices, owner: str) -> None:
+    # 写缓存的地方必须一起记下账号，回退时才有依据证明这份列表属于当前账号。
+    global _device_cache_owner
+    if not isinstance(devices, list):
+        return
+    bridge_state["devices"] = devices
+    _device_cache_owner = str(owner or "")
+
+
+def _clear_device_cache() -> None:
+    global _device_cache_owner
+    bridge_state["devices"] = []
+    _device_cache_owner = ""
+
+
+def _speaker_account_changed(owner: str, epoch: int) -> bool:
+    # await 之后复核：账号被切换/清除，或凭据被清（代次变化），都说明这次请求
+    # 拿到的结果属于上一个账号，必须整份丢弃。
+    if _credential_generation != epoch:
+        return True
+    return _device_cache_account() != owner
+
+
+def _account_changed_response() -> JSONResponse:
+    return JSONResponse(
+        {"ok": False, "code": "account_changed", "devices": [], "source": "none",
+         "msg": "小米账号已切换，已丢弃上一次刷新的结果，请重新刷新"},
+        status_code=409,
+    )
+
+
+def _cached_speakers() -> list:
+    # 只回退属于当前账号的缓存：否则切换账号后的失败会把旧账号的音箱列表
+    # 当成新账号的设备显示出来。
+    current = _device_cache_account()
+    if not current or _device_cache_owner != current:
+        return []
+    cached = bridge_state.get("devices")
+    return _speaker_list(cached) if isinstance(cached, list) else []
+
+
+def _xiaomi_auth_response(payload: dict) -> JSONResponse:
+    """A 401 about the Xiaomi account, not about the panel session.
+
+    The browser fetch wrapper reloads the whole page on panel-session 401s.
+    This header keeps "Xiaomi is not logged in yet" from being mistaken for an
+    expired Ingress/direct session (which would interrupt first-time setup).
+    """
+    return JSONResponse(payload, status_code=401,
+                        headers={"X-Bridge-Auth": "xiaomi"})
+
+
+@app.get("/api/xiaomi/speakers")
+async def xiaomi_speakers():
+    """Ask Xiaomi for the speaker list instead of replaying /api/status.
+
+    The saved micoapi token is enough for device_list, so the panel can refresh
+    while the bridge is stopped, right after a page reload and after switching
+    accounts. A failure returns the cached list (ok=false) instead of clearing
+    what the panel already has — but only while that cache still belongs to the
+    account this request started for. device_list can outlive an account switch,
+    and such a late result must never reach the shared cache or the new account.
+    """
+    cfg = load_config()
+    saved = _load_saved_xiaomi_identity()
+    if not saved:
+        return _xiaomi_auth_response(
+            {"ok": False, "code": "login_required", "devices": [],
+             "msg": "还没有保存的小米登录信息，请先在「小米账号」页登录"})
+    # 记下发起时的账号与凭据代次：device_list 期间用户可能切换/清除账号，
+    # 甚至另一个请求刚登录了别的账号。
+    account_user = str(saved.get("userId") or "")
+    account_epoch = _credential_generation
+    try:
+        from miservice import MiNAService
+    except ImportError:
+        return JSONResponse(
+            {"ok": False, "code": "dependency_missing", "devices": [],
+             "msg": "缺少 miservice 依赖，无法向小米获取音箱列表"},
+            status_code=500,
+        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            account = _build_token_account(session, cfg)
+            _set_token(account, cfg)
+            token = getattr(account, "token", None)
+            if not isinstance(token, dict) or not token.get("micoapi"):
+                return _xiaomi_auth_response(
+                    {"ok": False, "code": "login_incomplete", "devices": [],
+                     "msg": "已保存的登录信息不完整，请重新登录（或先启动一次桥接器）"})
+            devices = await MiNAService(account).device_list()
+    except Exception as exc:
+        if _speaker_account_changed(account_user, account_epoch):
+            log.warning("刷新音箱列表期间小米账号已变化，丢弃旧账号的失败结果")
+            return _account_changed_response()
+        cached = _cached_speakers()
+        verdict = _miservice_auth_failure(exc)
+        if verdict:
+            log.warning("刷新音箱列表失败（登录态）: %s", verdict.get("message"))
+            return _xiaomi_auth_response(
+                {"ok": False, "code": "login_expired", "devices": cached,
+                 "source": "cache" if cached else "none",
+                 "msg": verdict.get("message") or "小米登录已失效，请重新登录"})
+        log.warning("刷新音箱列表失败: %s", type(exc).__name__)
+        return JSONResponse(
+            {"ok": False, "code": "xiaomi_unavailable", "devices": cached,
+             "source": "cache" if cached else "none",
+             "msg": "向小米获取音箱列表失败，已保留原来的列表与选择"},
+            status_code=502,
+        )
+    if _speaker_account_changed(account_user, account_epoch):
+        log.warning("刷新音箱列表期间小米账号已变化，丢弃旧账号的设备列表")
+        return _account_changed_response()
+    speakers = _speaker_list(devices)
+    if isinstance(devices, list):
+        _set_device_cache(devices, account_user)
+    return {"ok": True, "source": "xiaomi", "devices": speakers,
+            "count": len(speakers),
+            "msg": ("已从小米获取 %d 台音箱" % len(speakers)) if speakers
+                   else "小米账号下没有发现小爱音箱"}
 ''',
 )
 
@@ -2192,6 +2366,8 @@ def _persist_sms_credentials(creds: dict) -> None:
     '''
     if not _credential_write_allowed():
         raise RuntimeError("登录凭据已清除，旧请求不得重新写盘")
+    # 换账号前先记住旧账号：写盘成功后要丢掉它的设备缓存。
+    previous_user = str((_load_saved_xiaomi_identity() or {}).get("userId") or "")
     missing = _missing_credentials(creds)
     if missing:
         raise ValueError("凭据不完整: " + "、".join(missing))
@@ -2235,6 +2411,12 @@ def _persist_sms_credentials(creds: dict) -> None:
                     stale.unlink()
             except OSError:
                 pass
+
+    # 凭据已经换人：旧账号的音箱列表不能再被当成当前账号的缓存回退给面板。
+    # 同一账号续期（最常见的一次写盘）不受影响，缓存继续有效。
+    if previous_user and previous_user != str(creds["userId"]):
+        _clear_device_cache()
+        log.info("小米账号已切换，已清除上一个账号的音箱缓存")
 
     # cookie_text 只是给 _get_cookie 的提示，最后写；失败不影响已经保存的凭据
     try:
@@ -6001,6 +6183,9 @@ replace_exact(
             try:
                 # 用户重新登录 / 清除凭据后磁盘上的凭据会变：立即切到新身份，
                 # 不要让桥接器继续无限期使用旧账号的会话。
+                # 这里直接写缓存与归属、不调用 helper：bridge_loop 会被
+                # test_startup_patch / test_upgrade_data 按函数单独执行，那两套
+                # 命名空间里没有后来新增的模块级 helper。
                 if _credential_fingerprint() != credential_mark:
                     credential_mark = _credential_fingerprint()
                     next_refresh_at = 0.0
@@ -6008,6 +6193,7 @@ replace_exact(
                     if str((getattr(account, "token", None) or {}).get("userId") or "") != str(identity.get("userId") or ""):
                         devices = []
                         bridge_state["devices"] = []
+                        _device_cache_owner = ""
                     log.info("检测到登录凭据变化，立即切换到新的登录态")
 
                 if time.time() >= next_refresh_at:
@@ -6021,6 +6207,8 @@ replace_exact(
                         if outcome.get("devices"):
                             devices = outcome["devices"]
                             bridge_state["devices"] = devices
+                            _device_cache_owner = str(
+                                (getattr(account, "token", None) or {}).get("userId") or "")
                         _apply_cookie_to_session(_bridge_session, cfg)
                         credential_mark = _credential_fingerprint()
                         if outcome.get("saved"):
@@ -7389,7 +7577,7 @@ async def update_automation(automation_id: str, req: ScheduleAutomationRequest):
 
 
 
-source = source + '# ════════════════ 登录回退：令牌路径不带密码 + 87001 终态判定 ════════════════\n_last_auth_failure: dict = {}\nAUTH_OTP_REQUIRED_CODES = {87001, 87002, 87003}\n\n\ndef _token_account_credentials(mi_cfg: dict) -> tuple:\n    """Credentials handed to MiAccount on the token/cookie paths: always empty.\n\n    miservice\'s mi_request calls login(sid) whenever the sid is missing from the\n    token, and login() falls back to serviceLoginAuth2 with self.username and\n    md5(self.password) when the passToken exchange fails. For a QR-login user that\n    password is stale or empty, so the fallback returns 87001 (验证码输入错误) and\n    miservice then sets self.token = None, destroying the passToken we just got.\n    Password login has its own explicit path (_otp_password_login).\n    """\n    return "", ""\n\n\ndef _miservice_auth_failure(exc) -> dict:\n    """Classify a miservice Exception that carries a Xiaomi response dict.\n\n    Returns {} when the error says nothing about authentication. A terminal\n    verdict means retrying is pointless and the operator has to log in again.\n    """\n    args = getattr(exc, "args", None) or ()\n    payload = args[0] if args and isinstance(args[0], dict) else None\n    if not isinstance(payload, dict):\n        return {}\n    code = payload.get("code")\n    desc = str(payload.get("desc") or payload.get("description") or "").strip()\n    if code in AUTH_OTP_REQUIRED_CODES:\n        return {\n            "kind": "otp", "code": code, "terminal": True, "desc": desc,\n            "message": "小米要求验证码/二次验证（%s），自动登录无法完成；"\n                       "请在面板「小米账号」页重新扫码或完成一次人工验证" % (code,),\n        }\n    if code in RELOGIN_FATAL_CODES:\n        return {\n            "kind": "rejected", "code": code, "terminal": True, "desc": desc,\n            "message": "小米拒绝了保存的凭据（%s），需要重新登录" % (code,),\n        }\n    return {}\n\n\ndef _note_auth_failure(exc) -> dict:\n    """Record and log a terminal auth verdict from a miservice exception."""\n    verdict = _miservice_auth_failure(exc)\n    if verdict:\n        _last_auth_failure.clear()\n        _last_auth_failure.update(verdict)\n        log.error("%s", verdict["message"])\n    return verdict\n\n\ndef _build_token_account(session, mi_cfg: dict):\n    """Build the MiAccount used by the token / cookie paths — without a password.\n\n    miservice\'s mi_request calls login(sid) after a 401, and login() falls back to\n    serviceLoginAuth2 with self.username / md5(self.password) when the passToken\n    exchange fails. A QR-login user has no usable password there, so that fallback\n    returns 87001 and miservice then sets self.token = None, destroying the\n    passToken. Password login has its own explicit path (_otp_password_login).\n    """\n    from miservice import MiAccount\n    return MiAccount(session, "", "", None)\n'
+source = source + '# ════════════════ 登录回退：令牌路径不带密码 + 87001 终态判定 ════════════════\n_last_auth_failure: dict = {}\nAUTH_OTP_REQUIRED_CODES = {87001, 87002, 87003}\n\n\ndef _token_account_credentials(mi_cfg: dict) -> tuple:\n    """Credentials handed to MiAccount on the token/cookie paths: always empty.\n\n    miservice\'s mi_request calls login(sid) whenever the sid is missing from the\n    token, and login() falls back to serviceLoginAuth2 with self.username and\n    md5(self.password) when the passToken exchange fails. For a QR-login user that\n    password is stale or empty, so the fallback returns 87001 (验证码输入错误) and\n    miservice then sets self.token = None, destroying the passToken we just got.\n    Password login has its own explicit path (_otp_password_login).\n    """\n    return "", ""\n\n\ndef _miservice_auth_failure(exc) -> dict:\n    """Classify a miservice Exception that reports a Xiaomi login failure.\n\n    Two shapes are handled: a Xiaomi response dict (miservice raises\n    Exception(resp)) and the plain-string wrapper the pinned miservice 2.9.3\n    mi_request uses when a 401 relogin fails, or when the retried request is\n    still rejected: Exception("Error <url>: Login failed") and\n    Exception("Error <url>: <body>"). Returns {} when the error says nothing\n    about authentication. A terminal verdict means retrying is pointless and the\n    operator has to log in again.\n    """\n    args = getattr(exc, "args", None) or ()\n    payload = args[0] if args and isinstance(args[0], dict) else None\n    if not isinstance(payload, dict):\n        # 字符串包装只认 miservice 自己的格式；普通异常（超时、连接失败）仍是未知失败。\n        text = args[0] if args and isinstance(args[0], str) else ""\n        if not text.startswith("Error http"):\n            return {}\n        _url, separator, body = text.partition(": ")\n        marker = body.strip().lower()\n        if not separator:\n            return {}\n        if marker and not any(hint in marker for hint in\n                              ("unauthorized", "forbidden", "401", "login failed", "auth error", "auth failed", "authentication failed", "authentication required")):\n            return {}\n        return {\n            "kind": "expired", "code": None, "terminal": True, "desc": marker,\n            "message": "小米登录已失效，请重新扫码登录",\n        }\n    code = payload.get("code")\n    desc = str(payload.get("desc") or payload.get("description") or "").strip()\n    if code in AUTH_OTP_REQUIRED_CODES:\n        return {\n            "kind": "otp", "code": code, "terminal": True, "desc": desc,\n            "message": "小米要求验证码/二次验证（%s），自动登录无法完成；"\n                       "请在面板「小米账号」页重新扫码或完成一次人工验证" % (code,),\n        }\n    if code in RELOGIN_FATAL_CODES:\n        return {\n            "kind": "rejected", "code": code, "terminal": True, "desc": desc,\n            "message": "小米拒绝了保存的凭据（%s），需要重新登录" % (code,),\n        }\n    return {}\n\n\ndef _note_auth_failure(exc) -> dict:\n    """Record and log a terminal auth verdict from a miservice exception."""\n    verdict = _miservice_auth_failure(exc)\n    if verdict:\n        _last_auth_failure.clear()\n        _last_auth_failure.update(verdict)\n        log.error("%s", verdict["message"])\n    return verdict\n\n\ndef _build_token_account(session, mi_cfg: dict):\n    """Build the MiAccount used by the token / cookie paths — without a password.\n\n    miservice\'s mi_request calls login(sid) after a 401, and login() falls back to\n    serviceLoginAuth2 with self.username / md5(self.password) when the passToken\n    exchange fails. A QR-login user has no usable password there, so that fallback\n    returns 87001 and miservice then sets self.token = None, destroying the\n    passToken. Password login has its own explicit path (_otp_password_login).\n    """\n    from miservice import MiAccount\n    return MiAccount(session, "", "", None)\n'
 
 source = source + '\n# ════════════════ 定时任务：暂停/启用 + HA 服务列表代理 ════════════════\n@app.post("/api/automations/{automation_id}/toggle")\nasync def toggle_automation(automation_id: str, payload: dict | None = None):\n    """Pause or resume one scheduled task (HA automation.turn_on / turn_off)."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    enabled = bool((payload or {}).get("enabled", True))\n    automation_id = str(automation_id or "").strip()\n    if not automation_id.startswith(_AUTOMATION_PREFIX):\n        raise HTTPException(403, "只能操作由小爱桥接创建的任务")\n    async with aiohttp.ClientSession() as s:\n        ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n        entity_id = await _schedule_automation_entity(ha, automation_id, s)\n        if entity_id is None:\n            raise HTTPException(502, "读取 HA 自动化列表失败，暂时无法切换")\n        if not entity_id:\n            raise HTTPException(404, "HA 里没有这个任务（可能尚未重新加载）")\n        ok = await ha.call_service(\n            "automation", "turn_on" if enabled else "turn_off",\n            {"entity_id": entity_id}, s)\n    if not ok:\n        raise HTTPException(500, "切换失败：HA 没有接受这次调用")\n    log.info("定时任务 %s 已%s", automation_id, "启用" if enabled else "暂停")\n    return {"ok": True, "enabled": enabled, "msg": "已启用" if enabled else "已暂停"}\n\n\n@app.get("/api/ha/services")\nasync def ha_services():\n    """Proxy HA /api/services so the form offers services HA actually has."""\n    cfg = load_config()\n    ha_cfg = cfg.get("homeassistant", {}) or {}\n    if not ha_cfg.get("url") or not ha_cfg.get("token"):\n        raise HTTPException(400, "Home Assistant 未配置")\n    ha = HAClient(ha_cfg["url"], ha_cfg["token"])\n    try:\n        async with aiohttp.ClientSession() as s:\n            async with s.get(ha.base + "/api/services", headers=ha.headers,\n                             timeout=aiohttp.ClientTimeout(total=10)) as r:\n                if r.status != 200:\n                    raise HTTPException(502, "HA /api/services 返回 %s" % r.status)\n                data = await r.json()\n    except HTTPException:\n        raise\n    except Exception as e:\n        raise HTTPException(502, "读取 HA 服务列表失败: %s" % type(e).__name__)\n    services = {}\n    if isinstance(data, list):\n        for item in data:\n            domain = item.get("domain")\n            entries = item.get("services")\n            if domain and isinstance(entries, dict):\n                services[domain] = sorted(entries.keys())\n    return {"ok": True, "services": services}\n'
 
@@ -7402,6 +7590,32 @@ replace_exact(
             if not await _sync_schedule_clock(ha, s):
                 raise HTTPException(503, "无法读取 HA 时区，未创建定时任务")
             automation_id, created = await _create_ha_automation(''',
+)
+
+# bridge_loop 会被 test_startup_patch / test_upgrade_data 按函数单独执行（那两套
+# 命名空间里没有后来新增的模块级 helper），所以缓存归属在 bridge_loop 内部直接维护。
+replace_exact(
+    "the bridge loop maintains the device cache owner itself",
+    '''async def bridge_loop():
+    global _bridge_session
+''',
+    '''async def bridge_loop():
+    global _bridge_session, _device_cache_owner
+''',
+)
+
+# 启动时自动发现的设备列表也要记下它属于哪个账号，否则切换账号后这份旧缓存
+# 既无法证明归属，也没法在刷新失败时安全回退。
+replace_exact(
+    "startup device discovery records the device cache owner",
+    '''                bridge_state["devices"] = devices
+            else:
+                log.warning("未发现小爱音箱设备")''',
+    '''                bridge_state["devices"] = devices
+                _device_cache_owner = str(
+                    (getattr(account, "token", None) or {}).get("userId") or "")
+            else:
+                log.warning("未发现小爱音箱设备")''',
 )
 
 import ast

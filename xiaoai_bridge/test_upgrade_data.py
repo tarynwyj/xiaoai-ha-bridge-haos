@@ -187,6 +187,7 @@ NEW_ONLY_FUNCTIONS = (
     "_refresh_lock_obj",
     "_refresh_outcome",
     "_recent_refresh",
+    "_recent_failure",
     "_remember_refresh",
     "_unsaved_refresh",
     "_save_refreshed_credentials",
@@ -212,6 +213,10 @@ NEEDED_ASSIGNMENTS = (
     "_LOG_LINE_RE",
     "POLL_COOKIE_KEYS",
     "REFRESH_COALESCE_SECONDS",
+    "REFRESH_FAILURE_COALESCE_SECONDS",
+    "MICOAPI_TOKEN_TTL_HOURS",
+    "DEFAULT_REFRESH_HOURS",
+    "MAX_REFRESH_HOURS",
     "_refresh_lock",
     "_process_login_device_id",
     "_refresh_cache",
@@ -1114,7 +1119,7 @@ def scenario_5_corrupted_data(
                 if loop_error is not None
                 else f"does not raise (bridge_state error={app_a.bridge_state['error']!r})"
             )
-            + ". The bad file is left untouched; not fixed here, reported to the Lead."
+            + ". The bad file is left untouched; this is a known limitation, not a regression."
         )
     assert (data_a / "config" / "config.yaml").read_bytes() == bad_yaml, (
         "S5a: 1.0.10 overwrote the corrupt config.yaml"
@@ -1330,7 +1335,7 @@ def main(argv=None):
 
     if reporter.findings:
         print(flush=True)
-        print("findings (observed, NOT fixed here - reported to the Lead):", flush=True)
+        print("findings (observed, not fixed here):", flush=True)
         for finding in reporter.findings:
             print(f"  - {finding}", flush=True)
     print(

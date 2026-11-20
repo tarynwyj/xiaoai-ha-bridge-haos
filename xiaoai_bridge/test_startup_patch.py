@@ -99,6 +99,7 @@ WANTED_FUNCS = [
     "_refresh_lock_obj",
     "_refresh_outcome",
     "_recent_refresh",
+    "_recent_failure",
     "_remember_refresh",
     "_unsaved_refresh",
     "_save_refreshed_credentials",
@@ -1057,6 +1058,75 @@ def scenario_renewal_failure_stays_quiet(root: Path):
     return "a failed renewal retries quietly instead of demanding a new login"
 
 
+def scenario_rejected_renewal_stops_five_minute_retries(root: Path):
+    """A 70016 on the proactive renewal must back off like the 401 path does.
+
+    Field log: after the passToken died, the bridge retried the same rejected
+    exchange every five minutes for five days (~400 attempts) while the panel
+    kept claiming "retrying". One rejection is terminal until the user logs in
+    again, so the next attempt belongs 30 minutes out — not five.
+    """
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 600
+    FakeAccount.reject_service_login = True
+
+    # Drive a fake clock so 300s/1800s really pass instead of just being recorded.
+    clock = {"now": time.time()}
+    real_time = harness.namespace["time"]
+    harness.namespace["time"] = SimpleNamespace(
+        time=lambda: clock["now"],
+        monotonic=real_time.monotonic,
+        sleep=real_time.sleep,
+        strftime=real_time.strftime,
+        localtime=real_time.localtime,
+    )
+    started = clock["now"]
+
+    async def sleeping(delay):
+        harness.sleeps.append(delay)
+        clock["now"] += delay
+        if clock["now"] - started > 1000:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = sleeping
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    attempts = [m for m in harness.log.messages if "登录态主动续期" in m]
+    assert len(attempts) == 1, (
+        "a rejected passToken must not be retried every 5 minutes, got %d attempts in "
+        "1000 simulated seconds: %s" % (len(attempts), attempts[-3:])
+    )
+    message = harness.bridge_state["renewal"] or ""
+    assert "70016" in message, f"the panel must show the Xiaomi code, got {message!r}"
+    assert "重新扫码" in message, f"the panel must name the fix, got {message!r}"
+    assert "300s 后重试" not in message, (
+        f"a terminal rejection must not promise a 5 minute retry, got {message!r}"
+    )
+    assert harness.bridge_state["error"] is None, (
+        "a failed renewal must not stop the poll loop while the token still works, "
+        f"got {harness.bridge_state['error']!r}"
+    )
+    assert harness.log.has("重试不会恢复"), (
+        "the terminal verdict must be logged like the 401 path does"
+    )
+    return "a rejected renewal backs off for 30 minutes instead of retrying every 5"
+
+
 def scenario_device_id_stays_stable(root: Path):
     """A missing deviceId must not become a brand-new device on every exchange.
 
@@ -1428,6 +1498,7 @@ def main():
         scenario_unsaved_renewal_retries_persistence,
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
+        scenario_rejected_renewal_stops_five_minute_retries,
         scenario_device_id_stays_stable,
         scenario_every_xiaoai_device_is_polled,
         scenario_poll_target_filtering,

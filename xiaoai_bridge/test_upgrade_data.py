@@ -1119,7 +1119,7 @@ def scenario_5_corrupted_data(
                 if loop_error is not None
                 else f"does not raise (bridge_state error={app_a.bridge_state['error']!r})"
             )
-            + ". The bad file is left untouched; not fixed here, reported to the Lead."
+            + ". The bad file is left untouched; this is a known limitation, not a regression."
         )
     assert (data_a / "config" / "config.yaml").read_bytes() == bad_yaml, (
         "S5a: 1.0.10 overwrote the corrupt config.yaml"
@@ -1335,7 +1335,7 @@ def main(argv=None):
 
     if reporter.findings:
         print(flush=True)
-        print("findings (observed, NOT fixed here - reported to the Lead):", flush=True)
+        print("findings (observed, not fixed here):", flush=True)
         for finding in reporter.findings:
             print(f"  - {finding}", flush=True)
     print(

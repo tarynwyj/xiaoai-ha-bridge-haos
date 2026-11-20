@@ -344,6 +344,8 @@ def _apply_cookie_to_session(session, cfg: dict) -> bool:
 # - 同一时刻只允许一次换票，避免拿同一张旧 passToken 并发换票；
 # - 成功后短时间内复用结果，避免「刚换完又立刻再换一次」。
 REFRESH_COALESCE_SECONDS = 60
+# 失败结果的短缓存：同一份凭据被小米拒掉后，60 秒内不再重复换票。
+REFRESH_FAILURE_COALESCE_SECONDS = 60
 _refresh_lock = None
 _refresh_cache: dict = {}
 
@@ -375,6 +377,24 @@ def _recent_refresh(started: tuple):
     if _refresh_cache.get("identity") != started:
         return None
     if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_COALESCE_SECONDS:
+        return None
+    return dict(cached, reused=True)
+
+
+def _recent_failure(started: tuple):
+    '''Reuse a just-rejected exchange instead of hitting Xiaomi again.
+
+    One dead passToken used to turn into a burst: every panel refresh and every
+    401 recovery called the exchange again, and Xiaomi answered each with 70016.
+    A short negative window keeps a single rejection to a single request without
+    hiding the failure from the caller.
+    '''
+    cached = _refresh_cache.get("outcome")
+    if not cached or cached.get("ok"):
+        return None
+    if _refresh_cache.get("identity") != started:
+        return None
+    if time.monotonic() - _refresh_cache.get("at", 0.0) > REFRESH_FAILURE_COALESCE_SECONDS:
         return None
     return dict(cached, reused=True)
 
@@ -5993,6 +6013,10 @@ replace_exact(
     cached = _recent_refresh(started)
     if cached is not None:
         return cached
+    # 刚被小米拒过：同一个结论不必要再问一次，尤其是面板刷新会连着打进来。
+    failed = _recent_failure(started)
+    if failed is not None:
+        return failed
 
     async with _refresh_lock_obj():
         # 另一个任务可能刚刚换完票：直接复用，别在成功后立刻再换一次。
@@ -6000,6 +6024,9 @@ replace_exact(
         cached = _recent_refresh((current.get("userId"), current.get("passToken")))
         if cached is not None:
             return cached
+        failed = _recent_failure((current.get("userId"), current.get("passToken")))
+        if failed is not None:
+            return failed
         # 上一次换票成功但写盘失败：只重试保存，不再向小米换一次票。
         retry = _unsaved_refresh(started)
         if retry is not None:
@@ -6023,7 +6050,11 @@ replace_exact(
             log.warning("Token 刷新失败: %s", e)
             _last_refresh_failure = _relogin_failure_from(e)
             _restore_token(account, snapshot)
-            return _refresh_outcome(False, "exchange", message=str(e))
+            outcome = _refresh_outcome(False, "exchange", message=str(e))
+            # 记住这次失败：60 秒内其它调用方（面板刷新、401 恢复）直接复用结论，
+            # 不再各打一次小米账号服务。
+            _remember_refresh(started, outcome)
+            return outcome
 
         rotated = bool((getattr(account, "token", None) or {}).get("pass_token_rotated"))
         # 换票已经成功。设备发现是独立的一步：暂时失败或返回空列表都不能把刚拿到的
@@ -6126,21 +6157,32 @@ replace_exact(
 # 所以只按短间隔重试，绝不因此把面板变红、把用户赶去重新扫码。
 TOKEN_REFRESH_RETRY = 300
 
+# micoapi serviceToken 的实际寿命约 6 小时（现场日志：issued_at 20:56:57 → 首次 401
+# 02:56:57，误差 0 秒）。续期必须显著早于这一刻，否则每次都是在令牌过期后才换票，
+# 登录态等于一直押在「换票能不能成」上。
+MICOAPI_TOKEN_TTL_HOURS = 6
+DEFAULT_REFRESH_HOURS = 4
+# 大于等于 TTL 的间隔没有意义，压到 TTL 前 1 小时；15 分钟的下限仍然生效。
+MAX_REFRESH_HOURS = 5
+
 
 def _refresh_interval_seconds(mi_cfg: dict | None = None) -> int:
-    \"\"\"How often to renew the micoapi session before it expires (default 6h).\"\"\"
+    '''How often to renew the micoapi session before it expires (default 4h).'''
     import math
 
     raw = (mi_cfg or {}).get("token_refresh_hours")
     try:
         hours = float(raw)
     except (TypeError, ValueError):
-        hours = 6.0
+        hours = DEFAULT_REFRESH_HOURS
     # NaN / inf / 0 / 负数 / 荒谬的大值都必须落回默认，否则 int() 会抛异常，
     # 或者把续期排到几百年之后。
     if not math.isfinite(hours) or hours <= 0:
-        hours = 6.0
-    return max(900, min(int(hours * 3600), 7 * 24 * 3600))
+        hours = DEFAULT_REFRESH_HOURS
+    # 比服务端寿命还长的间隔没有意义：那样每次都是在令牌过期后才换票。旧默认
+    # 6 小时正好等于 TTL，「每 6 小时掉一次登录」就是这么来的。
+    hours = min(hours, MAX_REFRESH_HOURS)
+    return max(900, int(hours * 3600))
 
 
 def _token_age_seconds() -> float:
@@ -6223,15 +6265,27 @@ replace_exact(
                             log.error("登录态已续期但未能持久化: %s",
                                       outcome.get("message") or "写入失败")
                     else:
-                        # 续期失败不等于登录失败：当前 serviceToken 还能用，先重试，
-                        # 不要把它写成面板错误，否则用户会被误导去重新扫码。
-                        next_refresh_at = time.time() + TOKEN_REFRESH_RETRY
-                        bridge_state["renewal"] = (
-                            "当前登录仍可用，但自动续期异常（%s），%ss 后重试"
-                            % (outcome.get("message") or "未知原因", TOKEN_REFRESH_RETRY)
-                        )
-                        log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
-                                    TOKEN_REFRESH_RETRY)
+                        # 续期失败要分开看：网络/STS 抖动等一会儿确实会好；小米明确
+                        # 拒绝这份凭据（70016 等）时重试多少次都是同一个结果，按 5 分钟
+                        # 一次重试只会持续打小米、把风控焐得更热。判定与 401 恢复路径
+                        # 共用 _relogin_retry_plan，别让两条路给出相反的结论。
+                        failure = _last_refresh_failure
+                        if outcome.get("stage") == "superseded":
+                            # 换票期间用户重新登录/清了凭据：这不是凭据被拒，
+                            # 循环顶部的指纹检查会立刻切到新登录态。
+                            failure = {}
+                        fatal, wait_seconds, message = _relogin_retry_plan(
+                            failure, TOKEN_REFRESH_RETRY)
+                        next_refresh_at = time.time() + wait_seconds
+                        bridge_state["renewal"] = message
+                        if fatal:
+                            # 不在这里 sleep：手里的 serviceToken 可能还能用，
+                            # 停掉轮询反而会漏掉语音指令。凭据文件一变，循环顶部
+                            # 会把 next_refresh_at 归零，用户扫码后立刻重试。
+                            log.error("%s", message)
+                        else:
+                            log.warning("登录态续期失败（当前轮询不受影响），%ss 后重试",
+                                        wait_seconds)
 
                 device_id = mi_cfg.get("device_id", "") or mi_cfg.get("device_did", "")
 """,

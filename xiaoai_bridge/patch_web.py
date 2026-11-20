@@ -2021,6 +2021,19 @@ async function verifyCookieTicket(){
 async function qrLogin(){""",
 )
 
+# ──────────────── 自动续期异常要在面板上可见 ────────────────
+# bridge_state["renewal"] 一直只写不读：文档承诺「面板提示自动续期异常」，
+# 实际只有日志里有。小米拒绝凭据时这条比 error 更该被看到。
+replace_exact(
+    "show the renewal warning on the dashboard",
+    """  if(s.error){showAlert(a,'err','✗ '+s.error)}else{a.classList.remove('show')}
+""",
+    """  if(s.error){showAlert(a,'err','✗ '+s.error)}
+  else if(s.renewal){showAlert(a,'warn','⚠ '+s.renewal)}
+  else{a.classList.remove('show')}
+""",
+)
+
 path.write_text(html, encoding="utf-8")
 print("Patched web/index.html with HA entity dropdowns")
 print("Patched web/index.html with ingress-safe fetch, clear-login button and rule edit guards")

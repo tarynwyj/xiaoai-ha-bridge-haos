@@ -39,6 +39,7 @@ WANTED_FUNCS = (
     "_refresh_lock_obj",
     "_refresh_outcome",
     "_recent_refresh",
+    "_recent_failure",
     "_remember_refresh",
     "_unsaved_refresh",
     "_save_refreshed_credentials",
@@ -56,6 +57,7 @@ WANTED_FUNCS = (
     "_restore_token",
     "_relogin_failure_from",
     "_relogin_retry_plan",
+    "_renewal_pending_message",
     "_refresh_interval_seconds",
     "_token_age_seconds",
     "_credential_fingerprint",
@@ -216,8 +218,11 @@ def build_namespace(bridge_path: Path, root: Path, log: Log):
     for node in tree.body:
         if isinstance(node, ast.Assign):
             targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            if any(t in ("REFRESH_COALESCE_SECONDS", "_refresh_lock", "_refresh_cache",
-                         "_last_refresh_failure", "_process_login_device_id")
+            if any(t in ("REFRESH_COALESCE_SECONDS", "REFRESH_FAILURE_COALESCE_SECONDS",
+                         "_refresh_lock", "_refresh_cache",
+                         "_last_refresh_failure", "_process_login_device_id",
+                         "MICOAPI_TOKEN_TTL_HOURS", "DEFAULT_REFRESH_HOURS",
+                         "MAX_REFRESH_HOURS")
                    for t in targets):
                 exec(compile(ast.Module(body=[node], type_ignores=[]), str(bridge_path), "exec"),
                      namespace)
@@ -464,6 +469,8 @@ def scenario_device_id(reporter, make_ns):
     assert first["ok"] is False, first
     used_first = Exchange.calls[0]["device_id"]
     assert used_first, "the exchange must send a non-empty deviceId"
+    # Bypass the 60s negative cache (covered by G1) to force a second exchange.
+    ns["_refresh_cache"].clear()
     second = asyncio.run(ns["_relogin_and_refresh"](account, {}))
     assert second["ok"] is False, second
     assert Exchange.calls[1]["device_id"] == used_first, (
@@ -557,14 +564,24 @@ def scenario_concurrency(reporter, make_ns):
 def scenario_schedule(reporter, make_ns):
     ns = make_ns()
     interval = ns["_refresh_interval_seconds"]
-    assert interval({}) == 6 * 3600, interval({})
-    assert interval({"token_refresh_hours": float("nan")}) == 6 * 3600
-    assert interval({"token_refresh_hours": float("inf")}) == 6 * 3600
-    assert interval({"token_refresh_hours": "nonsense"}) == 6 * 3600
-    assert interval({"token_refresh_hours": -1}) == 6 * 3600
+    assert interval({}) == 3600, interval({})
+    assert interval({"token_refresh_hours": float("nan")}) == 3600
+    assert interval({"token_refresh_hours": float("inf")}) == 3600
+    assert interval({"token_refresh_hours": "nonsense"}) == 3600
+    assert interval({"token_refresh_hours": -1}) == 3600
     assert interval({"token_refresh_hours": 0.001}) == 900
-    assert interval({"token_refresh_hours": 10 ** 9}) == 7 * 24 * 3600
+    assert interval({"token_refresh_hours": 10 ** 9}) == 5 * 3600
     reporter.ok("F1 a NaN/inf/garbage/absurd interval falls back safely")
+
+    # The micoapi serviceToken lives ~6h, so an interval at or beyond that is
+    # guaranteed to renew only after expiry. 4h default, 5h ceiling.
+    assert interval({"token_refresh_hours": 1}) == 3600
+    assert interval({"token_refresh_hours": 4}) == 4 * 3600
+    assert interval({"token_refresh_hours": 6}) == 5 * 3600, (
+        "an interval equal to the 6h token TTL must be capped, got %s"
+        % interval({"token_refresh_hours": 6}))
+    assert interval({"token_refresh_hours": 168}) == 5 * 3600
+    reporter.ok("F3 an interval at or beyond the 6h token TTL is capped to 5h")
 
     age = ns["_token_age_seconds"]
     assert age() == float("inf"), age()
@@ -577,12 +594,50 @@ def scenario_schedule(reporter, make_ns):
     reporter.ok("F2 a corrupted issued_at renews immediately instead of never")
 
 
+# ─────────────────────── G: rejected exchange cache ───────────────────────
+def scenario_rejected_exchange(reporter, make_ns):
+    """A rejected passToken must not be re-sent for every caller.
+
+    The panel refreshes the speaker list on every page load and the 401 recovery
+    runs on its own clock; without a negative window one dead passToken turned
+    into a burst of serviceLogin calls, each answered with 70016.
+    """
+    ns = make_ns()
+    write_credentials(ns)
+    reset_exchange()
+    ns["_refresh_cache"].clear()
+    Exchange.response = {"code": 70016, "description": "passToken 已失效"}
+
+    first = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
+    assert first["ok"] is False and first["stage"] == "exchange", first
+    assert len(Exchange.calls) == 1, Exchange.calls
+
+    second = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
+    assert second["ok"] is False, second
+    assert second.get("reused") is True, (
+        "a repeated rejection must reuse the verdict, got %r" % (second,))
+    assert len(Exchange.calls) == 1, (
+        "a rejected passToken must not be exchanged twice in a minute, got %d"
+        % len(Exchange.calls))
+    reporter.ok("G1 a rejected exchange is reused for a minute instead of re-hitting Xiaomi")
+
+    # A fresh login is a different identity: it must not inherit the rejection.
+    write_credentials(ns, pass_token="pass-2")
+    reset_exchange()
+    Exchange.response = {"code": 0, "location": "https://sts.example/sts", "nonce": "1",
+                         "ssecurity": "s2", "userId": "user-1", "passToken": "pass-2"}
+    third = asyncio.run(ns["_relogin_and_refresh"](FakeAccount("device-1"), {}))
+    assert third["ok"] is True, third
+    reporter.ok("G2 a fresh login is not shadowed by the cached rejection")
+
+
 SCENARIOS = (
     ("rotation", scenario_rotation),
     ("post-exchange failures", scenario_post_exchange),
     ("persistence", scenario_persistence),
     ("login deviceId", scenario_device_id),
     ("concurrency", scenario_concurrency),
+    ("rejected exchange cache", scenario_rejected_exchange),
     ("scheduling", scenario_schedule),
 )
 

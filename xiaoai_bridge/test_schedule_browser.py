@@ -20,7 +20,8 @@ import json
 import pathlib
 import sys
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import unquote, urlsplit
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -67,14 +68,21 @@ def main() -> int:
     toggles: list[dict] = []
     updated: list[dict] = []
     cleanups: list[str] = []
+    deleted: list[str] = []
+    toggle_ids: list[str] = []
     state = {"fail_create": False, "fail_list": False, "automations": []}
 
     def open_page(page):
         def api(route):
             request = route.request
-            path = request.url.split("://", 1)[-1]
-            path = "/" + path.split("/", 1)[1] if "/" in path else "/"
+            path = urlsplit(request.url).path
             if path.startswith("/api/automations/") and request.method == "DELETE":
+                config_id = unquote(path.rsplit("/", 1)[-1])
+                deleted.append(config_id)
+                if config_id != "xiaoai_bridge_partial":
+                    state["automations"] = [s for s in state["automations"] if s["config_id"] != config_id]
+                    route.fulfill(json={"ok": True, "ha_deleted": True, "registry_updated": True, "reloaded": True})
+                    return
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({
                     "ok": True, "ha_deleted": True, "registry_updated": False, "reloaded": True,
                     "msg": "HA 任务配置已删除，但本地登记清理失败，原登记表已保留"}))
@@ -85,10 +93,17 @@ def main() -> int:
                               body=json.dumps({"ok": True, "removed": 1}))
                 return
             if path.startswith("/api/automations/") and path.endswith("/toggle"):
-                toggles.append(json.loads(request.post_data or "{}"))
+                body = request.post_data_json
+                toggles.append(body)
+                config_id = unquote(path.split("/")[-2])
+                toggle_ids.append(config_id)
+                for item in state["automations"]:
+                    if item["config_id"] == config_id:
+                        item.update(state="on" if body["enabled"] else "off",
+                                    status="active" if body["enabled"] else "disabled")
                 route.fulfill(status=200, content_type="application/json",
-                              body=json.dumps({"ok": True, "enabled": False,
-                                               "msg": "已暂停"}))
+                              body=json.dumps({"ok": True, "enabled": body["enabled"],
+                                               "msg": "已启用" if body["enabled"] else "已暂停"}))
                 return
             if path.startswith("/api/automations/") and request.method == "PUT":
                 body = json.loads(request.post_data or "{}")
@@ -252,14 +267,12 @@ def main() -> int:
             result.eq("exactly one create request", len(posted), 1)
             body = posted[0] if posted else {}
             result.eq("time", body.get("time"), "07:30")
+            result.eq("existing time form posts a point task", body.get("kind"), "point")
             result.eq("days", body.get("days"), "daily")
             result.eq("domain", body.get("domain"), "switch")
             result.eq("service", body.get("service"), "turn_on")
             result.eq("entity", body.get("entity_id"), "switch.reshui")
-            result.check("the user never typed a service name",
-                         "turn_on" not in page.eval_on_selector("#schedule-form",
-                                                                "el => el.innerText")
-                         .replace("turn_on", "", 0) or True)
+
 
             # ── multiple compatible devices create one array-target task ──
             page.click('button[onclick="scheduleFormToggle()"]')
@@ -488,6 +501,167 @@ def main() -> int:
                 result.check("non-JSON error never exposes a parser exception",
                              'Unexpected token' not in message and 'undefined' not in message)
             state['fail_list']=False
+            # Freeze just before the deadline; navigation and form actions must
+            # not consume any of the interval that the test explicitly advances.
+            clock_start = datetime(2025, 12, 1, 8, tzinfo=timezone.utc)
+            page.clock.install(time=clock_start - timedelta(minutes=1))
+            page.clock.pause_at(clock_start)
+            state['automations'] = [
+                {'config_id': 'group/window', 'entity_id': 'automation.window', 'alias': '窗时段',
+                 'kind': 'window', 'entity': ['light.keting', 'switch.reshui'], 'domain': 'homeassistant',
+                 'service': 'turn_on', 'time': '22:00:15', 'end_time': '06:00:30', 'weekdays': ['fri'],
+                 'state': 'on', 'status': 'active'},
+                {'config_id': 'countdown/active', 'entity_id': 'automation.countdown_active', 'alias': '正在倒计时',
+                 'kind': 'countdown', 'entity': 'switch.reshui', 'domain': 'switch', 'service': 'turn_off',
+                 'duration_minutes': 30, 'deadline': '2025-12-01T16:00:05+08:00',
+                 'once': True, 'state': 'on', 'status': 'active'},
+                {'config_id': 'countdown/done', 'entity_id': 'automation.countdown_done', 'alias': '历史完成',
+                 'kind': 'countdown', 'entity': 'switch.reshui', 'status': 'done', 'once': True},
+                {'config_id': 'countdown/expired', 'entity_id': 'automation.countdown_expired', 'alias': '历史错过',
+                 'kind': 'countdown', 'entity': 'switch.reshui', 'status': 'expired', 'once': True},
+                {'config_id': 'unknown-target', 'entity_id': 'automation.unknown', 'alias': '未发现设备任务',
+                 'entity': 'switch.old', 'state': 'off', 'status': 'disabled'},
+            ]
+            page.locator('[data-page="devices"]').click()
+            sensor = page.locator('#device-list .rule-item').filter(has_text='温度传感器')
+            sensor.wait_for()
+            result.eq('read-only device has no schedule entry', sensor.get_by_role('button', name='定时').count(), 0)
+            page.locator('#device-list [data-entity="switch.reshui"]').click()
+            rows = page.locator('#schedule-list .rule-item')
+            rows.filter(has_text='正在倒计时').wait_for()
+            result.eq('device entry scopes the schedule list', page.input_value('#schedule-device-filter'), 'switch.reshui')
+            result.eq('device scope matches both scalar and array targets', rows.count(), 4)
+            result.check('a scoped refresh clears the previous list error', not page.is_visible('#schedules-alert'))
+            page.locator('button[onclick="loadSchedules()"]').click()
+            page.wait_for_function('document.querySelector("#schedule-count").textContent === "4个"')
+            result.eq('refresh preserves device selection', page.input_value('#schedule-device-filter'), 'switch.reshui')
+            page.select_option('#schedule-device-filter', 'switch.old')
+            result.eq('a retained unavailable target remains filterable', rows.count(), 1)
+            page.select_option('#schedule-device-filter', '')
+            result.eq('all devices restores all logical tasks', rows.count(), 5)
+            page.select_option('#schedule-device-filter', 'switch.reshui')
+
+            window = rows.filter(has_text='窗时段')
+            countdown = rows.filter(has_text='正在倒计时')
+            result.check('one grouped window shows repeat and next-day close',
+                         '每周五' in window.inner_text() and '次日 06:00:30' in window.inner_text())
+            result.check('completed and missed countdowns use backend status',
+                         '已完成' in rows.filter(has_text='历史完成').inner_text()
+                         and '已过期未执行' in rows.filter(has_text='历史错过').inner_text())
+            remaining = countdown.locator('[data-deadline]')
+            result.eq('offset deadline has five seconds remaining', remaining.inner_text(), '剩余 00:00:05')
+            page.clock.run_for(2000)
+            result.eq('countdown ticks in place', remaining.inner_text(), '剩余 00:00:03')
+            page.clock.run_for(5000)
+            result.check('local zero does not claim execution', '刷新核对' in remaining.inner_text())
+            page.locator('[data-page="devices"]').click()
+            result.check('leaving the page clears the countdown timer', page.evaluate('scheduleClock === null'))
+            page.locator('[data-page="schedules"]').click()
+
+            with page.expect_response(lambda r: r.url.endswith('/toggle')):
+                window.get_by_title('暂停/启用').click()
+            window.get_by_text('暂停', exact=True).wait_for()
+            result.eq('pause uses the group config id and one request', (toggle_ids[-1], toggles[-1]),
+                      ('group/window', {'enabled': False}))
+            with page.expect_response(lambda r: r.url.endswith('/toggle')):
+                window.get_by_title('暂停/启用').click()
+            window.get_by_text('启用', exact=True).wait_for()
+            result.eq('resume uses the same group id', (toggle_ids[-1], toggles[-1]),
+                      ('group/window', {'enabled': True}))
+
+            window.get_by_title('修改任务').click()
+            create = page.locator('#sch-create')
+            page.wait_for_function('!document.querySelector("#sch-create").disabled')
+            result.eq('edit loads the grouped window type and both clocks',
+                      [page.input_value(sel) for sel in ('#sch-kind', '#sch-time', '#sch-end-time')],
+                      ['window', '22:00:15', '06:00:30'])
+            result.eq('edit retains custom weekdays and both targets',
+                      (page.locator('#sch-weekdays :checked').get_attribute('value'), page.locator('#sch-device :checked').count()), ('5', 2))
+            page.fill('#sch-end-time', '07:00')
+            with page.expect_response(lambda r: r.request.method == 'PUT'):
+                create.click()
+            page.locator('#schedule-form').wait_for(state='hidden')
+            result.eq('group edit sends both clocks in one PUT', updated[-1],
+                      {'__id': 'group%2Fwindow', 'kind': 'window', 'time': '22:00:15', 'end_time': '07:00',
+                       'days': '5', 'entity_id': ['light.keting', 'switch.reshui'], 'domain': 'homeassistant', 'service': 'turn_on'})
+
+            page.locator('#page-schedules button[onclick="scheduleFormToggle()"]:visible').first.click()
+            page.wait_for_function('!document.querySelector("#sch-create").disabled')
+            result.eq('new form starts clean with only the context device',
+                      (page.input_value('#sch-kind'), page.locator('#sch-device :checked').get_attribute('value')), ('point', 'switch.reshui'))
+            page.select_option('#sch-kind', 'window')
+            result.check('window hides advanced mode and disables one-shot',
+                         not page.is_visible('#sch-advanced') and page.locator('#sch-days option[value=once]').is_disabled())
+            page.fill('#sch-time', '22:00')
+            page.fill('#sch-end-time', '22:00')
+            start_posts = len(posted)
+            create.click()
+            result.check('equal clocks are rejected locally', '不能相同' in page.inner_text('#sch-status'))
+            choose_devices(page, 'cover.window')
+            create.click()
+            result.check('incompatible window targets are rejected locally', '同时支持打开和关闭' in page.inner_text('#sch-status'))
+            result.eq('invalid windows make no POST', len(posted), start_posts)
+            choose_devices(page, 'switch.reshui')
+            page.fill('#sch-end-time', '06:00')
+            page.select_option('#sch-days', 'weekdays')
+            result.check('window preview identifies start-day repeat and next-day close',
+                         '周一至周五' in preview(page) and '次日 06:00' in preview(page))
+            with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/api/automations')):
+                create.click()
+            page.locator('#schedule-form').wait_for(state='hidden')
+            result.eq('window is posted as a single logical task', posted[-1],
+                      {'kind': 'window', 'time': '22:00', 'end_time': '06:00', 'days': 'weekdays',
+                       'entity_id': 'switch.reshui', 'domain': 'switch', 'service': 'turn_on'})
+
+            countdown.get_by_title('修改任务').click()
+            page.wait_for_function('!document.querySelector("#sch-create").disabled')
+            result.check('countdown editing explicitly requires a new duration',
+                         page.is_visible('#sch-countdown-edit') and page.input_value('#sch-duration') == '')
+            result.eq('countdown edit preserves the selected action',
+                      page.locator('input[name=sch-action]:checked').get_attribute('value'), 'turn_off')
+            create.click()
+            result.check('an empty edit duration cannot restart accidentally', '整数分钟' in page.inner_text('#sch-status'))
+            page.fill('#sch-duration', '12')
+            with page.expect_response(lambda r: r.request.method == 'PUT'):
+                create.click()
+            page.locator('#schedule-form').wait_for(state='hidden')
+            result.eq('restarting uses numeric minutes and the existing id, with no wall clock', updated[-1],
+                      {'__id': 'countdown%2Factive', 'kind': 'countdown', 'duration_minutes': 12,
+                       'entity_id': 'switch.reshui', 'domain': 'switch', 'service': 'turn_off', 'data': {}})
+
+            page.locator('#page-schedules button[onclick="scheduleFormToggle()"]:visible').first.click()
+            page.wait_for_function('!document.querySelector("#sch-create").disabled')
+            page.select_option('#sch-days', 'once')
+            page.select_option('#sch-kind', 'countdown')
+            result.check('countdown hides calendar fields including a previously selected date',
+                         not page.is_visible('#sch-time') and not page.is_visible('#sch-date'))
+            start_posts = len(posted)
+            for duration in ('0', '1.5', '10081'):
+                page.fill('#sch-duration', duration)
+                create.click()
+                result.check(f'invalid countdown duration {duration} explains the range', '整数分钟' in page.inner_text('#sch-status'))
+            result.eq('invalid countdown durations make no POST', len(posted), start_posts)
+            page.fill('#sch-duration', '30')
+            page.check('input[name=sch-action][value=turn_off]')
+            result.check('countdown preview describes a relative delay', '30 分钟后，关闭' in preview(page))
+            with page.expect_response(lambda r: r.request.method == 'POST' and r.url.endswith('/api/automations')):
+                create.click()
+            page.locator('#schedule-form').wait_for(state='hidden')
+            result.eq('countdown creation omits stale calendar values', posted[-1],
+                      {'kind': 'countdown', 'duration_minutes': 30, 'entity_id': 'switch.reshui',
+                       'domain': 'switch', 'service': 'turn_off', 'data': {}})
+
+            result.eq('active countdown has no pause control', countdown.get_by_title('暂停/启用').count(), 0)
+            with page.expect_response(lambda r: r.request.method == 'DELETE'):
+                countdown.get_by_title('取消倒计时').click()
+            countdown.wait_for(state='detached')
+            result.eq('cancellation deletes the countdown config id', deleted[-1], 'countdown/active')
+            result.check('cancellation confirmation is explicit', '已取消倒计时' in page.inner_text('#schedules-alert'))
+            result.check('refresh without an active countdown stops the clock', page.evaluate('scheduleClock === null'))
+            with page.expect_response(lambda r: r.request.method == 'DELETE'):
+                window.get_by_title('删除开关时段').click()
+            window.wait_for(state='detached')
+            result.eq('deletion targets the entire grouped window via one config id', deleted[-1], 'group/window')
             result.check("the page logged no error", not errors, "; ".join(errors[:3]))
             browser.close()
     finally:

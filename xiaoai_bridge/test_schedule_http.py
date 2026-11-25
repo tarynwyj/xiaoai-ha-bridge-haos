@@ -48,7 +48,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -285,6 +285,8 @@ class FakeHomeAssistant:
         return "automation." + (slug or "task")
 
     def _rebuild_states(self) -> None:
+        enabled_by_id = {state["attributes"].get("id"): state["state"]
+                         for state in self.states.values() if state["state"] in ("on", "off")}
         states = {}
         for entity_id, (state, name) in self.devices.items():
             states[entity_id] = {
@@ -296,7 +298,7 @@ class FakeHomeAssistant:
             entity_id = self.entity_id_for(config.get("alias") or config_id)
             states[entity_id] = {
                 "entity_id": entity_id,
-                "state": "on",
+                "state": enabled_by_id.get(config_id, "on"),
                 "attributes": {
                     "id": config_id,
                     "friendly_name": config.get("alias") or config_id,
@@ -428,7 +430,8 @@ class FakeHAHandler(BaseHTTPRequestHandler):
                 return self._send_json(404, {"message": "Entity not found."})
             return self._send_json(200, state)
         if path == "/api/services":
-            return self._send_json(200, SERVICE_CATALOG)
+            return self._send_json(getattr(self.store, "services_status", 200),
+                                   getattr(self.store, "service_catalog", SERVICE_CATALOG))
         if path.startswith("/api/config/automation/config/"):
             config_id = unquote(path[len("/api/config/automation/config/"):])
             config = self.store.get_config(config_id)
@@ -1270,6 +1273,8 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
     eq("partial cleanup: individual delete can finish the cleanup",
        client2.delete("/api/automations/" + purge_id, headers=UI_HEADER).status_code, 200)
 
+    run_device_schedules(root, restarted, client2, store, check, eq)
+
     # ── I: nothing reached HA's config store without the configured token ──
     denied_path = "/api/config/automation/config/" + denied_id
     config_writes = [item for item in store.requests
@@ -1280,6 +1285,146 @@ def run_fake_ha(root: Path, base: str, store, check, eq):
           bool(config_writes)
           and all(item["authorized"] for item in config_writes),
           [item for item in config_writes if not item["authorized"]])
+
+
+def run_device_schedules(root, bridge, client, store, check, eq):
+    path = "/api/automations"
+    window = {"kind": "window", "time": "22:00", "end_time": "06:00", "days": "fri,sun",
+              "domain": "homeassistant", "service": "turn_on",
+              "entity_id": ["light.kitchen", "switch.study_light"]}
+    countdown = {"kind": "countdown", "duration_minutes": 30,
+                 "domain": "light", "service": "turn_off", "entity_id": "light.kitchen"}
+
+    def row(config_id):
+        return rows_by_config_id(client.get(path).json()["automations"])[config_id]
+
+    first_configs = set(store.configs)
+    for invalid in ({"end_time": "22:00:00"}, {"end_time": "25:00"}, {"end_time": "²:00"},
+                    {"days": "once"}, {"days": "8"}, {"once": True}, {"data": {"brightness": 10}},
+                    {"service": "toggle"}, {"entity_id": []}, {"entity_id": "light.missing"},
+                    {"entity_id": "sensor.living_room_temperature"}):
+        eq(f"window: rejects {invalid}", client.post(path, headers=UI_HEADER,
+                                                     json_body=window | invalid).status_code, 400)
+    store.service_catalog = [dict(item, services={"turn_on": {}}) if item["domain"] == "switch" else item
+                             for item in SERVICE_CATALOG]
+    eq("window: both on and off must be exposed for every target",
+       client.post(path, headers=UI_HEADER, json_body=window).status_code, 400)
+    store.service_catalog = SERVICE_CATALOG
+    store.services_status = 503
+    eq("window: unknown capabilities do not allow a write",
+       client.post(path, headers=UI_HEADER, json_body=window).status_code, 502)
+    store.services_status = 200
+    for invalid in (0, -1, 10081, None, True, 1.5, "5"):
+        expected = 400 if invalid is None or type(invalid) is int else 422
+        eq(f"countdown: rejects duration {invalid!r}", client.post(path, headers=UI_HEADER,
+           json_body=countdown | {"duration_minutes": invalid}).status_code, expected)
+    eq("invalid scheduling requests leave HA untouched", set(store.configs), first_configs)
+
+    response = client.post(path, headers=UI_HEADER, json_body=window)
+    eq("window: create succeeds", response.status_code, 200)
+    wid = response.json()["automation_id"]
+    url = path + "/" + wid
+    eq("window: one HA config covers both edges", set(store.configs) - first_configs, {wid})
+    eq("window: stable config id prevents duplicate submission",
+       client.post(path, headers=UI_HEADER, json_body=window).json()["automation_id"], wid)
+    config = store.configs[wid]
+    eq("window: two time trigger IDs", config["trigger"],
+       [{"platform": "time", "at": "22:00:00", "id": "start"},
+        {"platform": "time", "at": "06:00:00", "id": "end"}])
+    for choice, edge, days, service in zip(config["action"][0]["choose"], ("start", "end"),
+                                          (["fri", "sun"], ["mon", "sat"]), ("turn_on", "turn_off")):
+        eq(f"window: {edge} uses opening-day semantics and the same targets", choice,
+           {"conditions": [{"condition": "trigger", "id": edge}, {"condition": "time", "weekday": days}],
+            "sequence": [{"service": "homeassistant." + service, "target": {"entity_id": window["entity_id"]}}]})
+    real_now = bridge._schedule_now
+    bridge._schedule_now = lambda: datetime(2030, 11, 8, 23)  # Friday night
+    try:
+        eq("window: after opening, next run is Saturday closing", row(wid)["next_run"], "2030-11-09 06:00")
+    finally:
+        bridge._schedule_now = real_now
+    eq("window: loaded row preserves target array and timing",
+       tuple(row(wid)[key] for key in ("kind", "end_time", "entity", "status")),
+       ("window", "06:00:00", window["entity_id"], "active"))
+    eq("window: pause applies to entire group", client.post(url + "/toggle", headers=UI_HEADER,
+                                                            json_body={"enabled": False}).status_code, 200)
+    eq("window: paused group has no next run", (row(wid)["status"], row(wid)["next_run"]), ("disabled", None))
+    updated_window = window | {"time": "08:00", "end_time": "18:00"}
+    updated = client.put(url, headers=UI_HEADER, json_body=updated_window)
+    eq("window: edit keeps ID and config count", (updated.status_code, updated.json().get("automation_id"),
+                                                   set(store.configs) - first_configs), (200, wid, {wid}))
+    eq("window: editing a disabled group does not enable it", row(wid)["status"], "disabled")
+    eq("window: same-day close uses opening weekdays",
+       store.configs[wid]["action"][0]["choose"][1]["conditions"][1]["weekday"], ["fri", "sun"])
+    eq("window: resume applies to entire group", client.post(url + "/toggle", headers=UI_HEADER,
+        json_body={"enabled": True}).status_code, 200)
+    eq("window: resumed row is active", row(wid)["status"], "active")
+    eq("window: delete removes the whole group", client.delete(url, headers=UI_HEADER).status_code, 200)
+    eq("window: registry and HA agree on deletion", (registry_entry(root, wid), wid in store.configs), (None, False))
+    eq("window: editing the deleted config does not recreate it",
+       client.put(url, headers=UI_HEADER, json_body=window).status_code, 404)
+
+    store.reload_status = 503
+    unloaded = client.post(path, headers=UI_HEADER, json_body=window)
+    store.reload_status = 200
+    eq("window: reload failure is acknowledged as saved but not loaded",
+       (unloaded.status_code, unloaded.json().get("reloaded")), (200, False))
+    wid = unloaded.json()["automation_id"]
+    eq("window: unloaded row does not report a next run", (row(wid)["status"], row(wid)["next_run"]),
+       ("not_loaded", None))
+    eq("window: unloaded group cannot be toggled", client.post(path + "/" + wid + "/toggle", headers=UI_HEADER,
+                                                              json_body={"enabled": False}).status_code, 404)
+    client.delete(path + "/" + wid, headers=UI_HEADER)
+
+    earliest = datetime.now(timezone.utc) + timedelta(minutes=30)
+    response = client.post(path, headers=UI_HEADER, json_body=countdown)
+    latest = datetime.now(timezone.utc) + timedelta(minutes=30, seconds=1)
+    eq("countdown: create succeeds without a wall-clock input", response.status_code, 200)
+    cid = response.json()["automation_id"]
+    url = path + "/" + cid
+    details = row(cid)
+    deadline = datetime.fromisoformat(details["deadline"])
+    check("countdown: server returns an offset-bearing persisted deadline", earliest <= deadline <= latest, details)
+    eq("countdown: list retains legacy once/date/time alongside duration",
+       (details["kind"], details["duration_minutes"], details["once"], details["date"], details["time"]),
+       ("countdown", 30, True, deadline.date().isoformat(), deadline.strftime("%H:%M:%S")))
+    eq("countdown: HA owns the scheduled action", store.configs[cid]["action"],
+       [{"service": "light.turn_off", "target": {"entity_id": "light.kitchen"}}])
+    eq("countdown: editing only the action preserves deadline", client.put(url, headers=UI_HEADER,
+       json_body={k: v for k, v in (countdown | {"service": "turn_on"}).items() if k != "duration_minutes"}).status_code, 200)
+    eq("countdown: deadline survives editing and reading", row(cid)["deadline"], details["deadline"])
+    eq("countdown: new duration edits in place", client.put(url, headers=UI_HEADER,
+       json_body=countdown | {"duration_minutes": 1}).json().get("automation_id"), cid)
+    check("countdown: new duration restarts the deadline", datetime.fromisoformat(row(cid)["deadline"]) < deadline)
+
+    # Assert the exact HA condition: a delayed or manual trigger cannot replay it.
+    from zoneinfo import ZoneInfo
+    deadline = datetime.fromisoformat(row(cid)["deadline"])
+    eq("countdown: the HA trigger checks the scheduled second", store.configs[cid]["trigger"],
+       [{"platform": "time_pattern", "seconds": deadline.second}])
+    eq("countdown: HA compares the trigger's absolute timestamp, disallowing catch-up",
+       store.configs[cid]["condition"], [{"condition": "template", "value_template":
+           "{{ trigger is defined and trigger.platform == 'time_pattern' and "
+           f"(as_timestamp(trigger.now) | int) == {int(deadline.timestamp())} " + "}}"}])
+    ny = ZoneInfo("America/New_York")
+    spring = bridge._countdown_deadline(datetime(2030, 3, 10, 1, 50, tzinfo=ny), 20, ny)
+    eq("countdown: elapsed arithmetic across a DST gap", spring.isoformat(), "2030-03-10T03:10:00-04:00")
+    fall = bridge._countdown_deadline(datetime(2030, 11, 3, 1, 50, tzinfo=ny), 20, ny)
+    eq("countdown: elapsed arithmetic across a DST fold", fall.isoformat(), "2030-11-03T01:10:00-05:00")
+    eq("countdown: ISO deadlines round-trip to the intended fold, not the first occurrence",
+       bridge._countdown_parse_deadline(fall.isoformat()).timestamp() - fall.replace(fold=0).timestamp(), 3600)
+    past_deadline = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=1)
+    rows = read_registry(root)
+    next(item for item in rows if item["id"] == cid)["deadline"] = past_deadline.isoformat()
+    bridge._schedule_registry_write(rows)
+    eq("countdown: missed deadline is expired with no next run", (row(cid)["status"], row(cid)["next_run"]),
+       ("expired", None))
+    eq("countdown: explicit cleanup leaves missed tasks visible", client.post(path + "/cleanup", headers=UI_HEADER,
+       json_body={}).json()["removed"], 0)
+    store.set_last_triggered(cid, past_deadline.isoformat())
+    eq("countdown: a confirmed trigger completes the task", row(cid)["status"], "done")
+    eq("countdown: delete removes the persistent automation", client.delete(url, headers=UI_HEADER).status_code, 200)
+    check("schedule API did not execute device actions while creating/editing/toggling/deleting",
+          all(call["domain"] == "automation" for call in store.service_calls))
 
 
 # ─────────────────────────── entry point ───────────────────────────

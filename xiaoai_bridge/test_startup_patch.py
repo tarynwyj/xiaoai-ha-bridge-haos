@@ -80,6 +80,9 @@ WANTED_FUNCS = [
     "_relogin_and_refresh",
     "_relogin_failure_from",
     "_relogin_retry_plan",
+    "_renewal_pending_message",
+    "_record_renewal",
+    "_renewal_backoff_seconds",
     "_credential_fingerprint",
     "_wait_for_relogin",
     "_refresh_interval_seconds",
@@ -99,6 +102,7 @@ WANTED_FUNCS = [
     "_refresh_lock_obj",
     "_refresh_outcome",
     "_recent_refresh",
+    "_recent_failure",
     "_remember_refresh",
     "_unsaved_refresh",
     "_save_refreshed_credentials",
@@ -273,7 +277,8 @@ class FakeHAClient:
 
     async def call_service(self, domain, service, data, session):
         FakeHAClient.calls.append((domain, service, dict(data)))
-        FakeHAClient.state["running"] = False
+        if domain != "persistent_notification":
+            FakeHAClient.state["running"] = False
         return True
 
 
@@ -782,6 +787,96 @@ def scenario_schedule_ai_fallback_keeps_time(root: Path):
     return "valid AI schedule fallback remains available without permitting immediate actions"
 
 
+def scenario_live_ticket_switch(root: Path):
+    for user in ('user-1', 'user-2'):
+        h = Harness(root / user)
+        h.cfg['xiaomi']['device_did'] = ''
+        def save(uid, client, service):
+            identity = dict(userId=uid, passToken='pass-' + client, deviceId=client)
+            h.write_auth(identity)
+            h.write_token(dict(identity, micoapi=['s', service], issued_at=int(time.time())))
+        save('user-1', 'before', 'valid-service')
+        visits = []
+        async def discover(na):
+            token = na.account.token
+            visits.append((token.copy(), na.account.session))
+            return [dict(deviceID=token['deviceId'], hardware='L05C')]
+        async def tick(delay):
+            if len(h.polled_devices) == 1 and not h.sleeps:
+                save(user, 'after', 'fresh-service-token')
+            else:
+                h.bridge_state['running'] = False
+            h.sleeps.append(delay)
+        original = FakeMiNAService.device_list
+        FakeMiNAService.device_list = discover
+        h.namespace['asyncio'].sleep = tick
+        try:
+            h.run()
+        finally:
+            FakeMiNAService.device_list = original
+        assert h.polled_devices == ['before', 'after'], h.polled_devices
+        assert visits[-1][0]['userId'] == user and visits[-1][0]['micoapi'][1] == 'fresh-service-token'
+        assert visits[0][1] is not visits[-1][1] and visits[0][1].closed
+        assert not h.verified_calls, h.verified_calls
+    return 'same-account and cross-account replacement adopt fresh ticket without exchange'
+
+
+def scenario_short_exchange(root: Path):
+    for challenge in (False, True):
+        h = Harness(root / str(challenge))
+        called = []
+        async def short(*args, **kw):
+            return dict(code=0, location='https://example.invalid/private', qs='secret' if challenge else '')
+        async def sts(*args):
+            called.append(True)
+        h.namespace['_mi_service_login_verified'] = short
+        account = SimpleNamespace(session=FakeSession(), token={}, _securityTokenService=sts)
+        try:
+            real_asyncio.run(h.namespace['_refresh_micoapi_token'](account, 'user', 'pass', 'client'))
+        except RuntimeError as exc:
+            fail = h.namespace['_relogin_failure_from'](exc)
+            assert fail['fatal'] is challenge and 'nonce, ssecurity' in str(exc)
+            assert 'secret' not in str(exc) and 'example.invalid' not in str(exc)
+        else:
+            raise AssertionError('incomplete exchange accepted')
+        assert not called
+    return 'short exchange never follows location; only marked challenges require interaction'
+
+
+def scenario_short_exchange_then_success(root: Path):
+    """A short response (code=0, no nonce/ssecurity) must be retried once, then succeed."""
+    harness = Harness(root)
+    harness.write_token({"userId": "user-1", "passToken": "pass-1",
+                         "deviceId": "account-device", "micoapi": ["s", "valid-service"],
+                         "issued_at": 0})
+    harness.write_auth({"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"})
+    calls = []
+    original = harness.namespace["_mi_service_login_verified"]
+
+    async def flaky(session, uri, data=None, device_id="", token=None, user_agent=""):
+        calls.append(uri)
+        if len(calls) == 1:
+            return {"code": 0, "location": "https://sts.example.invalid/sts"}
+        return await original(session, uri, data, device_id, token, user_agent)
+
+    harness.namespace["_mi_service_login_verified"] = flaky
+
+    async def stop(delay):
+        harness.sleeps.append(delay)
+        if len(harness.sleeps) >= 2:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = stop
+    harness.run()
+
+    assert len(calls) == 2, f"the short response must be retried exactly once, got {len(calls)}"
+    saved = harness.read_token()
+    assert saved["micoapi"][1] == "fresh-service-token", saved
+    assert harness.bridge_state.get("renewal") is None, harness.bridge_state
+    assert harness.log.has("登录态续期成功"), harness.log.messages[-6:]
+    return "short response is retried once in the same session and then succeeds"
+
+
 def scenario_renewal_updates_device_scope(root: Path):
     harness = Harness(root)
     harness.cfg["xiaomi"]["device_did"] = ""
@@ -1055,6 +1150,82 @@ def scenario_renewal_failure_stays_quiet(root: Path):
         f"a failed renewal must back off, not retry on every poll, got {attempts}"
     )
     return "a failed renewal retries quietly instead of demanding a new login"
+
+
+def scenario_rejected_renewal_stops_five_minute_retries(root: Path):
+    """A 70016 on the proactive renewal must back off like the 401 path does.
+
+    Field log: after the passToken died, the bridge retried the same rejected
+    exchange every five minutes for five days (~400 attempts) while the panel
+    kept claiming "retrying". One rejection is terminal until the user logs in
+    again, so the next attempt belongs 30 minutes out — not five.
+    """
+    harness = Harness(root)
+    harness.write_token(
+        {
+            "userId": "user-1",
+            "passToken": "pass-1",
+            "deviceId": "account-device",
+            "micoapi": ["old-ssecurity", "valid-service"],
+            "issued_at": int(time.time()) - 10 * 3600,
+        }
+    )
+    harness.write_auth(
+        {"userId": "user-1", "passToken": "pass-1", "deviceId": "account-device"}
+    )
+    harness.poll_script = [([], False)] * 600
+    FakeAccount.reject_service_login = True
+
+    # Drive a fake clock so 300s/1800s really pass instead of just being recorded.
+    clock = {"now": time.time()}
+    real_time = harness.namespace["time"]
+    harness.namespace["time"] = SimpleNamespace(
+        time=lambda: clock["now"],
+        monotonic=real_time.monotonic,
+        sleep=real_time.sleep,
+        strftime=real_time.strftime,
+        localtime=real_time.localtime,
+    )
+    started = clock["now"]
+
+    async def sleeping(delay):
+        harness.sleeps.append(delay)
+        clock["now"] += delay
+        if clock["now"] - started > 1000:
+            harness.bridge_state["running"] = False
+
+    harness.namespace["asyncio"].sleep = sleeping
+    try:
+        harness.run()
+    finally:
+        FakeAccount.reject_service_login = False
+
+    attempts = [m for m in harness.log.messages if "登录态主动续期" in m]
+    assert len(attempts) == 1, (
+        "a rejected passToken must not be retried every 5 minutes, got %d attempts in "
+        "1000 simulated seconds: %s" % (len(attempts), attempts[-3:])
+    )
+    message = harness.bridge_state["renewal"] or ""
+    assert "70016" in message, f"the panel must show the Xiaomi code, got {message!r}"
+    assert "重新扫码" in message, f"the panel must name the fix, got {message!r}"
+    assert "已失效" not in message, (
+        "a rejected renewal must not report the still-working poll session as dead, "
+        f"got {message!r}"
+    )
+    assert "仍可用" in message, (
+        f"the panel must say the current session still works, got {message!r}"
+    )
+    assert "300s 后重试" not in message, (
+        f"a terminal rejection must not promise a 5 minute retry, got {message!r}"
+    )
+    assert harness.bridge_state["error"] is None, (
+        "a failed renewal must not stop the poll loop while the token still works, "
+        f"got {harness.bridge_state['error']!r}"
+    )
+    assert harness.log.has("自动换票被小米拒绝"), (
+        "the terminal verdict must be logged like the 401 path does"
+    )
+    return "a rejected renewal backs off for 30 minutes instead of retrying every 5"
 
 
 def scenario_device_id_stays_stable(root: Path):
@@ -1424,10 +1595,14 @@ def main():
         scenario_scheduled_rule_never_executes_now,
         scenario_clock_failure_is_announced,
         scenario_schedule_ai_fallback_keeps_time,
+        scenario_live_ticket_switch,
+        scenario_short_exchange,
+        scenario_short_exchange_then_success,
         scenario_renewal_updates_device_scope,
         scenario_unsaved_renewal_retries_persistence,
         scenario_proactive_renewal_keeps_session_alive,
         scenario_renewal_failure_stays_quiet,
+        scenario_rejected_renewal_stops_five_minute_retries,
         scenario_device_id_stays_stable,
         scenario_every_xiaoai_device_is_polled,
         scenario_poll_target_filtering,

@@ -5,7 +5,7 @@ server, ensures default aiohttp verification rejects it, and proves the same
 helper succeeds when the test CA is explicitly trusted.
 """
 import asyncio
-import importlib.util
+import logging
 import os
 import shutil
 import ssl
@@ -91,11 +91,17 @@ def main():
              "-keyout", str(key), "-out", str(cert)],
             check=True, capture_output=True, timeout=30
         )
+        root_logger = logging.getLogger()
+        original_handlers = set(root_logger.handlers)
         try:
             os.chdir(root)
             bridge = load_bridge(root)
             asyncio.run(_run(bridge, cert, key))
         finally:
+            # The imported runtime opens a log in tmp; Windows cannot remove it while open.
+            for handler in set(root_logger.handlers) - original_handlers:
+                root_logger.removeHandler(handler)
+                handler.close()
             os.chdir(original_cwd)
     print("real TLS handshake test passed: self-signed rejected, explicit trust accepted")
 

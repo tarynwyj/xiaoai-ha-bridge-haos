@@ -373,6 +373,7 @@ FUNCTIONS = (
     "xiaomi_cookie_login",
     "xiaomi_cookie_ticket",
     "_adopt_login_identity",
+    "_refresh_micoapi_token",
     "_plausible_credential",
     "_cookie_pass_token_problem",
     "_cookie_exchange_detail",
@@ -3185,6 +3186,34 @@ def scenario_real_293_contracts():
 
 
 # ─────────────── 6. audit fixes: Cookie Path scoping and log sanitisation ───────────────
+def scenario_refresh_response_rotation():
+    from http.cookies import SimpleCookie
+    h = Harness()
+    try:
+        for header, body_token, expected in (
+            ("passToken=new; Path=/pass; Domain=account.xiaomi.com", None, "new"),
+            ("passToken=new; Path=/pass", "from-body", "from-body"),
+            ("passToken=new; Path=/other", None, "old"),
+            ("passToken=new; Domain=other.example", None, "old"),
+            ("passToken=new; Max-Age=0", None, "old"),
+            ("passToken=new; userId=other", None, "old"),
+            ("", None, "old"),
+        ):
+            payload = dict(code=0, location="fixture", nonce=1, ssecurity="key")
+            if body_token:
+                payload["passToken"] = body_token
+            cookies = SimpleCookie(header)
+            session = FakeSession()
+            session.jar.update_cookies({"passToken": "stale"})
+            session.request = lambda *a, **kw: _ResponseContext(
+                FakeResponse(body=payload, cookies=cookies))
+            account = FakeMiAccount(session, "", "")
+            asyncio.run(h.ns["_refresh_micoapi_token"](account, "user", "old", "device"))
+            check(account.token["passToken"] == expected, "unexpected refresh identity")
+    finally:
+        h.cleanup()
+
+
 def scenario_otp_cookie_path_scope():
     h = Harness()
     try:
@@ -3401,6 +3430,7 @@ def main():
         scenario_cookie_ticket,
         scenario_legacy_message,
         scenario_secrets_not_logged,
+        scenario_refresh_response_rotation,
         scenario_otp_cookie_path_scope,
         scenario_provider_error_is_sanitised,
         scenario_failures_leave_data_untouched,

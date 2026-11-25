@@ -69,6 +69,8 @@ EXTRACT_FUNCTIONS = [
     "miScopeEpochNow",
     "miScopeInvalidate",
     "refreshMiSpeakers",
+    "refreshXiaomiRevision",
+    "pollQrLogin",
     "renderMiScope",
     "renderDeviceList",
     "saveXiaomi",
@@ -415,10 +417,10 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
             "a Xiaomi-login 401 would be treated as an expired panel session",
         ),
         (
-            "QR success without devices points at the refresh entry",
-            "登录已保存，但暂时没读到音箱列表" in html
-            and "refreshMiSpeakers()" in html,
-            "a QR login that saved credentials but found no devices gives no recovery hint",
+            "QR success never calls the login test",
+            "/api/test/xiaomi" not in _fn("pollQrLogin")
+            and "登录已保存，但暂时没读到音箱列表" not in html,
+            "QR polling must not reauthenticate or put device-list warnings in the login alert",
         ),
         (
             "clear saved login credentials button added",
@@ -489,7 +491,8 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
         ),
         (
             "schedules form posts to the create endpoint",
-            "fetch('/api/automations',{method:'POST'" in html
+            "const url=editing?('/api/automations/'+encodeURIComponent(editing)):'/api/automations'" in html
+            and "fetch(url,{method:editing?'PUT':'POST'" in html
             and "async function createSchedule()" in html,
             "createSchedule() must POST /api/automations",
         ),
@@ -503,8 +506,9 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
         ),
         (
             "schedules list deletes by the HA config id",
-            "(s.config_id||'').trim()" in html
-            and "deleteSchedule(\\''+escAttr(id)+'\\')" in html,
+            "String(item.config_id||'').trim()" in html
+            and "scheduleConfigId(s)" in html
+            and 'onclick="deleteSchedule(this.dataset.id,this.dataset.label)"' in html,
             "the list must use the HA config id (not the entity id) for delete",
         ),
         (
@@ -519,7 +523,7 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
         ),
         (
             "schedules form treats 504 as pending, not as failure",
-            "r.status===504" in html and "创建结果待确认" in html,
+            "r.status===504" in html and "结果待确认，请先去 HA 核对" in html,
             "HTTP 504 must show a pending-result warning, not '创建失败'",
         ),
         (
@@ -529,7 +533,7 @@ def source_invariants(html: str) -> list[tuple[str, bool, str]]:
         ),
         (
             "schedules form carries optional service data",
-            'id="sch-data"' in html and "data:extra" in html,
+            'id="sch-data"' in html and "payload.data=extra" in html,
             "the form must send the optional service data JSON",
         ),
     ]
@@ -991,6 +995,7 @@ function showAlert(target, kind, message){
 function fetchLogs(){}
 function loadDevices(){}
 function loadSchedules(){}
+function stopScheduleClock(){}
 
 // Do not let the page's 3s alert timeouts keep the process alive.
 globalThis.setTimeout = function(){ return 0; };
@@ -1901,6 +1906,56 @@ function scopeRaceFixture(mi){
   globalThis.miScopeRefreshDone = 0;
   globalThis.miScopeRefreshing = false;
 }
+
+let qrPollTimer = null;
+function qrMount(){
+  scopeRaceFixture({});
+  for (const id of ['qr-status', 'qr-area', 'xiaomi-alert']){
+    if (document.getElementById(id)) continue;
+    const el = document.createElement('div');
+    el.id = id;
+    document.body.appendChild(el);
+  }
+  __alerts = [];
+}
+
+test('QR: a saved login replaces an in-flight speaker refresh without another login', async () => {
+  qrMount();
+  globalThis.miScopeRefreshing = true;
+  const oldEpoch = miScopeEpochNow();
+  const oldFetch = globalThis.fetch;
+  const calls = [];
+  const replies = {
+    '/api/qr/poll': {done:true, ok:true, msg:'扫码登录成功'},
+    '/api/config': {_section_revisions:{xiaomi:'after-qr'}},
+    '/api/xiaomi/speakers': {ok:true, devices:scopeDevices().slice(0, 2)},
+  };
+  globalThis.fetch = async (url, init) => {
+    calls.push((init && init.method || 'GET')+' '+url);
+    return {ok:true, status:200, json:async () => replies[url]};
+  };
+  try { await pollQrLogin(); } finally { globalThis.fetch = oldFetch; }
+  checkEq('QR only reads the login result, revision and speakers', calls.join(','),
+          'GET /api/qr/poll,GET /api/config,GET /api/xiaomi/speakers');
+  checkEq('QR invalidates the previous speaker request', miScopeEpochNow(), oldEpoch + 1);
+  checkEq('QR refreshes the saved Xiaomi revision', sectionRevisions.xiaomi, 'after-qr');
+  checkEq('QR shows a single successful login result', __alerts.map(a => a.kind).join(','), 'ok');
+  checkEq('the speaker section reports the new list', scopeNoticeText(), '已从小米获取 2 台音箱。');
+});
+
+test('QR: a failed scan neither refreshes speakers nor reports login success', async () => {
+  qrMount();
+  const oldFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async url => {
+    calls.push(url);
+    return {ok:true, json:async () => ({done:true, ok:false, msg:'二维码已失效'})};
+  };
+  try { await pollQrLogin(); } finally { globalThis.fetch = oldFetch; }
+  checkEq('only the QR poll was requested', calls.join(','), '/api/qr/poll');
+  checkEq('QR shows a single login error', __alerts.map(a => a.kind).join(','), 'err');
+  checkEq('failed QR keeps the speaker epoch', miScopeEpochNow(), 0);
+});
 
 test('scope: a late refresh from the previous account is dropped', async () => {
   scopeRaceFixture({ device_scope: 'selected', device_ids: ['A'] });

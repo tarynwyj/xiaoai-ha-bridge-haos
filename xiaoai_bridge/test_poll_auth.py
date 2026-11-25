@@ -530,13 +530,13 @@ def scenario_renewal_schedule_is_defensive(root):
     interval = namespace["_refresh_interval_seconds"]
     age = namespace["_token_age_seconds"]
 
-    check(interval({}) == 4 * 3600, f"default renewal interval must be 4h, got {interval({})}")
+    check(interval({}) == 3600, f"default renewal interval must be 1h, got {interval({})}")
     check(interval({"token_refresh_hours": 1}) == 3600, "the interval must be configurable")
     check(interval({"token_refresh_hours": 0.1}) == 900,
           "a tiny interval must clamp to 15 minutes")
-    check(interval({"token_refresh_hours": "abc"}) == 4 * 3600,
+    check(interval({"token_refresh_hours": "abc"}) == 3600,
           "a garbage interval must fall back to the default")
-    check(interval({"token_refresh_hours": -5}) == 4 * 3600,
+    check(interval({"token_refresh_hours": -5}) == 3600,
           "a negative interval must fall back to the default")
     check(interval({"token_refresh_hours": 6}) == 5 * 3600,
           "an interval at the 6h token TTL must be capped to 5h")

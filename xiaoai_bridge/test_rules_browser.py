@@ -209,6 +209,11 @@ def main() -> int:
                                       body=json.dumps({"ok": True, "count": len(DEVICES),
                                                        "devices": DEVICES}))
                     elif path.startswith("/api/qr/poll"):
+                        # A completed QR login stores fresh credentials server-side,
+                        # which rotates the xiaomi config revision on its own.
+                        state["counter"] += 1
+                        state["revisions"]["xiaomi"] = "fixture-qr-" + str(state["counter"])
+                        state["config"].setdefault("xiaomi", {})["cookie_text"] = "••••••••"
                         route.fulfill(status=200, content_type="application/json",
                                       body=json.dumps({"ok": True, "done": True,
                                                        "msg": "扫码已完成"}))

@@ -53,6 +53,7 @@ FUNCTIONS = (
     "_schedule_registry_remove",
     "_schedule_next_run",
     "_schedule_listing",
+    "_save_automation_form",
     "create_automation",
     "update_automation",
     "delete_automation",
@@ -188,6 +189,9 @@ class StubSession:
         for prefix, (status, payload) in ROUTES.items():
             if str(url).startswith(prefix):
                 return FakeResponse(status, payload)
+        if "/api/config/automation/config/" in str(url) and str(url).rsplit("/", 1)[-1] in FakeHA.created_ids:
+            if FakeHA.reload_ok:
+                return FakeResponse(200, {})
         return FakeResponse(404, None)
 
     def get(self, url, **kwargs):

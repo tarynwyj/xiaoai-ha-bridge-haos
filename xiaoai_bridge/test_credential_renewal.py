@@ -57,6 +57,7 @@ WANTED_FUNCS = (
     "_restore_token",
     "_relogin_failure_from",
     "_relogin_retry_plan",
+    "_renewal_pending_message",
     "_refresh_interval_seconds",
     "_token_age_seconds",
     "_credential_fingerprint",
@@ -563,11 +564,11 @@ def scenario_concurrency(reporter, make_ns):
 def scenario_schedule(reporter, make_ns):
     ns = make_ns()
     interval = ns["_refresh_interval_seconds"]
-    assert interval({}) == 4 * 3600, interval({})
-    assert interval({"token_refresh_hours": float("nan")}) == 4 * 3600
-    assert interval({"token_refresh_hours": float("inf")}) == 4 * 3600
-    assert interval({"token_refresh_hours": "nonsense"}) == 4 * 3600
-    assert interval({"token_refresh_hours": -1}) == 4 * 3600
+    assert interval({}) == 3600, interval({})
+    assert interval({"token_refresh_hours": float("nan")}) == 3600
+    assert interval({"token_refresh_hours": float("inf")}) == 3600
+    assert interval({"token_refresh_hours": "nonsense"}) == 3600
+    assert interval({"token_refresh_hours": -1}) == 3600
     assert interval({"token_refresh_hours": 0.001}) == 900
     assert interval({"token_refresh_hours": 10 ** 9}) == 5 * 3600
     reporter.ok("F1 a NaN/inf/garbage/absurd interval falls back safely")

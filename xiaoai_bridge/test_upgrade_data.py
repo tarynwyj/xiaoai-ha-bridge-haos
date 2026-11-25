@@ -173,6 +173,9 @@ NEW_ONLY_FUNCTIONS = (
     # 1.0.17: proactive session renewal, per-device polling, durable log tail.
     "_relogin_failure_from",
     "_relogin_retry_plan",
+    "_renewal_pending_message",
+    "_record_renewal",
+    "_renewal_backoff_seconds",
     "_credential_fingerprint",
     "_wait_for_relogin",
     "_refresh_interval_seconds",
@@ -220,6 +223,9 @@ NEEDED_ASSIGNMENTS = (
     "_refresh_lock",
     "_process_login_device_id",
     "_refresh_cache",
+    "_RENEW_FAIL_STREAK",
+    "_RENEW_OK_STREAK",
+    "_REFRESH_INTERVAL_OVERRIDE",
 )
 
 
